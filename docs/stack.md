@@ -59,11 +59,16 @@ currently runs in one process.
 
 ## 5. HTTP server
 
-`node:http`, hand-rolled routing table, one HTML page, one ~90-line client script, no framework.
+`node:http`, hand-rolled routing table, one HTML page, one client script, no framework.
 
-Why: the surface is five routes and one form. Express or Fastify would add a dependency, an
+Why: the surface is seven routes and one form. Express or Fastify would add a dependency, an
 upgrade path and a middleware model for something the standard library does in ~200 lines. The
 routing table is a data structure — you can read it and know every endpoint exists.
+
+**No route serves file bytes.** Traces and screenshots contain recipient data and panel-session
+material, so artifacts leave the machine over SSH, never through the web server. A download route
+was written, reviewed, and deleted: it was an unauthenticated path to PII that no amount of
+reverse-proxy auth justifies.
 
 Why not Next.js/React here: the page has no client-side state beyond one form, and no navigation.
 A single-page framework would be more code, a build step, and a bundler to keep patched, to render
@@ -116,6 +121,7 @@ hosts.
 - The app never sees the store password: 2FA makes login human-only, and there is no stored secret.
 - Secrets arrive at runtime through the environment; `MDL_STORE_ORIGIN` has no default pointing at a real store.
 - The UI binds loopback and has no CORS headers.
+- Artifacts are never served over HTTP; they are copied off the box over SSH.
 - Logs and records are designed to be shareable: the operator log carries no name, address, phone or document.
 
 ## 10. When to change it — scale-up triggers

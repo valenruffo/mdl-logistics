@@ -469,14 +469,6 @@ export const CLIENT_JS = `(function () {
     return table;
   }
 
-  function link(href, text, className) {
-    var node = document.createElement('a');
-    node.href = href;
-    node.textContent = text;
-    if (className) node.className = className;
-    return node;
-  }
-
   function renderWarnings(containerId, warnings) {
     var box = byId(containerId);
     clear(box);
@@ -647,8 +639,7 @@ export const CLIENT_JS = `(function () {
       tr.appendChild(cellText(textOr(row.costText, '(sin costo leído)')));
 
       var artifactCell = document.createElement('td');
-      if (row.artifactHref === null) artifactCell.textContent = '(no registrado)';
-      else artifactCell.appendChild(link(row.artifactHref, 'artifacts/' + row.artifactDir));
+      artifactCell.textContent = row.artifactDir === null ? '(no registrado)' : 'artifacts/' + row.artifactDir;
       tr.appendChild(artifactCell);
 
       body.appendChild(tr);
@@ -701,7 +692,7 @@ export const CLIENT_JS = `(function () {
       }
 
       box.appendChild(make('p', 'note',
-        'Capturas y traces de este run: pueden contener datos personales del destinatario. Se descargan desde este equipo, en 127.0.0.1.'));
+        'Capturas y traces de este run: pueden contener datos personales del destinatario y la sesión del panel. Se retiran del volumen por SSH; esta página no los sirve ni los muestra.'));
 
       var table = document.createElement('table');
       var head = document.createElement('thead');
@@ -714,9 +705,7 @@ export const CLIENT_JS = `(function () {
       var body = document.createElement('tbody');
       run.files.forEach(function (file) {
         var tr = document.createElement('tr');
-        var nameCell = document.createElement('td');
-        nameCell.appendChild(link(file.href, file.name));
-        tr.appendChild(nameCell);
+        tr.appendChild(cellText(file.name));
         tr.appendChild(cellText(formatBytes(file.sizeBytes)));
         body.appendChild(tr);
       });
@@ -745,10 +734,8 @@ export const CLIENT_JS = `(function () {
       ['escrito', latest.recordedAt]
     ]));
 
-    var downloadCell = link(latest.href, 'descargar ' + latest.kind);
-    box.appendChild(make('p', 'meta', 'descarga: '));
-    box.lastChild.appendChild(downloadCell);
-    box.appendChild(make('p', 'note', 'Este informe es de un run real: puede citar datos del destinatario.'));
+    box.appendChild(make('p', 'note',
+      'Este informe es de un run real: su texto puede citar el nombre o la dirección del destinatario. No se descarga desde acá; el archivo se retira del volumen por SSH, como el resto de los artefactos.'));
 
     box.appendChild(make('h3', null, 'Comprobación estructural que falló (verbatim)'));
     var table = document.createElement('table');
@@ -773,6 +760,7 @@ export const CLIENT_JS = `(function () {
     if (latest.message === null) {
       box.appendChild(make('p', 'warn', 'El informe no trae un campo message, reason, failure ni error.'));
     } else {
+      box.appendChild(make('p', 'warn', 'Texto tal como lo escribió el ejecutor: puede nombrar al destinatario o su dirección.'));
       box.appendChild(make('p', 'mono', latest.message));
     }
   }

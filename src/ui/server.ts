@@ -1,8 +1,7 @@
 /**
  * The local HTTP server: the console page, its script, three shipment actions and
- * the console's read-only surface (a JSON snapshot, the artifact downloads, and
- * one explicit session check). No framework, no runtime dependency beyond Node's
- * own `http` and `fs` modules.
+ * the console's read-only snapshot plus one explicit session check. No framework,
+ * no runtime dependency beyond Node's own `http` module.
  *
  * **It binds `127.0.0.1` and nothing else.** This page can create shipments in
  * Envío Nube, so it must not be reachable from another machine: there is no
@@ -15,26 +14,26 @@
  * trusted: the only mutating shipment route is `/api/run`, which itself refuses
  * unless both gates in `actions.ts` pass, and the only route that leaves the
  * process is `/api/session-check`, which opens a browser because the operator
- * asked for it. Everything else is a read: `/api/console` and the files under
- * `artifacts/`, both of which only ever return bytes from this machine.
+ * asked for it. Everything else is a read of `/api/console`, which returns a JSON
+ * snapshot and never file bytes.
+ *
+ * **There is no artifact route.** An earlier revision served every regular file
+ * under `artifacts/` at `GET /artifacts/...` with no authentication of its own.
+ * Those files are Playwright traces and screenshots: recipient personal data and
+ * panel-session material. The route was removed instead of authenticated, because
+ * the operator has SSH and retrieves the files from the mounted volume; a web
+ * server that can create shipments must not also hand out PII. Nothing in this
+ * file reads a file's bytes to answer a request, and no route is a prefix.
  */
-import { readFileSync, statSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 import { messageOf } from '../executor/errors';
 import { analyzeMessage, approveForm, runAttempt, type ActionDeps } from './actions';
 import { CLIENT_JS } from './client';
 import { performSessionCheck, readConsole, resolveConsoleDeps, type ConsoleDeps } from './console';
-import { PAGE_HTML } from './page';
-import {
-  ARTIFACT_ROUTE_PREFIX,
-  MAX_SERVED_ARTIFACT_BYTES,
-  baseNameOf,
-  contentTypeFor,
-  resolveArtifactTarget,
-} from './paths';
+import { ARTIFACT_RETRIEVAL_INSTRUCTION, PAGE_HTML } from './page';
 
-export { CLIENT_JS, PAGE_HTML };
+export { ARTIFACT_RETRIEVAL_INSTRUCTION, CLIENT_JS, PAGE_HTML };
 
 /** Loopback only. Not configurable, by design. */
 export const HOST = '127.0.0.1';
@@ -52,8 +51,8 @@ export const MAX_BODY_LENGTH = 1_000_000;
 export interface UiResponse {
   status: number;
   contentType: string;
-  /** Bytes for an artifact download, text for everything else. */
-  body: string | Uint8Array;
+  /** Text, always: no route returns file bytes. */
+  body: string;
 }
 
 export interface Route {
@@ -61,17 +60,15 @@ export interface Route {
   path: string;
   /** One line for the UI map, and for the assertion that no route does more. */
   purpose: string;
-  /**
-   * True when `path` is a prefix rather than an exact path. Exactly one route uses
-   * it: the artifact tree, whose file names cannot be enumerated in a table.
-   */
-  prefix?: true;
   handle(body: string, path: string): Promise<UiResponse>;
 }
 
-/** True when one request path belongs to a route (exact or prefix). */
+/**
+ * True when one request path belongs to a route. Every route is an exact path:
+ * there is no prefix route, so a request cannot name a file below a route.
+ */
 function routeMatches(route: Route, path: string): boolean {
-  return route.prefix === true ? path.startsWith(route.path) : route.path === path;
+  return route.path === path;
 }
 
 function json(status: number, value: unknown): UiResponse {
@@ -119,9 +116,9 @@ function formField(source: Record<string, unknown>): Record<string, unknown> {
 }
 
 /**
- * The whole surface of the page. Eight routes: the document, its script, the
- * three shipment actions, the console snapshot, the one explicit session check
- * and the artifact downloads. Nothing else exists to navigate to.
+ * The whole surface of the page. Seven routes: the document, its script, the
+ * three shipment actions, the console snapshot and the one explicit session
+ * check. Nothing else exists to navigate to, and nothing below exists to fetch.
  */
 export function createRoutes(deps: ActionDeps): Route[] {
   const consoleDeps: ConsoleDeps = resolveConsoleDeps({ recordDir: deps.recordDir, ...(deps.console ?? {}) });
@@ -212,51 +209,13 @@ export function createRoutes(deps: ActionDeps): Route[] {
         return json(200, { ...outcome.snapshot, check: outcome.check, problems: outcome.problems });
       },
     },
-    {
-      method: 'GET',
-      path: ARTIFACT_ROUTE_PREFIX,
-      prefix: true,
-      purpose:
-        'descarga de solo lectura de un archivo bajo artifacts/, con el recorrido de rutas rechazado',
-      handle: async (_body, path) => serveArtifact(consoleDeps.artifactsDir, path),
-    },
   ];
 }
 
 /**
- * Serves one artifact. The path arithmetic and the traversal refusal live in
- * `paths.ts`; this only turns the answer into a response, and refuses to buffer a
- * file past `MAX_SERVED_ARTIFACT_BYTES`.
+ * Dispatches one request. An unknown path is a 404; a known exact path with the
+ * wrong method is a 405. There is no route that resolves a file name.
  */
-function serveArtifact(artifactsDir: string, path: string): UiResponse {
-  const target = resolveArtifactTarget(artifactsDir, path);
-  if (!target.ok) return json(target.status, { status: 'refused', reason: target.reason });
-
-  let size: number;
-  try {
-    size = statSync(target.file).size;
-  } catch (error) {
-    return json(404, { status: 'not-found', reason: `no se pudo leer el archivo: ${messageOf(error)}` });
-  }
-
-  if (size > MAX_SERVED_ARTIFACT_BYTES) {
-    return json(413, {
-      status: 'refused',
-      reason: `el archivo pesa ${size} bytes y el limite es ${MAX_SERVED_ARTIFACT_BYTES}`,
-    });
-  }
-
-  let bytes: Uint8Array;
-  try {
-    bytes = readFileSync(target.file);
-  } catch (error) {
-    return json(500, { status: 'error', reason: `no se pudo leer el archivo: ${messageOf(error)}` });
-  }
-
-  return { status: 200, contentType: contentTypeFor(baseNameOf(target.file)), body: bytes };
-}
-
-/** Dispatches one request. An unknown path is a 404; a known path with the wrong method is a 405. */
 export async function handleRequest(
   method: string,
   path: string,

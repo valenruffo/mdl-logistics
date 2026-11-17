@@ -21,7 +21,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -668,7 +668,6 @@ test('the routes are the page, its script, the shipment actions and the console 
       'GET /',
       'GET /api/console',
       'GET /app.js',
-      'GET /artifacts/',
       'POST /api/analyze',
       'POST /api/approve',
       'POST /api/run',
@@ -676,16 +675,85 @@ test('the routes are the page, its script, the shipment actions and the console 
     ],
   );
 
-  // Exactly one route is a prefix (the artifact tree), and exactly one route can
-  // leave the process: the explicit session check.
-  assert.deepEqual(
-    routes.filter((route) => route.prefix === true).map((route) => route.path),
-    ['/artifacts/'],
-  );
+  // No route is a prefix, so a request cannot name a file below one, and none of
+  // them names an artifact path.
+  for (const route of routes) {
+    assert.equal('prefix' in route, false, `${route.method} ${route.path} must not be a prefix route`);
+    assert.doesNotMatch(route.path, /artifact/i);
+  }
+
+  // Exactly one route can leave the process: the explicit session check.
   assert.deepEqual(
     routes.filter((route) => route.path === '/api/session-check').map((route) => route.method),
     ['POST'],
   );
+});
+
+test('no route returns artifact bytes and no rendered link points at /artifacts/', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mdl-ui-artifacts-'));
+  const artifactsDir = path.join(root, 'artifacts');
+  const runDir = path.join(artifactsDir, 'executor-fixture');
+  await mkdir(runDir, { recursive: true });
+  const marker = 'PANEL-SESSION-DATA-MUST-NOT-LEAVE-THE-VOLUME';
+  await writeFile(path.join(runDir, 'trace.zip'), marker, { encoding: 'utf8' });
+  await writeFile(path.join(runDir, 'failure.png'), marker, { encoding: 'utf8' });
+
+  const { executor } = fakeExecutor();
+  const { startUiServer, handleRequest, PAGE_HTML, CLIENT_JS, ARTIFACT_RETRIEVAL_INSTRUCTION } =
+    await import('../../src/ui/server');
+  const runDeps: ActionDeps = {
+    executor,
+    recordDir: await mkdtemp(path.join(tmpdir(), 'mdl-ui-records-')),
+    console: { artifactsDir },
+  };
+  const started = await startUiServer({ port: 0, deps: runDeps });
+
+  try {
+    const candidates = [
+      '/artifacts/',
+      '/artifacts/executor-fixture/',
+      '/artifacts/executor-fixture/trace.zip',
+      '/artifacts/executor-fixture/failure.png',
+      '/artifacts/trace.zip',
+      '/artifacts/../secret.txt',
+      '/artifacts/%2e%2e%2fsecret.txt',
+      '/artifacts/..%2fsecret.txt',
+      '/artifacts/C:/Windows/win.ini',
+      '/artifacts//etc/passwd',
+    ];
+
+    for (const candidate of candidates) {
+      for (const method of ['GET', 'POST'] as const) {
+        const response = await fetch(`${started.url}${candidate}`, method === 'GET' ? {} : { method });
+        assert.equal(response.status, 404, `${method} ${candidate} answered ${response.status}`);
+        const body = await response.text();
+        assert.doesNotMatch(body, new RegExp(marker), `${method} ${candidate} must not return the file`);
+        assert.match(body, /not-found/);
+      }
+    }
+
+    // The console snapshot lists names and sizes only: no URL anywhere.
+    const snapshot = await (await fetch(`${started.url}/api/console`)).text();
+    assert.doesNotMatch(snapshot, /\/artifacts\//);
+    assert.doesNotMatch(snapshot, new RegExp(marker));
+
+    // Nor does the rendered surface build a link to one.
+    assert.doesNotMatch(PAGE_HTML, /\/artifacts\//);
+    assert.doesNotMatch(CLIENT_JS, /\/artifacts\//);
+    assert.doesNotMatch(PAGE_HTML, /href\s*=/);
+    assert.doesNotMatch(CLIENT_JS, /\.href\s*=/);
+    assert.ok(PAGE_HTML.includes(ARTIFACT_RETRIEVAL_INSTRUCTION));
+
+    // And the raw dispatcher refuses the same shapes.
+    for (const candidate of candidates) {
+      const answer = await handleRequest('GET', candidate, '', runDeps);
+      assert.equal(answer.status, 404, `handleRequest ${candidate} answered ${answer.status}`);
+      assert.doesNotMatch(answer.body, new RegExp(marker));
+    }
+  } finally {
+    await started.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('candidate purchase paths are 404 and grant nothing', async () => {

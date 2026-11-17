@@ -15,13 +15,25 @@
  * 3. `Sesión` — the storageState/profile on disk and the last checks, plus the
  *    one explicit button that runs `session-check` (it opens a browser).
  * 4. `Runs` — every run record, newest first, with the open ones marked.
- * 5. `Artefactos` — per run, the files with their sizes, and the plain warning
- *    that traces and screenshots carry personal data.
- * 6. `Errores` — the most recent failure report the executor wrote, verbatim.
+ * 5. `Artefactos` — per run, the files with their sizes, the plain warning
+ *    that traces and screenshots carry personal data, and the instruction for
+ *    retrieving them over SSH. No download link: the page serves no file.
+ * 6. `Errores` — the most recent failure report the executor wrote, verbatim,
+ *    next to the warning that its text may name the recipient.
  *
  * The health line sits above the tabs because it answers the only question that
  * matters before touching anything: can the agent work right now?
  */
+
+/**
+ * The one instruction for getting at the artifact files. The page lists them and
+ * never serves them: they hold recipient personal data and panel-session material,
+ * so they leave the box over SSH, not over the web server that can create
+ * shipments. Exported so a test can assert the page shows exactly this.
+ */
+export const ARTIFACT_RETRIEVAL_INSTRUCTION =
+  'Los artefactos quedan en el volumen montado y se retiran por SSH desde el equipo del operador, por ejemplo con docker compose cp mdl-logistics:/app/artifacts ./artifacts, o leyendo directo la ruta del volumen (/app/artifacts en el contenedor).';
+
 export const PAGE_HTML = `<!doctype html>
 <html lang="es">
 <head>
@@ -251,7 +263,8 @@ export const PAGE_HTML = `<!doctype html>
 <div class="panel" id="panel-artifacts" role="tabpanel" hidden>
 <section class="card">
   <h2>Artefactos</h2>
-  <p class="note">Las capturas y los traces contienen datos personales del destinatario (nombre, dirección, teléfono) y la sesión del panel. Se sirven solo desde este equipo, en 127.0.0.1, y conviene no compartirlos.</p>
+  <p class="note">Las capturas y los traces contienen datos personales del destinatario (nombre, dirección, teléfono) y la sesión del panel. El informe de fallo también puede citar el nombre o la dirección del destinatario. Nada de esto se sirve por HTTP.</p>
+  <p class="mono" id="artifacts-how">${ARTIFACT_RETRIEVAL_INSTRUCTION}</p>
   <div id="artifacts-warnings"></div>
   <div id="artifacts-body"></div>
 </section>
@@ -260,13 +273,13 @@ export const PAGE_HTML = `<!doctype html>
 <div class="panel" id="panel-errors" role="tabpanel" hidden>
 <section class="card">
   <h2>Errores</h2>
-  <p class="hint">El informe más reciente que el ejecutor escribió y que falló una comprobación estructural, con el mensaje tal como quedó en el archivo.</p>
+  <p class="hint">El informe más reciente que el ejecutor escribió y que falló una comprobación estructural, con el mensaje tal como quedó en el archivo. El archivo no se descarga desde acá: se retira por SSH, como el resto de los artefactos.</p>
   <div id="errors-warnings"></div>
   <div id="errors-body"></div>
 </section>
 </div>
 
-<footer>Esta página puede crear envíos, por eso escucha solo en 127.0.0.1. No hay ninguna acción sobre la etiqueta: el flujo termina con la etiqueta impaga. Las descargas de artefactos son de solo lectura y no salen del directorio artifacts/.</footer>
+<footer>Esta página puede crear envíos, por eso escucha solo en 127.0.0.1. No hay ninguna acción sobre la etiqueta: el flujo termina con la etiqueta impaga. La página no sirve archivos: los artefactos se listan con su tamaño y se retiran del volumen por SSH.</footer>
 
 <script src="/app.js"></script>
 </body>

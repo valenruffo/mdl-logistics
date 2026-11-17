@@ -44,15 +44,6 @@ declare module 'node:fs' {
 
   /** Used to derive whether the artifacts directory is writable. */
   export function accessSync(path: string, mode?: number): void;
-
-  /** Used to keep an artifact download inside the real artifacts root. */
-  export function realpathSync(path: string): string;
-
-  /** Artifact downloads are binary (screenshots, traces), so bytes are read here. */
-  export function readFileSync(path: string): Uint8Array;
-
-  /** Report files are read as text; this overload returns the decoded string. */
-  export function readFileSync(path: string, options: { encoding: 'utf8' }): string;
 }
 
 declare module 'node:child_process' {

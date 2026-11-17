@@ -1,5 +1,5 @@
 /**
- * The maintenance console: tolerant reads, the artifact route, the health
+ * The maintenance console: tolerant reads, the file-name listing, the health
  * derivation, the explicit session check, and the absence of any purchase.
  *
  * Everything here is offline and fictional (R11): temporary directories, invented
@@ -10,8 +10,11 @@
  *  - the empty state renders notices and no invented numbers;
  *  - a corrupt record, a corrupt report or a corrupt history file is a visible
  *    warning, never a crash and never a silent zero;
- *  - the artifact route refuses `..`, encoded traversal, absolute paths, drive
- *    letters and symlink-free escapes, and serves a real file with its bytes;
+ *  - the console lists artifact names and sizes only: no href, no URL, and no
+ *    route answers with a file's bytes (the old `GET /artifacts/...` was removed
+ *    because it served recipient PII and panel-session material);
+ *  - the artifact tree being empty, missing or not a readable directory is a
+ *    warning on a working page;
  *  - the health line is derived for every combination of its three facts;
  *  - the session check only runs when asked, records its exit code and message,
  *    and keeps a capped history;
@@ -33,7 +36,7 @@ import {
   type ProcessInfo,
   type SessionCheckEntry,
 } from '../../src/ui/console';
-import { resolveArtifactTarget } from '../../src/ui/paths';
+import { relativeSegments } from '../../src/ui/paths';
 import { SESSION_CHECK_HISTORY_LIMIT } from '../../src/ui/sessionCheck';
 import type { SessionCheckRunner } from '../../src/ui/sessionCheck';
 
@@ -268,96 +271,107 @@ test('an unreadable outcome is shown as unresolved instead of guessed away', asy
   }
 });
 
-// ------------------------------------------------------- 3. the artifact route
+// ------------------------------------------------ 3. no artifact-serving route
 
-test('the artifact route refuses traversal in every shape it was tried', async () => {
-  const box = await sandbox('traversal');
-  try {
-    const dir = path.join(box.artifactsDir, 'executor-fixture');
-    await mkdir(dir, { recursive: true });
-    await writeFile(path.join(dir, 'dry-run.json'), '{}\n', { encoding: 'utf8' });
-    await writeFile(path.join(box.root, 'secret.txt'), 'not for you\n', { encoding: 'utf8' });
+/** A plausible artifact path: every one of these must be a 404, forever. */
+const ARTIFACT_SHAPED_PATHS: readonly string[] = [
+  '/artifacts/',
+  '/artifacts/trace.zip',
+  '/artifacts/executor-fixture/trace.zip',
+  '/artifacts/executor-fixture/',
+  '/artifacts/executor-fixture/create-run.json',
+  '/artifacts/../secret.txt',
+  '/artifacts/%2e%2e/secret.txt',
+  '/artifacts/..%2fsecret.txt',
+  '/artifacts/%2e%2e%2fsecret.txt',
+  '/artifacts/a/../../secret.txt',
+  '/artifacts/executor-fixture/../secret.txt',
+  '/artifacts/C:/Windows/win.ini',
+  '/artifacts//etc/passwd',
+  '/artifacts/%00trace.zip',
+];
 
-    const refused = [
-      '/artifacts/../secret.txt',
-      '/artifacts/%2e%2e/secret.txt',
-      '/artifacts/a/../../secret.txt',
-      '/artifacts/..%2fsecret.txt',
-      '/artifacts/%2e%2e%2fsecret.txt',
-      '/artifacts/executor-fixture/../secret.txt',
-      '/artifacts/C:/Windows/win.ini',
-      '/artifacts//etc/passwd',
-      '/artifacts/',
-    ];
+test('a path a run record names is refused unless it is plain and relative', () => {
+  // The download route is gone, but records still name artifact directories, so
+  // the segment validation that keeps those reads inside the artifacts root stays.
+  assert.deepEqual(relativeSegments('executor-fixture'), ['executor-fixture']);
+  assert.deepEqual(relativeSegments('executor-fixture/create-run.json'), ['executor-fixture', 'create-run.json']);
 
-    for (const requestPath of refused) {
-      const target = resolveArtifactTarget(box.artifactsDir, requestPath);
-      assert.equal(target.ok, false, `${requestPath} must be refused`);
-      if (target.ok) continue;
-      assert.ok([400, 403, 404].includes(target.status), `${requestPath} answered ${target.status}`);
-      assert.ok(target.reason.length > 0, `${requestPath} carries a reason`);
-    }
-
-    const allowed = resolveArtifactTarget(box.artifactsDir, '/artifacts/executor-fixture/dry-run.json');
-    assert.equal(allowed.ok, true);
-    if (allowed.ok) assert.deepEqual(allowed.segments, ['executor-fixture', 'dry-run.json']);
-
-    const missing = resolveArtifactTarget(box.artifactsDir, '/artifacts/executor-fixture/nope.json');
-    assert.equal(missing.ok, false);
-    if (!missing.ok) assert.equal(missing.status, 404);
-  } finally {
-    cleanup(box);
+  for (const refused of ['../secret.txt', 'a/../../secret.txt', '/etc/passwd', 'C:/Windows/win.ini', '', '.']) {
+    assert.equal(relativeSegments(refused), null, `${JSON.stringify(refused)} must not be a usable relative path`);
   }
 });
 
-test('the HTTP artifact route serves a real file and refuses an encoded traversal', async () => {
-  const box = await sandbox('http-artifacts');
-  const { startUiServer } = await import('../../src/ui/server');
+test('no route answers with an artifact file, and no href points at one', async () => {
+  const box = await sandbox('no-artifact-route');
+  const { startUiServer, handleRequest, createRoutes, PAGE_HTML, CLIENT_JS, ARTIFACT_RETRIEVAL_INSTRUCTION } =
+    await import('../../src/ui/server');
 
   try {
     const dir = path.join(box.artifactsDir, 'executor-fixture');
     await mkdir(dir, { recursive: true });
-    const report = { mode: 'dry-run', formMatchesApproval: true, mismatches: [] };
-    await writeFile(path.join(dir, 'dry-run.json'), `${JSON.stringify(report)}\n`, { encoding: 'utf8' });
-    await writeFile(path.join(box.root, 'secret.txt'), 'fictional secret\n', { encoding: 'utf8' });
+    const marker = 'PANEL-SESSION-MATERIAL-MUST-NEVER-BE-SERVED';
+    await writeFile(path.join(dir, 'trace.zip'), `${marker}\n`, { encoding: 'utf8' });
+    await writeFile(path.join(dir, 'create-run.json'), `{"note":"${marker}"}\n`, { encoding: 'utf8' });
+    await writeFile(path.join(box.root, 'secret.txt'), `${marker}\n`, { encoding: 'utf8' });
 
-    const executor = {
-      runDryRun: async () => {
-        throw new Error('the console never runs the panel');
+    const deps = {
+      executor: {
+        runDryRun: async () => {
+          throw new Error('the console never runs the panel');
+        },
+        runCreate: async () => {
+          throw new Error('the console never runs the panel');
+        },
       },
-      runCreate: async () => {
-        throw new Error('the console never runs the panel');
+      recordDir: box.recordDir,
+      console: {
+        artifactsDir: box.artifactsDir,
+        sessionCheckHistoryPath: box.historyPath,
+        sessionCheckRunner: forbiddenRunner(),
+        processInfo: box.processInfo,
       },
     };
 
-    const started = await startUiServer({
-      port: 0,
-      deps: { executor, recordDir: box.recordDir, console: { artifactsDir: box.artifactsDir, sessionCheckHistoryPath: box.historyPath, sessionCheckRunner: forbiddenRunner(), processInfo: box.processInfo } },
-    });
-
+    const started = await startUiServer({ port: 0, deps });
     try {
-      const served = await fetch(`${started.url}/artifacts/executor-fixture/dry-run.json`);
-      assert.equal(served.status, 200);
-      assert.match(served.headers.get('content-type') ?? '', /application\/json/);
-      assert.deepEqual(await served.json(), report);
-
-      for (const requestPath of ['/artifacts/..%2fsecret.txt', '/artifacts/%2e%2e%2fsecret.txt']) {
-        const response = await fetch(`${started.url}${requestPath}`);
-        assert.ok([400, 403, 404].includes(response.status), `${requestPath} answered ${response.status}`);
-        const body = await response.text();
-        assert.doesNotMatch(body, /fictional secret/, `${requestPath} must not leak the file`);
-        assert.match(body, /refused|not-found/);
+      for (const artifactPath of ARTIFACT_SHAPED_PATHS) {
+        for (const method of ['GET', 'POST']) {
+          const response = await fetch(`${started.url}${artifactPath}`, method === 'GET' ? {} : { method });
+          assert.equal(response.status, 404, `${method} ${artifactPath} answered ${response.status}`);
+          const body = await response.text();
+          assert.doesNotMatch(body, new RegExp(marker), `${method} ${artifactPath} must not serve the file`);
+          assert.match(body, /not-found/);
+        }
       }
 
-      // The raw dispatcher sees the unnormalized path, so this is the server's own check.
-      const { handleRequest } = await import('../../src/ui/server');
-      const raw = await handleRequest('GET', '/artifacts/../secret.txt', '', {
-        executor,
-        recordDir: box.recordDir,
-        console: { artifactsDir: box.artifactsDir, sessionCheckHistoryPath: box.historyPath, sessionCheckRunner: forbiddenRunner(), processInfo: box.processInfo },
-      });
-      assert.equal(raw.status, 403);
-      assert.match(raw.body as string, /recorrido de rutas/);
+      const page = await fetch(`${started.url}/`);
+      const script = await fetch(`${started.url}/app.js`);
+      assert.equal(page.status, 200);
+      assert.equal(script.status, 200);
+
+      for (const [name, source] of [
+        ['the page', PAGE_HTML],
+        ['the client script', CLIENT_JS],
+      ] as const) {
+        assert.doesNotMatch(source, /\/artifacts\//, `${name} must not name an artifact URL`);
+      }
+      assert.doesNotMatch(PAGE_HTML, /href\s*=/, 'the page carries no link at all');
+      assert.doesNotMatch(CLIENT_JS, /\.href\s*=/, 'the script builds no link at all');
+      assert.ok(
+        PAGE_HTML.includes(ARTIFACT_RETRIEVAL_INSTRUCTION),
+        'the page tells the operator how the files are retrieved',
+      );
+      assert.match(ARTIFACT_RETRIEVAL_INSTRUCTION, /SSH/);
+      assert.match(ARTIFACT_RETRIEVAL_INSTRUCTION, /docker compose cp/);
+
+      // The route table itself: every route is an exact path, and none names an artifact.
+      for (const route of createRoutes(deps)) {
+        assert.doesNotMatch(route.path, /artifact/i, `route ${route.path} must not serve artifacts`);
+        assert.equal('prefix' in route, false, `route ${route.path} must not be a prefix`);
+      }
+      assert.equal((await handleRequest('GET', '/artifacts/executor-fixture/trace.zip', '', deps)).status, 404);
+      assert.equal((await handleRequest('GET', '/artifacts/', '', deps)).status, 404);
     } finally {
       await started.close();
     }
@@ -366,7 +380,7 @@ test('the HTTP artifact route serves a real file and refuses an encoded traversa
   }
 });
 
-test('artifacts are listed per run with their sizes and download links', async () => {
+test('artifacts are listed per run with their sizes and no link', async () => {
   const box = await sandbox('artifact-list');
   try {
     await withEnv(CLEAN_ENV, async () => {
@@ -389,10 +403,16 @@ test('artifacts are listed per run with their sizes and download links', async (
       const sizes = entry.files.map((file) => file.sizeBytes);
       assert.ok(sizes.every((size) => size > 0));
       assert.equal(entry.totalBytes, sizes.reduce((total, size) => total + size, 0));
-      assert.equal(entry.files[1]?.href, '/artifacts/executor-fixture/trace.zip');
+      assert.equal('href' in entry, false, 'the listing carries no URL');
+      for (const file of entry.files) assert.equal('href' in file, false, `${file.name} carries no URL`);
 
-      // The run row links to the same directory.
-      assert.equal(snapshot.runs.rows[0]?.artifactHref, '/artifacts/executor-fixture');
+      // The run row names the directory; nothing on it is clickable.
+      assert.equal(snapshot.runs.rows[0]?.artifactDir, 'executor-fixture');
+      assert.equal('artifactHref' in (snapshot.runs.rows[0] ?? {}), false);
+
+      // The whole snapshot is free of any URL that could return a file.
+      assert.doesNotMatch(JSON.stringify(snapshot), /\/artifacts\//);
+      assert.doesNotMatch(JSON.stringify(snapshot), /"href"/);
     });
   } finally {
     cleanup(box);
@@ -413,6 +433,40 @@ test('a missing artifact directory is a visible problem, not an empty list', asy
       assert.deepEqual(entry.files, []);
       assert.match(entry.problems.join('\n'), /no existe/);
       assert.ok(snapshot.artifacts.warnings.length > 0);
+    });
+  } finally {
+    cleanup(box);
+  }
+});
+
+test('the page renders when the artifact tree is missing, empty, or not a directory', async () => {
+  const box = await sandbox('artifact-shapes');
+  try {
+    await withEnv(CLEAN_ENV, async () => {
+      const runId = '2026-02-08T09-00-00-000Z-ffffffffffff';
+      await writeJson(path.join(box.recordDir, `${runId}.json`), attemptRecord(runId, '2026-02-08T09:00:00.000Z'));
+      await writeJson(path.join(box.recordDir, `${runId}.outcome.json`), outcomeRecord(runId, 'created'));
+
+      // 1. missing: the run names a directory that is not there.
+      const missing = await readConsole(depsOf(box, forbiddenRunner()));
+      assert.equal(missing.status, 'ok');
+      assert.deepEqual(missing.artifacts.runs[0]?.files, []);
+      assert.ok(missing.warnings.length > 0);
+
+      // 2. empty: present, readable, no files.
+      await mkdir(path.join(box.artifactsDir, 'executor-fixture'), { recursive: true });
+      const empty = await readConsole(depsOf(box, forbiddenRunner()));
+      assert.equal(empty.status, 'ok');
+      assert.deepEqual(empty.artifacts.runs[0]?.files, []);
+
+      // 3. unreadable as a directory: a regular file sits where the tree should be.
+      rmSync(box.artifactsDir, { recursive: true, force: true });
+      await writeFile(box.artifactsDir, 'not a directory\n', { encoding: 'utf8' });
+      const unreadable = await readConsole(depsOf(box, forbiddenRunner()));
+      assert.equal(unreadable.status, 'ok', 'an unreadable tree never crashes the page');
+      assert.deepEqual(unreadable.artifacts.runs[0]?.files, []);
+      assert.ok(unreadable.warnings.some((warning) => warning.source === box.artifactsDir));
+      assert.equal(unreadable.health.level, 'bad', 'an unwritable artifacts path is not a healthy state');
     });
   } finally {
     cleanup(box);
@@ -695,6 +749,7 @@ test('the newest failing report is shown verbatim, and a passing report is ignor
       const latest = snapshot.errors.latest;
       assert.ok(latest);
       assert.equal(latest.path, 'executor-new/create-run.json');
+      assert.equal('href' in latest, false, 'the report is named by path, never by a URL');
       assert.equal(latest.kind, 'create-run.json');
       assert.equal(latest.message, 'the panel does not hold the approved payload');
       assert.deepEqual(
@@ -702,7 +757,9 @@ test('the newest failing report is shown verbatim, and a passing report is ignor
         ['mismatches[0]', 'formMatchesApproval', 'outcome', 'reconciliation.interpretation'],
       );
       assert.equal(latest.checks[0]?.detail, 'carrier: expected "Andreani a domicilio", the panel holds "Entrega a domicilio"');
-      assert.equal(latest.href, '/artifacts/executor-new/create-run.json');
+
+      // Nothing in the report section is a URL to its contents.
+      assert.doesNotMatch(JSON.stringify(snapshot.errors), /\/artifacts\//);
 
       // A report whose structural checks held is not an error.
       assert.ok(!snapshot.errors.latest?.path.includes('executor-passing'));

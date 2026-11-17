@@ -90,7 +90,7 @@ if (args.error !== null) {
   console.log(`  ${started.url}`);
   console.log('  escucha solo en 127.0.0.1 porque esta pagina puede crear envios.');
   console.log(`  registros de ejecucion: ${RUN_RECORD_DIR}`);
-  console.log(`  artefactos: ${ARTIFACTS_DIR} (descarga de solo lectura en /artifacts/)`);
+  console.log(`  artefactos: ${ARTIFACTS_DIR} (se listan en la pagina; no se sirven por HTTP)`);
   console.log(`  historial del chequeo de sesion: ${SESSION_CHECK_HISTORY_PATH}`);
   console.log('  el chequeo de sesion abre un navegador: solo corre con el boton de la pagina.');
   console.log('  Ctrl+C para detener.');

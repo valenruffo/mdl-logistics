@@ -30,7 +30,6 @@ import { messageOf } from '../executor/errors';
 import { STORE_ORIGIN_VARIABLE, resolveStoreOrigin } from '../executor/panel';
 import {
   baseNameOf,
-  hrefForFile,
   isAbsolutePath,
   joinPath,
   relativeSegments,
@@ -380,7 +379,6 @@ export interface RunRow {
   costText: string | null;
   /** Artifact directory, relative to the artifacts root; `null` when unknown. */
   artifactDir: string | null;
-  artifactHref: string | null;
   /** True when this record blocks the create path: no outcome, or an unknown one. */
   unresolved: boolean;
   /** The gate's own human-resolution instruction, for an unresolved record. */
@@ -501,7 +499,6 @@ async function readRawRun(deps: ConsoleDeps, name: string, runId: string, proble
     shipmentId: null,
     costText: null,
     artifactDir: null,
-    artifactHref: null,
     unresolved: true,
     resolution: null,
     problems,
@@ -602,8 +599,6 @@ async function readRuns(deps: ConsoleDeps): Promise<RunsSection> {
         );
       } else {
         raw.row.artifactDir = recorded.dir;
-        const segments = relativeSegments(recorded.dir);
-        raw.row.artifactHref = segments === null ? null : hrefForFile(segments);
         if (!recorded.exists) {
           raw.row.problems.push(`el directorio de artefactos ${recorded.dir} no existe en disco`);
         }
@@ -654,14 +649,12 @@ async function readRuns(deps: ConsoleDeps): Promise<RunsSection> {
 export interface ArtifactFile {
   name: string;
   sizeBytes: number;
-  href: string;
 }
 
 export interface RunArtifacts {
   runId: string;
   /** Relative to the artifacts root; `null` when the run did not record one. */
   dir: string | null;
-  href: string | null;
   files: ArtifactFile[];
   totalBytes: number;
   problems: string[];
@@ -673,6 +666,13 @@ export interface ArtifactsSection {
   warnings: Warning[];
 }
 
+/**
+ * Lists what is on disk, nothing more: file names and sizes per run. There is no
+ * href and no content field, because the page must not hand out recipient PII or
+ * panel-session material; the operator retrieves the files from the mounted
+ * volume over SSH.
+ */
+
 async function readArtifacts(deps: ConsoleDeps, rows: readonly RunRow[]): Promise<ArtifactsSection> {
   const warnings: Warning[] = [];
   const runs: RunArtifacts[] = [];
@@ -682,7 +682,6 @@ async function readArtifacts(deps: ConsoleDeps, rows: readonly RunRow[]): Promis
       runs.push({
         runId: row.runId,
         dir: null,
-        href: null,
         files: [],
         totalBytes: 0,
         problems: ['el registro no nombra un directorio de artefactos'],
@@ -695,7 +694,6 @@ async function readArtifacts(deps: ConsoleDeps, rows: readonly RunRow[]): Promis
       runs.push({
         runId: row.runId,
         dir: row.artifactDir,
-        href: null,
         files: [],
         totalBytes: 0,
         problems: [`${JSON.stringify(row.artifactDir)} no es una ruta relativa usable`],
@@ -713,7 +711,7 @@ async function readArtifacts(deps: ConsoleDeps, rows: readonly RunRow[]): Promis
         ? `el directorio de artefactos ${row.artifactDir} no existe`
         : `no se pudo leer ${row.artifactDir}: ${messageOf(error)}`;
       warnings.push({ source: row.artifactDir, message });
-      runs.push({ runId: row.runId, dir: row.artifactDir, href: hrefForFile(segments), files: [], totalBytes: 0, problems: [message] });
+      runs.push({ runId: row.runId, dir: row.artifactDir, files: [], totalBytes: 0, problems: [message] });
       continue;
     }
 
@@ -730,14 +728,13 @@ async function readArtifacts(deps: ConsoleDeps, rows: readonly RunRow[]): Promis
         continue;
       }
       if (!stats.isFile()) continue;
-      files.push({ name, sizeBytes: stats.size, href: hrefForFile([...segments, name]) });
+      files.push({ name, sizeBytes: stats.size });
       totalBytes += stats.size;
     }
 
     runs.push({
       runId: row.runId,
       dir: row.artifactDir,
-      href: hrefForFile(segments),
       files,
       totalBytes,
       problems,
@@ -759,7 +756,6 @@ export interface FailedCheck {
 export interface FailureReport {
   /** Repository-relative path of the report file. */
   path: string;
-  href: string;
   kind: string;
   mode: string | null;
   finishedAt: string | null;
@@ -915,7 +911,6 @@ async function readErrors(deps: ConsoleDeps): Promise<ErrorsSection> {
 
     failures.push({
       path: candidate.segments.join('/'),
-      href: hrefForFile(candidate.segments),
       kind: baseNameOf(candidate.segments.join('/')),
       mode: textOf(parsed, 'mode'),
       finishedAt: textOf(parsed, 'finishedAt'),
