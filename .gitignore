@@ -1,0 +1,31 @@
+# Secrets — never commit (R15)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+
+# Playwright session state is a credential (R15)
+**/storageState*.json
+**/auth/*.json
+
+# Test and run artifacts: PII and tokens (R11, R15)
+artifacts/
+traces/
+test-results/
+playwright-report/
+*.har
+*.webm
+screenshots/
+videos/
+
+# Dependencies and build
+node_modules/
+dist/
+coverage/
+
+# OS / editor
+.DS_Store
+Thumbs.db
