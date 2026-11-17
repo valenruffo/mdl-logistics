@@ -50,7 +50,14 @@ export const CLIENT_JS = `(function () {
     }).then(function (response) {
       if (!response.ok) {
         return response.text().then(function (text) {
-          throw new Error(path + ' respondio ' + response.status + ': ' + text);
+          // A 409 while another run holds the browser lock carries an actionable
+          // sentence in "reason"; show that instead of the raw JSON.
+          var reason = text;
+          try {
+            var parsed = JSON.parse(text);
+            if (parsed && typeof parsed.reason === 'string' && parsed.reason !== '') reason = parsed.reason;
+          } catch (ignored) {}
+          throw new Error(path + ' respondio ' + response.status + ': ' + reason);
         });
       }
       return response.json();
@@ -453,6 +460,22 @@ export const CLIENT_JS = `(function () {
     return make('td', className || null, text);
   }
 
+  /**
+   * Labels for the closed vocabulary of failed checks. Fixed sentences that name
+   * the structural check; never text read out of a report.
+   */
+  var CHECK_LABELS = {
+    'shipment-id': 'el encabezado del detalle no trae un identificador #EM<numero>',
+    'status-badge': 'ningun estado del panel dice "Por enviar"',
+    'label-button': 'no hay un boton visible para la etiqueta',
+    'form-mismatch': 'el panel no coincide con el payload aprobado',
+    'form-not-approved': 'el hash aprobado no coincide con el formulario leido',
+    'outcome-unknown': 'el desenlace quedo desconocido',
+    'status-failed': 'el informe quedo en estado failed',
+    'status-error': 'el informe quedo en estado error',
+    'reconciliation-unread': 'el informe trae una conciliacion'
+  };
+
   function factsTable(rows) {
     var table = document.createElement('table');
     var body = document.createElement('tbody');
@@ -540,11 +563,18 @@ export const CLIENT_JS = `(function () {
     }
   }
 
+  /**
+   * The session-check history: four closed facts per row and nothing else.
+   *
+   * The check's own output is deliberately absent from this table. It is the
+   * script's stdout, it can name the recipient, and it stays in the history file
+   * on disk, which the operator reads over SSH.
+   */
   function checkTable(checks) {
     var table = document.createElement('table');
     var head = document.createElement('thead');
     var headRow = document.createElement('tr');
-    ['cuándo', 'resultado', 'salida', 'mensaje que imprimió'].forEach(function (title) {
+    ['cuándo', 'resultado', 'código de salida', 'duración'].forEach(function (title) {
       headRow.appendChild(make('th', null, title));
     });
     head.appendChild(headRow);
@@ -556,7 +586,7 @@ export const CLIENT_JS = `(function () {
       tr.appendChild(cellText(check.runAt));
       tr.appendChild(cellText(check.result, check.result === 'usable' ? 'ok' : 'bad'));
       tr.appendChild(cellText(check.exitCode === null ? 'sin código' : String(check.exitCode)));
-      tr.appendChild(cellText(check.message));
+      tr.appendChild(cellText(check.durationMs + ' ms'));
       body.appendChild(tr);
     });
     table.appendChild(body);
@@ -590,20 +620,24 @@ export const CLIENT_JS = `(function () {
     }
     box.appendChild(make('p', 'hint', 'El contenido de este archivo es la sesión del panel: la página solo mira tamaño y fecha, nunca lo abre.'));
 
+    box.appendChild(make('p', 'meta', 'historial de chequeos: ' + data.session.history.path));
+
+    if (data.session.history.unparseable) {
+      box.appendChild(make('p', 'bad',
+        'historial ilegible (unparseable): no se pudo reducir a ningún chequeo. Se informa solo la ruta; su contenido no se copia acá porque es la salida que imprimió el chequeo.'));
+    }
+
     box.appendChild(make('h3', null, 'Últimos chequeos (' + data.session.checks.length + ' de ' + data.session.limit + ')'));
     if (data.session.checks.length === 0) {
-      box.appendChild(make('p', 'warn', 'Todavía no hay ningún chequeo registrado: la salud no puede afirmar que la sesión esté usable hasta que corras uno.'));
+      box.appendChild(make('p', 'warn', data.session.history.unparseable
+        ? 'El historial existe pero no se puede leer: no hay ningún chequeo que mostrar, y la salud no puede afirmar que la sesión esté usable.'
+        : 'Todavía no hay ningún chequeo registrado: la salud no puede afirmar que la sesión esté usable hasta que corras uno.'));
       return;
     }
 
     box.appendChild(checkTable(data.session.checks));
-
-    var last = data.session.lastCheck;
-    if (last !== null) {
-      box.appendChild(make('h3', null, 'Salida completa del último chequeo (verbatim)'));
-      box.appendChild(make('p', 'mono', last.output === '' ? '(no imprimió nada)' : last.output));
-      if (last.spawnProblem !== null) box.appendChild(make('p', 'bad', last.spawnProblem));
-    }
+    box.appendChild(make('p', 'hint',
+      'De cada chequeo se muestran solo el resultado, el código de salida, la fecha y la duración. La salida completa queda en el historial, en disco, y se retira por SSH; esta página no la copia ni la muestra.'));
   }
 
   function renderRuns(data) {
@@ -620,7 +654,7 @@ export const CLIENT_JS = `(function () {
     var table = document.createElement('table');
     var head = document.createElement('thead');
     var headRow = document.createElement('tr');
-    ['run', 'cuándo', 'hash del mensaje', 'hash de aprobación', 'estado', 'desenlace', 'envío', 'costo', 'artefactos'].forEach(function (title) {
+    ['run', 'cuándo', 'hash del mensaje', 'hash de aprobación', 'estado', 'desenlace', 'envío', 'artefactos'].forEach(function (title) {
       headRow.appendChild(make('th', null, title));
     });
     head.appendChild(headRow);
@@ -636,7 +670,6 @@ export const CLIENT_JS = `(function () {
       tr.appendChild(cellText(textOr(row.status)));
       tr.appendChild(cellText(row.outcome === null ? 'sin desenlace' : row.outcome, row.unresolved ? 'bad' : null));
       tr.appendChild(cellText(textOr(row.shipmentId, '(sin envío)')));
-      tr.appendChild(cellText(textOr(row.costText, '(sin costo leído)')));
 
       var artifactCell = document.createElement('td');
       artifactCell.textContent = row.artifactDir === null ? '(no registrado)' : 'artifacts/' + row.artifactDir;
@@ -729,39 +762,33 @@ export const CLIENT_JS = `(function () {
     box.appendChild(factsTable([
       ['informe', latest.path],
       ['archivo', latest.kind],
-      ['modo', textOr(latest.mode)],
-      ['terminado', textOr(latest.finishedAt)],
-      ['escrito', latest.recordedAt]
+      ['terminado (según el informe)', textOr(latest.finishedAt)],
+      ['escrito (fecha del archivo)', latest.recordedAt]
     ]));
 
     box.appendChild(make('p', 'note',
-      'Este informe es de un run real: su texto puede citar el nombre o la dirección del destinatario. No se descarga desde acá; el archivo se retira del volumen por SSH, como el resto de los artefactos.'));
+      'El informe completo queda en disco en esa ruta y se retira por SSH: puede contener el nombre y la dirección del destinatario, por eso acá solo se muestran hechos estructurados y nunca su texto.'));
 
-    box.appendChild(make('h3', null, 'Comprobación estructural que falló (verbatim)'));
-    var table = document.createElement('table');
-    var head = document.createElement('thead');
-    var headRow = document.createElement('tr');
-    headRow.appendChild(make('th', null, 'campo del informe'));
-    headRow.appendChild(make('th', null, 'valor'));
-    head.appendChild(headRow);
-    table.appendChild(head);
+    if (latest.unparseable) {
+      box.appendChild(make('p', 'bad',
+        'informe ilegible (unparseable report): no se pudo reducir a las comprobaciones conocidas. Se informa solo la ruta; su contenido no se copia acá.'));
+      return;
+    }
 
-    var body = document.createElement('tbody');
-    latest.checks.forEach(function (check) {
-      var tr = document.createElement('tr');
-      tr.appendChild(cellText(check.check));
-      tr.appendChild(cellText(check.detail));
-      body.appendChild(tr);
-    });
-    table.appendChild(body);
-    box.appendChild(table);
-
-    box.appendChild(make('h3', null, 'Mensaje del informe (verbatim)'));
-    if (latest.message === null) {
-      box.appendChild(make('p', 'warn', 'El informe no trae un campo message, reason, failure ni error.'));
+    box.appendChild(make('h3', null, 'Comprobaciones estructurales que fallaron'));
+    if (latest.checks.length === 0) {
+      box.appendChild(make('p', 'warn', 'El informe no nombró ninguna comprobación del vocabulario conocido.'));
     } else {
-      box.appendChild(make('p', 'warn', 'Texto tal como lo escribió el ejecutor: puede nombrar al destinatario o su dirección.'));
-      box.appendChild(make('p', 'mono', latest.message));
+      var list = make('ul', 'issues');
+      latest.checks.forEach(function (id) {
+        list.appendChild(make('li', 'bad mono', id + ' - ' + textOr(CHECK_LABELS[id], id)));
+      });
+      box.appendChild(list);
+    }
+
+    if (latest.unrecognisedChecks > 0) {
+      box.appendChild(make('p', 'warn',
+        latest.unrecognisedChecks + ' comprobación(es) del informe no están en el vocabulario conocido: sus nombres no se copian acá.'));
     }
   }
 

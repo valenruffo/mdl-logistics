@@ -28,6 +28,12 @@ interface NodeProcess {
   /** Seconds since this process started. */
   uptime(): number;
   cwd(): string;
+  /**
+   * Signals a process or — with a negative pid — a whole process group. The
+   * session check uses this to stop the Chromium the check started, not only the
+   * script.
+   */
+  kill(pid: number, signal?: string): boolean;
 }
 
 declare module 'node:fs' {
@@ -53,6 +59,8 @@ declare module 'node:child_process' {
   }
 
   export interface ChildProcessHandle {
+    /** `undefined` when the spawn never produced a process. */
+    pid?: number | undefined;
     stdout: ChildOutput | null;
     stderr: ChildOutput | null;
     /** Overloads are declared as separate members, which TypeScript accepts. */
@@ -64,6 +72,14 @@ declare module 'node:child_process' {
   export function spawn(
     command: string,
     args: readonly string[],
-    options?: { cwd?: string; env?: Record<string, string | undefined> },
+    options?: {
+      cwd?: string;
+      env?: Record<string, string | undefined>;
+      /**
+       * Puts the child in its own process group, so a timeout can signal the
+       * script *and* the browser it started.
+       */
+      detached?: boolean;
+    },
   ): ChildProcessHandle;
 }

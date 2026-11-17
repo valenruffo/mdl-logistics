@@ -24,6 +24,13 @@
  * the operator has SSH and retrieves the files from the mounted volume; a web
  * server that can create shipments must not also hand out PII. Nothing in this
  * file reads a file's bytes to answer a request, and no route is a prefix.
+ *
+ * **Two routes open a browser, and they share one lock.** `/api/run` (both
+ * modes) and `/api/session-check` each used to spawn a Chromium on demand. The
+ * documented container has memory for one, so they now take `browserLock`
+ * (`lock.ts`) for the whole request: a second request gets a `409` carrying
+ * `LOCK_BUSY_MESSAGE` and runs nothing at all, and the lock is released in a
+ * `finally` whatever the run does.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
@@ -31,9 +38,10 @@ import { messageOf } from '../executor/errors';
 import { analyzeMessage, approveForm, runAttempt, type ActionDeps } from './actions';
 import { CLIENT_JS } from './client';
 import { performSessionCheck, readConsole, resolveConsoleDeps, type ConsoleDeps } from './console';
+import { LOCK_BUSY_MESSAGE, withBrowserLock } from './lock';
 import { ARTIFACT_RETRIEVAL_INSTRUCTION, PAGE_HTML } from './page';
 
-export { ARTIFACT_RETRIEVAL_INSTRUCTION, CLIENT_JS, PAGE_HTML };
+export { ARTIFACT_RETRIEVAL_INSTRUCTION, CLIENT_JS, LOCK_BUSY_MESSAGE, PAGE_HTML };
 
 /** Loopback only. Not configurable, by design. */
 export const HOST = '127.0.0.1';
@@ -73,6 +81,14 @@ function routeMatches(route: Route, path: string): boolean {
 
 function json(status: number, value: unknown): UiResponse {
   return { status, contentType: 'application/json; charset=utf-8', body: JSON.stringify(value) };
+}
+
+/**
+ * A request that arrived while another one holds the browser lock. `409`, the
+ * one message from `lock.ts`, and nothing was read or written on its behalf.
+ */
+function busy(heldBy: string | null): UiResponse {
+  return json(409, { status: 'busy', heldBy, reason: LOCK_BUSY_MESSAGE });
 }
 
 function html(body: string): UiResponse {
@@ -179,17 +195,23 @@ export function createRoutes(deps: ActionDeps): Route[] {
         const approvedHash = parsed.value['approvedHash'];
         const token = parsed.value['token'];
 
-        const result = await runAttempt(
-          {
-            message: textField(parsed.value, 'message'),
-            form: formField(parsed.value),
-            mode,
-            approvedHash: typeof approvedHash === 'string' ? approvedHash : null,
-            token: typeof token === 'string' ? token : null,
-          },
-          deps,
+        // Both modes drive the panel, so both take the one browser lock. The
+        // gates are read inside it too: a prior-attempt check must not race a
+        // run that is about to write its own record.
+        const guarded = await withBrowserLock('run', async () =>
+          runAttempt(
+            {
+              message: textField(parsed.value, 'message'),
+              form: formField(parsed.value),
+              mode,
+              approvedHash: typeof approvedHash === 'string' ? approvedHash : null,
+              token: typeof token === 'string' ? token : null,
+            },
+            deps,
+          ),
         );
-        return json(200, result);
+        if (!guarded.ok) return busy(guarded.holder);
+        return json(200, guarded.value);
       },
     },
     {
@@ -205,7 +227,13 @@ export function createRoutes(deps: ActionDeps): Route[] {
       purpose:
         'corre session-check solo cuando el operador lo pide: abre un navegador y guarda el resultado en el historial',
       handle: async () => {
-        const outcome = await performSessionCheck(consoleDeps);
+        // The same lock as `/api/run`: one Chromium at a time in this process,
+        // and the timeout escalation runs inside it, so a wedged browser cannot
+        // be left behind holding the lock.
+        const guarded = await withBrowserLock('session-check', async () => performSessionCheck(consoleDeps));
+        if (!guarded.ok) return busy(guarded.holder);
+
+        const outcome = guarded.value;
         return json(200, { ...outcome.snapshot, check: outcome.check, problems: outcome.problems });
       },
     },

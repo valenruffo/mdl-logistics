@@ -16,8 +16,10 @@
  *  - the artifact tree being empty, missing or not a readable directory is a
  *    warning on a working page;
  *  - the health line is derived for every combination of its three facts;
- *  - the session check only runs when asked, records its exit code and message,
- *    and keeps a capped history;
+ *  - the session check only runs when asked, records its exit code, and keeps a
+ *    capped history; only its four closed facts (result, exit code, timestamp,
+ *    duration) cross the HTTP boundary, and an unparseable history is reported by
+ *    path;
  *  - no route, page or client script mentions a purchase.
  */
 import assert from 'node:assert/strict';
@@ -34,10 +36,13 @@ import {
   resolveConsoleDeps,
   type ConsoleDeps,
   type ProcessInfo,
-  type SessionCheckEntry,
 } from '../../src/ui/console';
 import { relativeSegments } from '../../src/ui/paths';
-import { SESSION_CHECK_HISTORY_LIMIT } from '../../src/ui/sessionCheck';
+import {
+  SESSION_CHECK_HISTORY_LIMIT,
+  type SessionCheckEntry,
+  type SessionCheckFact,
+} from '../../src/ui/sessionCheck';
 import type { SessionCheckRunner } from '../../src/ui/sessionCheck';
 
 // ------------------------------------------------------------------ fixtures
@@ -170,6 +175,8 @@ test('the empty state renders notices instead of invented numbers', async () => 
       assert.equal(snapshot.errors.latest, null);
       assert.equal(snapshot.session.lastCheck, null);
       assert.deepEqual(snapshot.session.checks, []);
+      assert.equal(snapshot.session.history.unparseable, false, 'a missing history is not an unparseable one');
+      assert.equal(snapshot.session.history.path, box.historyPath);
 
       // A missing directory is announced, not silently reported as zero.
       const messages = snapshot.warnings.map((warning) => `${warning.source} ${warning.message}`).join('\n');
@@ -211,7 +218,6 @@ test('a corrupt record is a warning and the readable records are still listed', 
       assert.equal(good.resolution, null);
       assert.equal(good.messageHashShort, MESSAGE_HASH.slice(0, 12));
       assert.equal(good.approvalHashShort, APPROVAL_HASH.slice(0, 12));
-      assert.match(good.costText ?? '', /1234/);
 
       const junk = snapshot.runs.rows.find((row) => row.runId === 'junk');
       assert.ok(junk, 'a readable but unusable record is shown with its problems');
@@ -476,20 +482,16 @@ test('the page renders when the artifact tree is missing, empty, or not a direct
 // ------------------------------------------------------------- 4. health facts
 
 test('health is derived for every combination of its three facts', () => {
-  const results = ['usable', 'unusable', 'bad-config', 'no-browser', 'error'] as const;
+  const results = ['usable', 'unusable', 'config-refused', 'browser-failed'] as const;
 
-  const entry = (result: (typeof results)[number]): SessionCheckEntry => ({
+  const entry = (result: (typeof results)[number]): SessionCheckFact => ({
     runAt: '2026-02-06T09:00:00.000Z',
     result,
-    exitCode: result === 'usable' ? 0 : result === 'unusable' ? 1 : result === 'bad-config' ? 2 : result === 'no-browser' ? 3 : null,
+    exitCode: result === 'usable' ? 0 : result === 'unusable' ? 1 : result === 'config-refused' ? 2 : 3,
     durationMs: 10,
-    message: result === 'usable' ? 'OK: la sesión es utilizable.' : 'ERROR: la sesión no es utilizable',
-    output: '',
-    opensBrowser: true,
-    spawnProblem: null,
   });
 
-  const sessions: (SessionCheckEntry | null)[] = [null, ...results.map(entry)];
+  const sessions: (SessionCheckFact | null)[] = [null, ...results.map(entry)];
   const attemptSets: string[][] = [[], ['open-run']];
   const writableFlags: boolean[] = [true, false];
 
@@ -555,36 +557,54 @@ test('health is derived for every combination of its three facts', () => {
 
 // --------------------------------------------------------- 5. the session check
 
-test('the session check records the exit code and the message it printed', async () => {
+test('the session check records the exit code, and the snapshot carries only closed facts', async () => {
   const box = await sandbox('check');
   try {
     await withEnv(CLEAN_ENV, async () => {
-      const deps = depsOf(box, runnerReturning('  estado: listo\nOK: la sesión es utilizable.\n', 0));
+      const printed = '  estado: listo\nOK: la sesión es utilizable: Titular Ficticia Delvalle.\n';
+      const deps = depsOf(box, runnerReturning(printed, 0));
       const { performSessionCheck } = await import('../../src/ui/console');
       const outcome = await performSessionCheck(deps);
 
+      // The HTTP shape: four facts, and not the message the script printed.
+      assert.deepEqual(Object.keys(outcome.check).sort(), ['durationMs', 'exitCode', 'result', 'runAt']);
       assert.equal(outcome.check.result, 'usable');
       assert.equal(outcome.check.exitCode, 0);
-      assert.equal(outcome.check.message, 'OK: la sesión es utilizable.');
-      assert.equal(outcome.check.opensBrowser, true);
+      assert.equal(outcome.check.durationMs, 12);
+      assert.match(outcome.check.runAt, /^\d{4}-\d{2}-\d{2}T/);
+      assert.doesNotMatch(JSON.stringify(outcome.check), /Ficticia Delvalle/);
+
       assert.deepEqual(outcome.problems, []);
       assert.equal(outcome.snapshot.health.canWork, true, 'a usable check with nothing open makes the agent able to work');
 
+      // The history file keeps the check's own text: only the projection changed.
       const stored: unknown = JSON.parse(await readFile(box.historyPath, { encoding: 'utf8' }));
       assert.ok(typeof stored === 'object' && stored !== null);
-      assert.equal((stored as { checks: unknown[] }).checks.length, 1);
+      const [recorded] = (stored as { checks: SessionCheckEntry[] }).checks;
+      assert.ok(recorded);
+      assert.equal(recorded.message, 'OK: la sesión es utilizable: Titular Ficticia Delvalle.');
+      assert.match(recorded.output, /estado: listo/);
+      assert.match(recorded.output, /Ficticia Delvalle/);
+      assert.equal(recorded.opensBrowser, true);
 
       // The recorded check is what the console shows next time, and it is not re-run.
       const snapshot = await readConsole(depsOf(box, forbiddenRunner()));
       assert.equal(snapshot.session.lastCheck?.result, 'usable');
-      assert.equal(snapshot.session.lastCheck?.message, 'OK: la sesión es utilizable.');
+      assert.deepEqual(snapshot.session.checks[0], outcome.check);
+      assert.deepEqual(Object.keys(snapshot.session.lastCheck ?? {}).sort(), [
+        'durationMs',
+        'exitCode',
+        'result',
+        'runAt',
+      ]);
+      assert.doesNotMatch(JSON.stringify(snapshot), /Ficticia Delvalle/, 'no script text reaches the snapshot');
     });
   } finally {
     cleanup(box);
   }
 });
 
-test('every documented exit code maps to its own result, and a spawn failure is an error', async () => {
+test('every documented exit code maps to its own closed result, and a spawn failure is browser-failed', async () => {
   const box = await sandbox('check-codes');
   const { performSessionCheck } = await import('../../src/ui/console');
 
@@ -593,10 +613,10 @@ test('every documented exit code maps to its own result, and a spawn failure is 
       const cases: { code: number | null; problem: string | null; expected: string }[] = [
         { code: 0, problem: null, expected: 'usable' },
         { code: 1, problem: null, expected: 'unusable' },
-        { code: 2, problem: null, expected: 'bad-config' },
-        { code: 3, problem: null, expected: 'no-browser' },
-        { code: 9, problem: null, expected: 'error' },
-        { code: null, problem: 'no se pudo iniciar el chequeo: ENOENT', expected: 'error' },
+        { code: 2, problem: null, expected: 'config-refused' },
+        { code: 3, problem: null, expected: 'browser-failed' },
+        { code: 9, problem: null, expected: 'browser-failed' },
+        { code: null, problem: 'no se pudo iniciar el chequeo: ENOENT', expected: 'browser-failed' },
       ];
 
       for (const item of cases) {
@@ -604,15 +624,21 @@ test('every documented exit code maps to its own result, and a spawn failure is 
         const outcome = await performSessionCheck(deps);
         assert.equal(outcome.check.result, item.expected, `exit code ${String(item.code)}`);
         assert.equal(outcome.check.exitCode, item.code);
+        assert.doesNotMatch(
+          JSON.stringify(outcome.check),
+          /ENOENT|no es utilizable/,
+          'neither the spawn problem nor the printed line is part of the projection',
+        );
       }
 
-      // A runner that throws is recorded as an error, never as a crash.
+      // A runner that throws is recorded as browser-failed, never as a crash.
       const throwing = (async () => {
         throw new Error('spawn exploded');
       }) as SessionCheckRunner;
       const outcome = await performSessionCheck(depsOf(box, throwing));
-      assert.equal(outcome.check.result, 'error');
-      assert.match(outcome.check.spawnProblem ?? '', /spawn exploded/);
+      assert.equal(outcome.check.result, 'browser-failed');
+      assert.deepEqual(Object.keys(outcome.check).sort(), ['durationMs', 'exitCode', 'result', 'runAt']);
+      assert.doesNotMatch(JSON.stringify(outcome.check), /spawn exploded/);
     });
   } finally {
     cleanup(box);
@@ -640,10 +666,16 @@ test('the history keeps the newest checks, capped, and survives a corrupt file',
       assert.equal(checks.length, SESSION_CHECK_HISTORY_LIMIT, 'the history is capped');
       assert.equal(checks[0]?.message, `OK: corrida ${SESSION_CHECK_HISTORY_LIMIT + 2}`, 'newest first');
 
-      // A corrupt history is a warning, and the next check still records.
-      await writeFile(box.historyPath, 'not json', { encoding: 'utf8' });
+      // A corrupt history is a warning, and the next check still records. The
+      // bytes are never quoted back, and the file is reported as unparseable by
+      // path.
+      const marker = 'TITULAR-FICTICIA-EN-HISTORIAL';
+      await writeFile(box.historyPath, `${marker} not json`, { encoding: 'utf8' });
       const snapshot = await readConsole(depsOf(box, forbiddenRunner()));
       assert.deepEqual(snapshot.session.checks, []);
+      assert.equal(snapshot.session.history.unparseable, true);
+      assert.equal(snapshot.session.history.path, box.historyPath);
+      assert.doesNotMatch(JSON.stringify(snapshot), new RegExp(marker), 'never an excerpt of the file');
       assert.match(
         snapshot.warnings.map((warning) => warning.message).join('\n'),
         /no es JSON válido/,
@@ -651,6 +683,7 @@ test('the history keeps the newest checks, capped, and survives a corrupt file',
 
       const repaired = await performSessionCheck(depsOf(box, runnerReturning('OK: la sesión es utilizable.', 0)));
       assert.equal(repaired.snapshot.session.checks.length, 1);
+      assert.equal(repaired.snapshot.session.history.unparseable, false);
       assert.match(repaired.problems.join('\n'), /no es JSON válido/);
     });
   } finally {
@@ -708,7 +741,7 @@ test('no session content is rendered: only the file size and its date', async ()
 
 // ------------------------------------------------------------ 7. the errors tab
 
-test('the newest failing report is shown verbatim, and a passing report is ignored', async () => {
+test('the newest failing report is reduced to closed structural facts', async () => {
   const box = await sandbox('errors');
   try {
     await withEnv(CLEAN_ENV, async () => {
@@ -742,6 +775,7 @@ test('the newest failing report is shown verbatim, and a passing report is ignor
         message: 'the panel does not hold the approved payload',
         finishedAt: '2026-02-07T10:00:00.000Z',
         reconciliation: { interpretation: 'one candidate row matches the recipient' },
+        failedChecks: ['shipmentId', 'statusBadge', 'buyButton', 'somethingElse'],
       });
       await writeFile(path.join(box.artifactsDir, 'broken-report.json'), 'nope', { encoding: 'utf8' });
 
@@ -749,20 +783,82 @@ test('the newest failing report is shown verbatim, and a passing report is ignor
       const latest = snapshot.errors.latest;
       assert.ok(latest);
       assert.equal(latest.path, 'executor-new/create-run.json');
+      assert.equal(latest.kind, 'create-run');
+      assert.equal(latest.unparseable, false);
       assert.equal('href' in latest, false, 'the report is named by path, never by a URL');
-      assert.equal(latest.kind, 'create-run.json');
-      assert.equal(latest.message, 'the panel does not hold the approved payload');
-      assert.deepEqual(
-        latest.checks.map((check) => check.check),
-        ['mismatches[0]', 'formMatchesApproval', 'outcome', 'reconciliation.interpretation'],
-      );
-      assert.equal(latest.checks[0]?.detail, 'carrier: expected "Andreani a domicilio", the panel holds "Entrega a domicilio"');
+      assert.equal(latest.finishedAt, '2026-02-07T10:00:00.000Z');
+      assert.match(latest.recordedAt, /^\d{4}-\d{2}-\d{2}T/);
+      assert.deepEqual(latest.checks, [
+        'shipment-id',
+        'status-badge',
+        'label-button',
+        'form-mismatch',
+        'form-not-approved',
+        'outcome-unknown',
+        'reconciliation-unread',
+      ]);
+      assert.equal(latest.unrecognisedChecks, 1, 'a name outside the vocabulary is counted, never copied');
+
+      // The report's own free text is nowhere in the section: it can quote the
+      // recipient, and this snapshot is served over HTTP.
+      const rendered = JSON.stringify(snapshot.errors);
+      assert.doesNotMatch(rendered, /the panel does not hold the approved payload/);
+      assert.doesNotMatch(rendered, /Entrega a domicilio/);
+      assert.doesNotMatch(rendered, /one candidate row matches the recipient/);
+      assert.doesNotMatch(rendered, /somethingElse/);
+      assert.deepEqual(Object.keys(latest).sort(), [
+        'checks',
+        'finishedAt',
+        'kind',
+        'path',
+        'recordedAt',
+        'unparseable',
+        'unrecognisedChecks',
+      ]);
 
       // Nothing in the report section is a URL to its contents.
-      assert.doesNotMatch(JSON.stringify(snapshot.errors), /\/artifacts\//);
+      assert.doesNotMatch(rendered, /\/artifacts\//);
 
       // A report whose structural checks held is not an error.
       assert.ok(!snapshot.errors.latest?.path.includes('executor-passing'));
+    });
+  } finally {
+    cleanup(box);
+  }
+});
+
+test('a report that cannot be reduced to the vocabulary is unparseable, by path only', async () => {
+  const box = await sandbox('errors-unparseable');
+  try {
+    await withEnv(CLEAN_ENV, async () => {
+      const marker = 'DESTINATARIO-FICTICIO-987654';
+      const dir = path.join(box.artifactsDir, 'executor-broken');
+      await mkdir(dir, { recursive: true });
+
+      // Not JSON at all, and it starts with the marker: a parse error message
+      // quotes those bytes, so the warning must not be the parser's message.
+      await writeFile(path.join(dir, 'failure.json'), `${marker} is not json\n`, { encoding: 'utf8' });
+
+      const snapshot = await readConsole(depsOf(box, forbiddenRunner()));
+      const latest = snapshot.errors.latest;
+      assert.ok(latest, 'an unreadable failing report is still the latest one');
+      assert.equal(latest.path, 'executor-broken/failure.json');
+      assert.equal(latest.kind, 'failure');
+      assert.equal(latest.unparseable, true);
+      assert.deepEqual(latest.checks, []);
+      assert.equal(latest.finishedAt, null);
+
+      assert.doesNotMatch(JSON.stringify(snapshot), new RegExp(marker), 'the raw bytes never reach the snapshot');
+      assert.match(snapshot.warnings.map((warning) => warning.message).join('\n'), /solo la ruta/);
+
+      // A parseable report that names no known check is unparseable too.
+      const silent = path.join(box.artifactsDir, 'executor-silent');
+      await mkdir(silent, { recursive: true });
+      await writeJson(path.join(silent, 'failure.json'), { message: marker, note: 'nothing structural' });
+
+      const second = await readConsole(depsOf(box, forbiddenRunner()));
+      assert.equal(second.errors.latest?.unparseable, true);
+      assert.doesNotMatch(JSON.stringify(second), new RegExp(marker));
     });
   } finally {
     cleanup(box);

@@ -8,10 +8,17 @@
  *    corrupt JSON file becomes a `Warning` that the page renders. Nothing here
  *    throws at the page and nothing here silently shows a zero instead of the
  *    problem it could not read.
- * 2. **Nothing is interpreted.** Every string the console shows is either a file
- *    name, a path, a value read verbatim from a record, or a sentence this module
- *    derived from those values by an explicit rule. There is no model in this
- *    path and no free-text summary of anything.
+ * 2. **Nothing free-text crosses the HTTP boundary.** Every string the console
+ *    shows is either a file name, a path, a value the console derived from a
+ *    record by an explicit rule, or a sentence this module wrote. Executor
+ *    reports are read only for *structural* facts: a report's message,
+ *    mismatches, reconciliation, journey readback and card text can quote the
+ *    recipient, so they are never copied into the snapshot (see
+ *    `FAILED_CHECKS` and the no-artifact-over-HTTP rule in `server.ts`). The
+ *    session-check history is projected the same way: only its closed facts
+ *    (result, exit code, timestamp, duration) reach the snapshot, because the
+ *    check prints what it saw on the panel. There is no model in this path and
+ *    no free-text summary of anything.
  * 3. **No secret is read.** The session file and the Chromium profile are only
  *    `stat`ed (size and mtime); their contents are a credential (R15). The store
  *    origin is shown as a host, and it cannot carry userinfo because
@@ -37,10 +44,11 @@ import {
 import {
   SESSION_CHECK_HISTORY_LIMIT,
   SESSION_CHECK_HISTORY_PATH,
+  factOfCheck,
   readSessionCheckHistory,
   runAndRecordSessionCheck,
   runSessionCheckScript,
-  type SessionCheckEntry,
+  type SessionCheckFact,
   type SessionCheckRunner,
 } from './sessionCheck';
 
@@ -325,12 +333,29 @@ function readSessionFile(layer: SessionLayer): SessionFileRead {
   return file;
 }
 
+/**
+ * The check history as the HTTP surface may describe it: where it lives, and
+ * whether the file could be used at all.
+ *
+ * `unparseable` is a fact about the **file**, not about a check: the console says
+ * "unparseable" and names the path, and never an excerpt — the file holds the
+ * check's own stdout.
+ */
+export interface SessionCheckHistoryFact {
+  /** The history file, as configured (`artifacts/ui/session-checks.json` by default). */
+  path: string;
+  /** True when the file exists but yields no usable entry: only `path` is reportable. */
+  unparseable: boolean;
+}
+
 export interface SessionSection {
   file: SessionFileRead;
-  /** Newest first, capped at `limit`. */
-  checks: SessionCheckEntry[];
-  lastCheck: SessionCheckEntry | null;
+  /** Newest first, capped at `limit`. Closed facts only: no script text. */
+  checks: SessionCheckFact[];
+  lastCheck: SessionCheckFact | null;
   limit: number;
+  /** Where the checks — and the full output — are on disk. */
+  history: SessionCheckHistoryFact;
   warnings: Warning[];
 }
 
@@ -348,13 +373,16 @@ async function readSessionSection(deps: ConsoleDeps, layer: SessionLayer): Promi
     warnings.push({ source: deps.sessionCheckHistoryPath, message: history.problem });
   }
 
-  const checks = history.checks.slice(0, SESSION_CHECK_HISTORY_LIMIT);
+  // The stored entries keep the script's output on disk; the snapshot keeps only
+  // the four closed facts, so no substring of the check's stdout can be served.
+  const checks = history.checks.slice(0, SESSION_CHECK_HISTORY_LIMIT).map(factOfCheck);
 
   return {
     file,
     checks,
     lastCheck: checks[0] ?? null,
     limit: SESSION_CHECK_HISTORY_LIMIT,
+    history: { path: deps.sessionCheckHistoryPath, unparseable: history.unparseable },
     warnings,
   };
 }
@@ -375,8 +403,6 @@ export interface RunRow {
   outcomeFinishedAt: string | null;
   /** The `#EM<number>` the panel printed, when the run recorded one. */
   shipmentId: string | null;
-  /** What the panel showed for the cost, verbatim, or `null`. */
-  costText: string | null;
   /** Artifact directory, relative to the artifacts root; `null` when unknown. */
   artifactDir: string | null;
   /** True when this record blocks the create path: no outcome, or an unknown one. */
@@ -394,18 +420,6 @@ export interface RunsSection {
 }
 
 const OUTCOME_STATUSES: readonly RecordedOutcomeStatus[] = ['created', 'unknown', 'not-created'];
-
-function costTextOf(outcome: Record<string, unknown>): string | null {
-  const cost = recordOf(outcome, 'costShown');
-  if (cost === null) return null;
-
-  const parts: string[] = [];
-  const summary = textOf(cost, 'summaryModality');
-  const detail = textOf(cost, 'detailShipmentData');
-  if (summary !== null && summary.trim() !== '') parts.push(`resumen: ${summary}`);
-  if (detail !== null && detail.trim() !== '') parts.push(`detalle: ${detail}`);
-  return parts.length === 0 ? null : parts.join(' · ');
-}
 
 /**
  * The artifact directory a recorded report path points at, relative to the
@@ -474,17 +488,27 @@ interface RawRun {
 }
 
 async function readRawRun(deps: ConsoleDeps, name: string, runId: string, problems: string[]): Promise<RawRun | null> {
+  let text: string;
+  try {
+    text = await readFile(joinPath(deps.recordDir, [name]), { encoding: 'utf8' });
+  } catch (error) {
+    problems.push(`no se pudo leer el registro: ${messageOf(error)}`);
+    return null;
+  }
+
+  // A record carries the approved payload (name, address, postal code), so a
+  // parse failure is reported without the parser's own message: it quotes the
+  // bytes it choked on.
   let parsed: Record<string, unknown>;
   try {
-    const text = await readFile(joinPath(deps.recordDir, [name]), { encoding: 'utf8' });
     const value: unknown = JSON.parse(text);
     if (!isRecord(value)) {
       problems.push('el registro no es un objeto JSON');
       return null;
     }
     parsed = value;
-  } catch (error) {
-    problems.push(`no se pudo leer el registro: ${messageOf(error)}`);
+  } catch {
+    problems.push('no se pudo leer el registro: el archivo no es JSON válido (no se copia su contenido)');
     return null;
   }
 
@@ -497,7 +521,6 @@ async function readRawRun(deps: ConsoleDeps, name: string, runId: string, proble
     outcome: null,
     outcomeFinishedAt: null,
     shipmentId: null,
-    costText: null,
     artifactDir: null,
     unresolved: true,
     resolution: null,
@@ -518,24 +541,33 @@ async function readOutcome(
   const { row } = raw;
   const path = joinPath(deps.recordDir, [outcomeName]);
 
+  let text: string;
+  try {
+    text = await readFile(path, { encoding: 'utf8' });
+  } catch (error) {
+    row.problems.push(`el desenlace no se pudo leer y se trata como no resuelto: ${messageOf(error)}`);
+    return;
+  }
+
   let parsed: Record<string, unknown>;
   try {
-    const text = await readFile(path, { encoding: 'utf8' });
     const value: unknown = JSON.parse(text);
     if (!isRecord(value)) {
       row.problems.push('el desenlace no es un objeto JSON: se trata como no resuelto');
       return;
     }
     parsed = value;
-  } catch (error) {
-    row.problems.push(`el desenlace no se pudo leer y se trata como no resuelto: ${messageOf(error)}`);
+  } catch {
+    row.problems.push(
+      'el desenlace no se pudo leer y se trata como no resuelto: el archivo no es JSON válido (no se copia su contenido)',
+    );
     return;
   }
 
   const status = textOf(parsed, 'status');
   if (status === null || !OUTCOME_STATUSES.includes(status as RecordedOutcomeStatus)) {
     row.problems.push(
-      `el desenlace trae un status que no se puede usar (${JSON.stringify(parsed['status'] ?? null)}): se trata como no resuelto`,
+      'el desenlace trae un status que no se puede usar: se trata como no resuelto (no se copia el valor)',
     );
     return;
   }
@@ -543,7 +575,6 @@ async function readOutcome(
   row.outcome = status as RecordedOutcomeStatus;
   row.outcomeFinishedAt = textOf(parsed, 'finishedAt');
   row.shipmentId = textOf(parsed, 'shipmentId');
-  row.costText = costTextOf(parsed);
 
   const reportPath = textOf(parsed, 'reportPath');
   raw.reportPath = reportPath === null || reportPath.trim() === '' ? null : reportPath;
@@ -746,25 +777,85 @@ async function readArtifacts(deps: ConsoleDeps, rows: readonly RunRow[]): Promis
 
 // ------------------------------------------------------------------- errors
 
-export interface FailedCheck {
-  /** Which field of the report failed, as it is named in the file. */
-  check: string;
-  /** Its value, verbatim. */
-  detail: string;
-}
+/**
+ * The closed vocabulary of structural facts a report can fail.
+ *
+ * It exists because of *what is on the other side of the boundary*: a report is
+ * written from the panel, so its `message`, its `mismatches`, its
+ * `reconciliation.interpretation`, its journey readback and its card text can
+ * quote the recipient's name, address and phone. Those fields are free text and
+ * they never reach the HTTP surface (see `server.ts`: no artifact over HTTP).
+ * Only identifiers from this list, the report's kind, a timestamp and the file
+ * path do.
+ *
+ * `label-button` is the executor's third unpaid-label check: "a visible button
+ * whose accessible name contains the label wording is present". The identifier
+ * deliberately avoids the pay verb, because nothing in `src/ui/` names that
+ * action.
+ */
+export const FAILED_CHECKS = [
+  'shipment-id',
+  'status-badge',
+  'label-button',
+  'form-mismatch',
+  'form-not-approved',
+  'outcome-unknown',
+  'status-failed',
+  'status-error',
+  'reconciliation-unread',
+] as const;
 
+export type FailedCheckId = (typeof FAILED_CHECKS)[number];
+
+/** The reports the console names. The same three files `REPORT_FILE_NAMES` lists. */
+export const REPORT_KINDS = ['dry-run', 'create-run', 'failure'] as const;
+
+export type ReportKind = (typeof REPORT_KINDS)[number];
+
+/**
+ * Report field names mapped onto the vocabulary. A report may name its failing
+ * checks (`failedChecks`, `structuralChecks`); only names listed here survive,
+ * and an unknown name is counted, never copied.
+ */
+const CHECK_NAME_ALIASES: ReadonlyMap<string, FailedCheckId> = new Map<string, FailedCheckId>([
+  ['shipment-id', 'shipment-id'],
+  ['shipmentid', 'shipment-id'],
+  ['status-badge', 'status-badge'],
+  ['statusbadge', 'status-badge'],
+  ['label-button', 'label-button'],
+  ['labelbutton', 'label-button'],
+  ['buybutton', 'label-button'],
+  ['form-mismatch', 'form-mismatch'],
+  ['formmismatch', 'form-mismatch'],
+  ['form-not-approved', 'form-not-approved'],
+  ['formnotapproved', 'form-not-approved'],
+  ['outcome-unknown', 'outcome-unknown'],
+  ['outcomeunknown', 'outcome-unknown'],
+  ['reconciliation-unread', 'reconciliation-unread'],
+]);
+
+/**
+ * One failing report, reduced to structured facts.
+ *
+ * There is no `message`, no `mismatch` and no `reconciliation` field: those are
+ * exactly the strings that could carry recipient data, and the HTTP surface must
+ * not be able to return them even for a report that has them on disk.
+ */
 export interface FailureReport {
   /** Repository-relative path of the report file. */
   path: string;
-  kind: string;
-  mode: string | null;
+  /** Which of the three report files this is, from `REPORT_KINDS`. */
+  kind: ReportKind;
+  /** The report's own `finishedAt`, kept only when it is an ISO timestamp. */
   finishedAt: string | null;
-  /** The failing structural checks, verbatim. */
-  checks: FailedCheck[];
-  /** The report's own message field(s), verbatim; `null` when it carried none. */
-  message: string | null;
   /** The report file's modification time, ISO. */
   recordedAt: string;
+  /** Closed-vocabulary identifiers only, in `FAILED_CHECKS` order. */
+  checks: FailedCheckId[];
+  /** How many names the report carried outside the vocabulary (a count, not text). */
+  unrecognisedChecks: number;
+  /** True when the file could not be reduced to those facts: show the path only. */
+  unparseable: boolean;
 }
 
 export interface ErrorsSection {
@@ -772,38 +863,63 @@ export interface ErrorsSection {
   warnings: Warning[];
 }
 
-function stringListOf(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  const parts: string[] = [];
-  for (const item of value) if (typeof item === 'string') parts.push(item);
-  return parts;
+/** ISO-8601 UTC, the only shape a report timestamp may have to be shown. */
+const TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+
+function timestampOf(source: Record<string, unknown>, key: string): string | null {
+  const value = textOf(source, key);
+  return value !== null && TIMESTAMP.test(value) ? value : null;
 }
 
-function failedChecksOf(source: Record<string, unknown>): FailedCheck[] {
-  const checks: FailedCheck[] = [];
+/** The report kind its file name declares; `null` for a name that is not one. */
+function reportKindOf(file: string): ReportKind | null {
+  const name = baseNameOf(file);
+  const stripped = name.endsWith('.json') ? name.slice(0, -'.json'.length) : name;
+  return (REPORT_KINDS as readonly string[]).includes(stripped) ? (stripped as ReportKind) : null;
+}
 
-  stringListOf(source['mismatches']).forEach((detail, index) => {
-    checks.push({ check: `mismatches[${index}]`, detail });
-  });
+interface ClosedFacts {
+  checks: FailedCheckId[];
+  unrecognisedChecks: number;
+}
 
-  if (source['formMatchesApproval'] === false) {
-    checks.push({ check: 'formMatchesApproval', detail: 'false' });
-  }
-  if (source['outcome'] === 'unknown') {
-    checks.push({ check: 'outcome', detail: 'unknown' });
-  }
+/**
+ * Reads the report's *structure* and nothing else. Every branch below looks at a
+ * boolean, an enum value or the length of an array; the values of the strings in
+ * `mismatches` are never read out.
+ */
+function closedFactsOf(source: Record<string, unknown>): ClosedFacts {
+  const found = new Set<FailedCheckId>();
+  let unrecognisedChecks = 0;
+
+  const mismatches = source['mismatches'];
+  if (Array.isArray(mismatches) && mismatches.length > 0) found.add('form-mismatch');
+  if (source['formMatchesApproval'] === false) found.add('form-not-approved');
+  if (source['outcome'] === 'unknown') found.add('outcome-unknown');
+
   const status = textOf(source, 'status');
-  if (status === 'failed' || status === 'error') {
-    checks.push({ check: 'status', detail: status });
+  if (status === 'failed') found.add('status-failed');
+  if (status === 'error') found.add('status-error');
+  if (recordOf(source, 'reconciliation') !== null) found.add('reconciliation-unread');
+
+  for (const key of ['failedChecks', 'structuralChecks']) {
+    const raw = source[key];
+    if (!Array.isArray(raw)) continue;
+    for (const item of raw) {
+      if (typeof item !== 'string') {
+        unrecognisedChecks += 1;
+        continue;
+      }
+      const mapped = CHECK_NAME_ALIASES.get(item.trim().toLowerCase());
+      if (mapped === undefined) unrecognisedChecks += 1;
+      else found.add(mapped);
+    }
   }
 
-  const reconciliation = recordOf(source, 'reconciliation');
-  if (reconciliation !== null) {
-    const interpretation = textOf(reconciliation, 'interpretation');
-    if (interpretation !== null) checks.push({ check: 'reconciliation.interpretation', detail: interpretation });
-  }
-
-  return checks;
+  return {
+    checks: FAILED_CHECKS.filter((id) => found.has(id)),
+    unrecognisedChecks,
+  };
 }
 
 interface ReportCandidate {
@@ -886,41 +1002,83 @@ async function reportCandidates(deps: ConsoleDeps, warnings: Warning[]): Promise
   return candidates;
 }
 
+/**
+ * Reads every report file and keeps the newest one that failed something.
+ *
+ * A report that cannot be reduced to `FAILED_CHECKS` is reported as
+ * **unparseable**, by path, and nothing else. That includes a file that is not
+ * JSON: a `JSON.parse` error message quotes the beginning of the file it choked
+ * on, so the reason is never `messageOf(error)` here — a corrupt report would
+ * leak its own first bytes through the warning.
+ */
 async function readErrors(deps: ConsoleDeps): Promise<ErrorsSection> {
   const warnings: Warning[] = [];
   const candidates = await reportCandidates(deps, warnings);
   const failures: FailureReport[] = [];
 
   for (const candidate of candidates) {
-    let parsed: Record<string, unknown>;
+    const relative = candidate.segments.join('/');
+    const kind = reportKindOf(relative);
+    if (kind === null) continue;
+
+    const unparseableReport = (): FailureReport => ({
+      path: relative,
+      kind,
+      finishedAt: null,
+      recordedAt: candidate.recordedAt,
+      checks: [],
+      unrecognisedChecks: 0,
+      unparseable: true,
+    });
+
+    let text: string;
     try {
-      const text = await readFile(candidate.file, { encoding: 'utf8' });
-      const value: unknown = JSON.parse(text);
-      if (!isRecord(value)) {
-        warnings.push({ source: candidate.file, message: 'el informe no es un objeto JSON' });
-        continue;
-      }
-      parsed = value;
+      text = await readFile(candidate.file, { encoding: 'utf8' });
     } catch (error) {
-      warnings.push({ source: candidate.file, message: `el informe no se pudo leer: ${messageOf(error)}` });
+      warnings.push({ source: relative, message: `el informe no se pudo leer: ${messageOf(error)}` });
+      failures.push(unparseableReport());
       continue;
     }
 
-    const checks = failedChecksOf(parsed);
-    if (checks.length === 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      warnings.push({
+        source: relative,
+        message: 'el informe no es JSON válido: se informa solo la ruta, nunca su contenido',
+      });
+      failures.push(unparseableReport());
+      continue;
+    }
+
+    if (!isRecord(parsed)) {
+      warnings.push({ source: relative, message: 'el informe no es un objeto JSON: se informa solo la ruta' });
+      failures.push(unparseableReport());
+      continue;
+    }
+
+    const facts = closedFactsOf(parsed);
+    if (facts.checks.length === 0 && facts.unrecognisedChecks === 0) {
+      // A dry-run or create-run report where every check held is a passing
+      // report, not an error. `failure.json` says by its name that it failed.
+      if (kind !== 'failure') continue;
+      warnings.push({
+        source: relative,
+        message: 'el informe de fallo no dice qué comprobación estructural falló: se informa solo la ruta',
+      });
+      failures.push(unparseableReport());
+      continue;
+    }
 
     failures.push({
-      path: candidate.segments.join('/'),
-      kind: baseNameOf(candidate.segments.join('/')),
-      mode: textOf(parsed, 'mode'),
-      finishedAt: textOf(parsed, 'finishedAt'),
-      checks,
-      message:
-        textOf(parsed, 'message') ??
-        textOf(parsed, 'reason') ??
-        textOf(parsed, 'failure') ??
-        textOf(parsed, 'error'),
+      path: relative,
+      kind,
+      finishedAt: timestampOf(parsed, 'finishedAt'),
       recordedAt: candidate.recordedAt,
+      checks: facts.checks,
+      unrecognisedChecks: facts.unrecognisedChecks,
+      unparseable: false,
     });
   }
 
@@ -947,14 +1105,14 @@ export interface HealthLine {
 }
 
 export interface HealthInput {
-  lastCheck: SessionCheckEntry | null;
+  lastCheck: SessionCheckFact | null;
   unresolvedRunIds: readonly string[];
   artifactsWritable: boolean;
   artifactsProblem: string | null;
   artifactsDir: string;
 }
 
-function exitText(entry: SessionCheckEntry): string {
+function exitText(entry: SessionCheckFact): string {
   return entry.exitCode === null ? 'sin código de salida' : `código ${entry.exitCode}`;
 }
 
@@ -986,7 +1144,9 @@ export function deriveHealth(input: HealthInput): HealthLine {
             key: 'session',
             label: 'sesión',
             level: 'bad',
-            detail: `el chequeo del ${input.lastCheck.runAt} terminó con ${exitText(input.lastCheck)} (${input.lastCheck.result}): ${input.lastCheck.message}`,
+            // Closed facts only: the detail names the result and the exit code.
+            // The check's own message is on disk, not in this line.
+            detail: `el chequeo del ${input.lastCheck.runAt} terminó con ${exitText(input.lastCheck)} (${input.lastCheck.result})`,
           };
 
   const attemptFact: HealthFact =
@@ -1119,7 +1279,8 @@ export async function readConsole(deps: ConsoleDeps): Promise<ConsoleSnapshot> {
 }
 
 export interface SessionCheckCompleted {
-  check: SessionCheckEntry;
+  /** The check that just ran, as the closed facts the HTTP surface may carry. */
+  check: SessionCheckFact;
   /** Warnings raised while recording the check (a failed write, a corrupt history). */
   problems: string[];
   snapshot: ConsoleSnapshot;
@@ -1132,5 +1293,5 @@ export interface SessionCheckCompleted {
 export async function performSessionCheck(deps: ConsoleDeps): Promise<SessionCheckCompleted> {
   const result = await runAndRecordSessionCheck(deps.sessionCheckHistoryPath, deps.sessionCheckRunner);
   const snapshot = await readConsole(deps);
-  return { check: result.entry, problems: result.problems, snapshot };
+  return { check: factOfCheck(result.entry), problems: result.problems, snapshot };
 }

@@ -12,14 +12,20 @@
  * 1. `Envío manual` — the existing flow: paste, review, approve, authorize.
  * 2. `Runtime` — process, Node, PID, store host, session source, headless flag,
  *    artifacts directory.
- * 3. `Sesión` — the storageState/profile on disk and the last checks, plus the
- *    one explicit button that runs `session-check` (it opens a browser).
+ * 3. `Sesión` — the storageState/profile on disk and the last checks, reduced to
+ *    their four closed facts, plus the one explicit button that runs
+ *    `session-check` (it opens a browser). The check's own output stays in the
+ *    history file on disk and leaves over SSH; nothing it printed is rendered.
  * 4. `Runs` — every run record, newest first, with the open ones marked.
  * 5. `Artefactos` — per run, the files with their sizes, the plain warning
  *    that traces and screenshots carry personal data, and the instruction for
  *    retrieving them over SSH. No download link: the page serves no file.
- * 6. `Errores` — the most recent failure report the executor wrote, verbatim,
- *    next to the warning that its text may name the recipient.
+ * 6. `Errores` — the most recent failing report reduced to **structured facts
+ *    only**: which of the three report files it is, which of the closed-vocabulary
+ *    structural checks failed, when, and its path. The report's own message,
+ *    mismatches, reconciliation and panel text can quote the recipient, so they
+ *    are never fetched or rendered here; the line below the facts says the full
+ *    report is on disk and is retrieved over SSH.
  *
  * The health line sits above the tabs because it answers the only question that
  * matters before touching anything: can the agent work right now?
@@ -33,6 +39,22 @@
  */
 export const ARTIFACT_RETRIEVAL_INSTRUCTION =
   'Los artefactos quedan en el volumen montado y se retiran por SSH desde el equipo del operador, por ejemplo con docker compose cp mdl-logistics:/app/artifacts ./artifacts, o leyendo directo la ruta del volumen (/app/artifacts en el contenedor).';
+
+/**
+ * The one sentence about the failing report. Same rule as the artifacts above:
+ * the console shows structural facts, the file stays on disk, and the operator
+ * reads it over SSH because it may name the recipient.
+ */
+export const REPORT_ON_DISK_NOTE =
+  'El informe completo queda en disco, en la ruta que se muestra arriba, y se retira por SSH desde el equipo del operador (docker compose cp, o directo la ruta del volumen). Esta página no copia ni muestra su texto porque el informe puede contener datos del destinatario: nombre, dirección y teléfono.';
+
+/**
+ * The one sentence about the session-check history. The check prints what it saw
+ * on the panel, which can name the recipient, so the page shows only its four
+ * closed facts (result, exit code, when, how long) and the file leaves over SSH.
+ */
+export const SESSION_CHECK_OUTPUT_NOTE =
+  'La salida completa de cada chequeo queda en disco, en el historial que se nombra arriba, y se retira por SSH desde el equipo del operador (docker compose cp, o directo la ruta del volumen). Esta página no copia ni muestra su texto, porque la salida es lo que el chequeo imprimió al leer el panel y puede nombrar al destinatario: de cada chequeo se muestran solo el resultado, el código de salida, la fecha y la duración.';
 
 export const PAGE_HTML = `<!doctype html>
 <html lang="es">
@@ -242,6 +264,7 @@ export const PAGE_HTML = `<!doctype html>
 <section class="card">
   <h2>Sesión</h2>
   <p class="hint">El chequeo de sesión abre un navegador Chromium contra el panel del admin y lo lee en modo lectura. No corre solo: se dispara únicamente con este botón, y cada corrida queda en el historial de abajo.</p>
+  <p class="note" id="session-check-output-note">${SESSION_CHECK_OUTPUT_NOTE}</p>
   <div class="actions">
     <button id="session-check-run" type="button">Correr el chequeo de sesión ahora (abre un navegador)</button>
   </div>
@@ -273,7 +296,8 @@ export const PAGE_HTML = `<!doctype html>
 <div class="panel" id="panel-errors" role="tabpanel" hidden>
 <section class="card">
   <h2>Errores</h2>
-  <p class="hint">El informe más reciente que el ejecutor escribió y que falló una comprobación estructural, con el mensaje tal como quedó en el archivo. El archivo no se descarga desde acá: se retira por SSH, como el resto de los artefactos.</p>
+  <p class="hint">El informe más reciente que falló una comprobación estructural, reducido a hechos estructurados: qué archivo es, qué comprobación de la lista cerrada falló, cuándo y en qué ruta. El mensaje, los desajustes y la conciliación del informe no se leen: pueden citar al destinatario.</p>
+  <p class="note" id="errors-retrieval">${REPORT_ON_DISK_NOTE}</p>
   <div id="errors-warnings"></div>
   <div id="errors-body"></div>
 </section>
