@@ -1,23 +1,38 @@
 /**
- * `npm run ui` — starts the single page on `127.0.0.1` and prints where it is.
+ * `npm run ui` — starts the maintenance console on `127.0.0.1` and prints where
+ * it is.
  *
  * The executor is wired lazily: Playwright is only imported when a run actually
- * starts, so the page (and the analyze/approve steps) work without the browser
- * stack being loaded. Nothing else is read here — no secrets, no session, no
- * credential: the session lives in the Playwright profile, outside the repo.
+ * starts, so the page, the analyze/approve steps and the whole console (runtime,
+ * session, runs, artifacts, errors, health) work without the browser stack being
+ * loaded. The console's readers are given plain paths here — the artifacts tree,
+ * the session-check history and the run-record directory — and nothing else is
+ * read: no secret, no session, no credential. The session lives in the Playwright
+ * profile or the transferred storageState file, both outside the repository, and
+ * the console only `stat`s them.
  *
  * Only the port is an option. The host is not: this page can create shipments.
  */
+import { ARTIFACTS_DIR } from './console';
 import { RUN_RECORD_DIR } from '../cli/runRecord';
 import type { ActionDeps, UiExecutor } from './actions';
 import { DEFAULT_PORT, startUiServer } from './server';
+import { SESSION_CHECK_HISTORY_PATH, runSessionCheckScript } from './sessionCheck';
 
 const executor: UiExecutor = {
   runDryRun: async (input) => (await import('../executor/run')).runDryRun(input),
   runCreate: async (input) => (await import('../executor/run')).runCreate(input),
 };
 
-const deps: ActionDeps = { executor, recordDir: RUN_RECORD_DIR };
+const deps: ActionDeps = {
+  executor,
+  recordDir: RUN_RECORD_DIR,
+  console: {
+    artifactsDir: ARTIFACTS_DIR,
+    sessionCheckHistoryPath: SESSION_CHECK_HISTORY_PATH,
+    sessionCheckRunner: runSessionCheckScript,
+  },
+};
 
 function usage(): string {
   return [
@@ -71,9 +86,12 @@ if (args.error !== null) {
 } else {
   const started = await startUiServer({ port: args.port, deps });
 
-  console.log('MDL Logistics — UI de envío manual');
+  console.log('MDL Logistics — consola de mantenimiento');
   console.log(`  ${started.url}`);
   console.log('  escucha solo en 127.0.0.1 porque esta pagina puede crear envios.');
   console.log(`  registros de ejecucion: ${RUN_RECORD_DIR}`);
+  console.log(`  artefactos: ${ARTIFACTS_DIR} (descarga de solo lectura en /artifacts/)`);
+  console.log(`  historial del chequeo de sesion: ${SESSION_CHECK_HISTORY_PATH}`);
+  console.log('  el chequeo de sesion abre un navegador: solo corre con el boton de la pagina.');
   console.log('  Ctrl+C para detener.');
 }

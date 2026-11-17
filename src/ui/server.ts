@@ -1,6 +1,8 @@
 /**
- * The local HTTP server: one page, its script, three actions. No framework, no
- * runtime dependency beyond Node's own `http` module.
+ * The local HTTP server: the console page, its script, three shipment actions and
+ * the console's read-only surface (a JSON snapshot, the artifact downloads, and
+ * one explicit session check). No framework, no runtime dependency beyond Node's
+ * own `http` and `fs` modules.
  *
  * **It binds `127.0.0.1` and nothing else.** This page can create shipments in
  * Envío Nube, so it must not be reachable from another machine: there is no
@@ -10,15 +12,27 @@
  * it.
  *
  * The routes are data (`createRoutes`) so the surface can be asserted instead of
- * trusted: there are exactly five, and the only mutating one is `/api/run`, which
- * itself refuses unless both gates in `actions.ts` pass.
+ * trusted: the only mutating shipment route is `/api/run`, which itself refuses
+ * unless both gates in `actions.ts` pass, and the only route that leaves the
+ * process is `/api/session-check`, which opens a browser because the operator
+ * asked for it. Everything else is a read: `/api/console` and the files under
+ * `artifacts/`, both of which only ever return bytes from this machine.
  */
+import { readFileSync, statSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 import { messageOf } from '../executor/errors';
 import { analyzeMessage, approveForm, runAttempt, type ActionDeps } from './actions';
 import { CLIENT_JS } from './client';
+import { performSessionCheck, readConsole, resolveConsoleDeps, type ConsoleDeps } from './console';
 import { PAGE_HTML } from './page';
+import {
+  ARTIFACT_ROUTE_PREFIX,
+  MAX_SERVED_ARTIFACT_BYTES,
+  baseNameOf,
+  contentTypeFor,
+  resolveArtifactTarget,
+} from './paths';
 
 export { CLIENT_JS, PAGE_HTML };
 
@@ -38,7 +52,8 @@ export const MAX_BODY_LENGTH = 1_000_000;
 export interface UiResponse {
   status: number;
   contentType: string;
-  body: string;
+  /** Bytes for an artifact download, text for everything else. */
+  body: string | Uint8Array;
 }
 
 export interface Route {
@@ -46,7 +61,17 @@ export interface Route {
   path: string;
   /** One line for the UI map, and for the assertion that no route does more. */
   purpose: string;
-  handle(body: string): Promise<UiResponse>;
+  /**
+   * True when `path` is a prefix rather than an exact path. Exactly one route uses
+   * it: the artifact tree, whose file names cannot be enumerated in a table.
+   */
+  prefix?: true;
+  handle(body: string, path: string): Promise<UiResponse>;
+}
+
+/** True when one request path belongs to a route (exact or prefix). */
+function routeMatches(route: Route, path: string): boolean {
+  return route.prefix === true ? path.startsWith(route.path) : route.path === path;
 }
 
 function json(status: number, value: unknown): UiResponse {
@@ -94,10 +119,13 @@ function formField(source: Record<string, unknown>): Record<string, unknown> {
 }
 
 /**
- * The whole surface of the page. Five routes: the document, its script, and the
- * three actions. There is nothing else to navigate to — no lists, no dashboard.
+ * The whole surface of the page. Eight routes: the document, its script, the
+ * three shipment actions, the console snapshot, the one explicit session check
+ * and the artifact downloads. Nothing else exists to navigate to.
  */
 export function createRoutes(deps: ActionDeps): Route[] {
+  const consoleDeps: ConsoleDeps = resolveConsoleDeps({ recordDir: deps.recordDir, ...(deps.console ?? {}) });
+
   return [
     {
       method: 'GET',
@@ -167,7 +195,65 @@ export function createRoutes(deps: ActionDeps): Route[] {
         return json(200, result);
       },
     },
+    {
+      method: 'GET',
+      path: '/api/console',
+      purpose:
+        'estado de solo lectura: runtime, sesion, runs, artefactos, errores y la linea de salud derivada',
+      handle: async () => json(200, await readConsole(consoleDeps)),
+    },
+    {
+      method: 'POST',
+      path: '/api/session-check',
+      purpose:
+        'corre session-check solo cuando el operador lo pide: abre un navegador y guarda el resultado en el historial',
+      handle: async () => {
+        const outcome = await performSessionCheck(consoleDeps);
+        return json(200, { ...outcome.snapshot, check: outcome.check, problems: outcome.problems });
+      },
+    },
+    {
+      method: 'GET',
+      path: ARTIFACT_ROUTE_PREFIX,
+      prefix: true,
+      purpose:
+        'descarga de solo lectura de un archivo bajo artifacts/, con el recorrido de rutas rechazado',
+      handle: async (_body, path) => serveArtifact(consoleDeps.artifactsDir, path),
+    },
   ];
+}
+
+/**
+ * Serves one artifact. The path arithmetic and the traversal refusal live in
+ * `paths.ts`; this only turns the answer into a response, and refuses to buffer a
+ * file past `MAX_SERVED_ARTIFACT_BYTES`.
+ */
+function serveArtifact(artifactsDir: string, path: string): UiResponse {
+  const target = resolveArtifactTarget(artifactsDir, path);
+  if (!target.ok) return json(target.status, { status: 'refused', reason: target.reason });
+
+  let size: number;
+  try {
+    size = statSync(target.file).size;
+  } catch (error) {
+    return json(404, { status: 'not-found', reason: `no se pudo leer el archivo: ${messageOf(error)}` });
+  }
+
+  if (size > MAX_SERVED_ARTIFACT_BYTES) {
+    return json(413, {
+      status: 'refused',
+      reason: `el archivo pesa ${size} bytes y el limite es ${MAX_SERVED_ARTIFACT_BYTES}`,
+    });
+  }
+
+  let bytes: Uint8Array;
+  try {
+    bytes = readFileSync(target.file);
+  } catch (error) {
+    return json(500, { status: 'error', reason: `no se pudo leer el archivo: ${messageOf(error)}` });
+  }
+
+  return { status: 200, contentType: contentTypeFor(baseNameOf(target.file)), body: bytes };
 }
 
 /** Dispatches one request. An unknown path is a 404; a known path with the wrong method is a 405. */
@@ -178,10 +264,10 @@ export async function handleRequest(
   deps: ActionDeps,
 ): Promise<UiResponse> {
   const routes = createRoutes(deps);
-  const route = routes.find((candidate) => candidate.path === path && candidate.method === method);
-  if (route !== undefined) return await route.handle(body);
+  const route = routes.find((candidate) => candidate.method === method && routeMatches(candidate, path));
+  if (route !== undefined) return await route.handle(body, path);
 
-  if (routes.some((candidate) => candidate.path === path)) {
+  if (routes.some((candidate) => routeMatches(candidate, path))) {
     return json(405, { status: 'method-not-allowed', method, path });
   }
   return json(404, { status: 'not-found', path });

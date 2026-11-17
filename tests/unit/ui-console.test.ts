@@ -657,14 +657,34 @@ test('the server listens on 127.0.0.1 only and answers without CORS headers', as
   }
 });
 
-test('the only routes are the page, its script and the three actions', async () => {
+test('the routes are the page, its script, the shipment actions and the console reads', async () => {
   const { executor } = fakeExecutor();
   const { createRoutes } = await import('../../src/ui/server');
   const routes = createRoutes(await deps(executor));
 
   assert.deepEqual(
     routes.map((route) => `${route.method} ${route.path}`).sort(),
-    ['GET /', 'GET /app.js', 'POST /api/analyze', 'POST /api/approve', 'POST /api/run'],
+    [
+      'GET /',
+      'GET /api/console',
+      'GET /app.js',
+      'GET /artifacts/',
+      'POST /api/analyze',
+      'POST /api/approve',
+      'POST /api/run',
+      'POST /api/session-check',
+    ],
+  );
+
+  // Exactly one route is a prefix (the artifact tree), and exactly one route can
+  // leave the process: the explicit session check.
+  assert.deepEqual(
+    routes.filter((route) => route.prefix === true).map((route) => route.path),
+    ['/artifacts/'],
+  );
+  assert.deepEqual(
+    routes.filter((route) => route.path === '/api/session-check').map((route) => route.method),
+    ['POST'],
   );
 });
 

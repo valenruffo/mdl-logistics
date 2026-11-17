@@ -9,6 +9,8 @@ secrets/
 
 # Playwright session state is a credential (R15)
 **/storageState*.json
+**/*storage-state*.json
+session/
 **/auth/*.json
 
 # Test and run artifacts: PII and tokens (R11, R15)

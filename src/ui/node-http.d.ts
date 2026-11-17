@@ -27,7 +27,8 @@ declare module 'node:http' {
   export interface ServerResponse {
     statusCode: number;
     setHeader(name: string, value: string): void;
-    end(body?: string): void;
+    /** A string for the page and the JSON routes; raw bytes for an artifact download. */
+    end(body?: string | Uint8Array): void;
   }
 
   export interface AddressInfo {

@@ -1,6 +1,6 @@
 /**
- * The page's script: three `fetch` calls and DOM rendering. No framework, no
- * bundler, no dependency — served verbatim by `server.ts` as `/app.js`.
+ * The page's script: a handful of `fetch` calls and DOM rendering. No framework,
+ * no bundler, no dependency — served verbatim by `server.ts` as `/app.js`.
  *
  * Deliberate boundaries:
  *
@@ -8,10 +8,13 @@
  *   `/api/approve`, shows it, and posts it back with the run. The server
  *   recomputes the hash from the posted values every time, so a stale hash after
  *   an edit is refused there, not here.
- * - Every value shown comes from the server response, and all of it is rendered
- *   with `textContent`/`createElement`: pasted data is never interpreted as HTML.
+ * - Every value shown comes from a server response, and all of it is rendered
+ *   with `textContent`/`createElement`: pasted data, record fields and file names
+ *   are never interpreted as HTML.
  * - The two gates stay separate on screen: approving the data has its own
  *   section, the creation needs its own token in its own input.
+ * - The console is read-only. The only request that changes anything is
+ *   `/api/session-check`, sent by its own button, because it opens a browser.
  */
 export const CLIENT_JS = `(function () {
   'use strict';
@@ -20,7 +23,8 @@ export const CLIENT_JS = `(function () {
     message: '',
     approvedHash: null,
     applying: false,
-    busy: false
+    busy: false,
+    consoleBusy: false
   };
 
   function byId(id) { return document.getElementById(id); }
@@ -335,6 +339,7 @@ export const CLIENT_JS = `(function () {
     post('/api/run', body).then(function (data) {
       renderResult(data);
       setApprovalState(data.status === 'created' ? 'Envio creado.' : 'Terminado: revisa el resultado.', null);
+      loadConsole(null);
     }).then(function () {
       setBusy(false);
     }, function (error) {
@@ -411,11 +416,449 @@ export const CLIENT_JS = `(function () {
     box.appendChild(make('p', 'note', data.note));
   }
 
+  // --------------------------------------------------------------- the console
+
+  function textOr(value, fallback) {
+    if (value === null || value === undefined || value === '') return fallback || '(no registrado)';
+    return String(value);
+  }
+
+  function formatSeconds(total) {
+    var seconds = Math.floor(total % 60);
+    var minutes = Math.floor(total / 60) % 60;
+    var hours = Math.floor(total / 3600) % 24;
+    var days = Math.floor(total / 86400);
+    var parts = [];
+    if (days > 0) parts.push(days + 'd');
+    if (hours > 0) parts.push(hours + 'h');
+    if (minutes > 0) parts.push(minutes + 'm');
+    parts.push(seconds + 's');
+    return parts.join(' ');
+  }
+
+  function formatBytes(bytes) {
+    if (bytes === null || bytes === undefined) return '(sin tamaño)';
+    if (bytes < 1000) return bytes + ' B';
+    var units = ['kB', 'MB', 'GB'];
+    var value = bytes / 1000;
+    var index = 0;
+    while (value >= 1000 && index < units.length - 1) {
+      value = value / 1000;
+      index += 1;
+    }
+    return (Math.round(value * 10) / 10) + ' ' + units[index];
+  }
+
+  function cellText(text, className) {
+    return make('td', className || null, text);
+  }
+
+  function factsTable(rows) {
+    var table = document.createElement('table');
+    var body = document.createElement('tbody');
+    rows.forEach(function (row) {
+      var tr = document.createElement('tr');
+      tr.appendChild(make('th', null, row[0]));
+      var td = document.createElement('td');
+      if (row[1] instanceof Node || typeof row[1] === 'object') td.appendChild(row[1]);
+      else td.textContent = String(row[1]);
+      tr.appendChild(td);
+      body.appendChild(tr);
+    });
+    table.appendChild(body);
+    return table;
+  }
+
+  function link(href, text, className) {
+    var node = document.createElement('a');
+    node.href = href;
+    node.textContent = text;
+    if (className) node.className = className;
+    return node;
+  }
+
+  function renderWarnings(containerId, warnings) {
+    var box = byId(containerId);
+    clear(box);
+    if (!warnings || warnings.length === 0) return;
+    box.appendChild(make('p', 'warn', 'Avisos de lectura (la pagina sigue funcionando):'));
+    var list = make('ul', 'issues');
+    warnings.forEach(function (warning) {
+      list.appendChild(make('li', 'warn', warning.source + ' - ' + warning.message));
+    });
+    box.appendChild(list);
+  }
+
+  function appendWarningItems(containerId, problems) {
+    if (!problems || problems.length === 0) return;
+    var box = byId(containerId);
+    var list = box.querySelector('ul.issues');
+    if (list === null) {
+      box.appendChild(make('p', 'warn', 'Avisos de lectura (la pagina sigue funcionando):'));
+      list = make('ul', 'issues');
+      box.appendChild(list);
+    }
+    problems.forEach(function (problem) {
+      list.appendChild(make('li', 'warn', problem));
+    });
+  }
+
+  function renderHealth(data) {
+    var level = data.health.level;
+    byId('health').className = 'health ' + level;
+    var line = byId('health-line');
+    line.className = level;
+    line.textContent = data.health.line;
+
+    var facts = byId('health-facts');
+    clear(facts);
+    data.health.facts.forEach(function (fact) {
+      facts.appendChild(make('li', fact.level, fact.label + ': ' + fact.detail));
+    });
+  }
+
+  function renderRuntime(data) {
+    renderWarnings('runtime-warnings', data.runtime.warnings);
+    var box = byId('runtime-body');
+    clear(box);
+
+    var runtime = data.runtime;
+    box.appendChild(factsTable([
+      ['uptime', formatSeconds(runtime.uptimeSeconds) + ' (arrancó ' + runtime.startedAt + ')'],
+      ['node', runtime.nodeVersion],
+      ['pid', String(runtime.pid)],
+      ['plataforma', runtime.platform],
+      ['directorio de trabajo', runtime.cwd],
+      ['origen del panel',
+        runtime.storeHost === null
+          ? '(no configurado: ' + runtime.storeVariable + ')'
+          : runtime.storeHost + ' - solo el host, sin credenciales (' + runtime.storeVariable + ')'],
+      ['fuente de la sesión', runtime.sessionSource],
+      ['ruta de la sesión', runtime.sessionPath === null ? '(sin resolver)' : runtime.sessionPath],
+      ['headless', runtime.headless === null ? '(no se pudo leer el interruptor)' : String(runtime.headless)],
+      ['directorio de artefactos', runtime.artifactsDirAbsolute],
+      ['registros de ejecución', runtime.recordDirAbsolute]
+    ]));
+
+    if (runtime.storeProblem !== null) {
+      box.appendChild(make('p', 'bad', 'origen del panel: ' + runtime.storeProblem));
+    }
+    if (runtime.headlessProblem !== null) {
+      box.appendChild(make('p', 'bad', 'headless: ' + runtime.headlessProblem));
+    }
+  }
+
+  function checkTable(checks) {
+    var table = document.createElement('table');
+    var head = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    ['cuándo', 'resultado', 'salida', 'mensaje que imprimió'].forEach(function (title) {
+      headRow.appendChild(make('th', null, title));
+    });
+    head.appendChild(headRow);
+    table.appendChild(head);
+
+    var body = document.createElement('tbody');
+    checks.forEach(function (check) {
+      var tr = document.createElement('tr');
+      tr.appendChild(cellText(check.runAt));
+      tr.appendChild(cellText(check.result, check.result === 'usable' ? 'ok' : 'bad'));
+      tr.appendChild(cellText(check.exitCode === null ? 'sin código' : String(check.exitCode)));
+      tr.appendChild(cellText(check.message));
+      body.appendChild(tr);
+    });
+    table.appendChild(body);
+    return table;
+  }
+
+  function renderSession(data) {
+    renderWarnings('session-warnings', data.session.warnings);
+    var box = byId('session-body');
+    clear(box);
+
+    var file = data.session.file;
+    box.appendChild(make('h3', null, 'El archivo de la sesión'));
+    box.appendChild(factsTable([
+      ['modo',
+        file.mode === 'storage-state'
+          ? 'storageState transferido'
+          : file.mode === 'persistent-profile'
+            ? 'perfil persistente de Chromium'
+            : '(no se pudo resolver)'],
+      ['ruta', file.path === null ? '(sin resolver)' : file.path],
+      ['existe', file.exists ? 'sí' : 'no'],
+      ['es un archivo', file.isFile ? 'sí' : 'no'],
+      ['tamaño', file.exists ? formatBytes(file.sizeBytes) : '(no aplica)'],
+      ['última modificación', file.exists ? textOr(file.modifiedAt) : '(no aplica)']
+    ]));
+
+    if (file.problems.length > 0) {
+      box.appendChild(make('p', 'warn', 'Problemas con el archivo de la sesión:'));
+      box.appendChild(issueList(file.problems));
+    }
+    box.appendChild(make('p', 'hint', 'El contenido de este archivo es la sesión del panel: la página solo mira tamaño y fecha, nunca lo abre.'));
+
+    box.appendChild(make('h3', null, 'Últimos chequeos (' + data.session.checks.length + ' de ' + data.session.limit + ')'));
+    if (data.session.checks.length === 0) {
+      box.appendChild(make('p', 'warn', 'Todavía no hay ningún chequeo registrado: la salud no puede afirmar que la sesión esté usable hasta que corras uno.'));
+      return;
+    }
+
+    box.appendChild(checkTable(data.session.checks));
+
+    var last = data.session.lastCheck;
+    if (last !== null) {
+      box.appendChild(make('h3', null, 'Salida completa del último chequeo (verbatim)'));
+      box.appendChild(make('p', 'mono', last.output === '' ? '(no imprimió nada)' : last.output));
+      if (last.spawnProblem !== null) box.appendChild(make('p', 'bad', last.spawnProblem));
+    }
+  }
+
+  function renderRuns(data) {
+    renderWarnings('runs-warnings', data.runs.warnings);
+    var box = byId('runs-body');
+    clear(box);
+
+    box.appendChild(make('p', 'meta', data.runs.rows.length + ' registro(s) visible(s) de ' + data.runs.total + '.'));
+    if (data.runs.rows.length === 0) {
+      box.appendChild(make('p', 'warn', 'No hay ningún run registrado todavía.'));
+      return;
+    }
+
+    var table = document.createElement('table');
+    var head = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    ['run', 'cuándo', 'hash del mensaje', 'hash de aprobación', 'estado', 'desenlace', 'envío', 'costo', 'artefactos'].forEach(function (title) {
+      headRow.appendChild(make('th', null, title));
+    });
+    head.appendChild(headRow);
+    table.appendChild(head);
+
+    var body = document.createElement('tbody');
+    data.runs.rows.forEach(function (row) {
+      var tr = document.createElement('tr');
+      tr.appendChild(cellText(row.runId, row.unresolved ? 'bad' : null));
+      tr.appendChild(cellText(textOr(row.recordedAt)));
+      tr.appendChild(cellText(textOr(row.messageHashShort)));
+      tr.appendChild(cellText(textOr(row.approvalHashShort)));
+      tr.appendChild(cellText(textOr(row.status)));
+      tr.appendChild(cellText(row.outcome === null ? 'sin desenlace' : row.outcome, row.unresolved ? 'bad' : null));
+      tr.appendChild(cellText(textOr(row.shipmentId, '(sin envío)')));
+      tr.appendChild(cellText(textOr(row.costText, '(sin costo leído)')));
+
+      var artifactCell = document.createElement('td');
+      if (row.artifactHref === null) artifactCell.textContent = '(no registrado)';
+      else artifactCell.appendChild(link(row.artifactHref, 'artifacts/' + row.artifactDir));
+      tr.appendChild(artifactCell);
+
+      body.appendChild(tr);
+    });
+    table.appendChild(body);
+    box.appendChild(table);
+
+    var withProblems = data.runs.rows.filter(function (row) { return row.problems.length > 0; });
+    if (withProblems.length > 0) {
+      box.appendChild(make('h3', 'warn', 'Registros con problemas de lectura'));
+      withProblems.forEach(function (row) {
+        box.appendChild(make('p', 'mono', row.runId));
+        box.appendChild(issueList(row.problems));
+      });
+    }
+
+    var unresolved = data.runs.rows.filter(function (row) { return row.unresolved; });
+    if (unresolved.length > 0) {
+      box.appendChild(make('h3', 'bad',
+        'Runs sin resolver (' + unresolved.length + '): la creación de ese mismo mensaje queda bloqueada hasta que una persona los resuelva a mano'));
+      unresolved.forEach(function (row) {
+        box.appendChild(make('p', 'mono',
+          row.runId + ' - ' + (row.outcome === 'unknown' ? 'desenlace desconocido' : 'sin desenlace escrito')));
+        box.appendChild(make('p', 'mono', textOr(row.resolution, '(el gate no produjo una instrucción)'), 'bad'));
+      });
+    }
+  }
+
+  function renderArtifacts(data) {
+    renderWarnings('artifacts-warnings', data.artifacts.warnings);
+    var box = byId('artifacts-body');
+    clear(box);
+
+    if (data.artifacts.runs.length === 0) {
+      box.appendChild(make('p', 'warn', 'No hay runs, así que no hay artefactos que listar.'));
+      return;
+    }
+
+    data.artifacts.runs.forEach(function (run) {
+      box.appendChild(make('h3', null, run.runId));
+      box.appendChild(make('p', 'meta',
+        run.dir === null
+          ? 'sin directorio de artefactos registrado'
+          : 'artifacts/' + run.dir + ' - ' + formatBytes(run.totalBytes) + ' en total'));
+
+      if (run.problems.length > 0) box.appendChild(issueList(run.problems));
+      if (run.files.length === 0) {
+        box.appendChild(make('p', 'warn', 'No hay archivos que listar en este directorio.'));
+        return;
+      }
+
+      box.appendChild(make('p', 'note',
+        'Capturas y traces de este run: pueden contener datos personales del destinatario. Se descargan desde este equipo, en 127.0.0.1.'));
+
+      var table = document.createElement('table');
+      var head = document.createElement('thead');
+      var headRow = document.createElement('tr');
+      headRow.appendChild(make('th', null, 'archivo'));
+      headRow.appendChild(make('th', null, 'tamaño'));
+      head.appendChild(headRow);
+      table.appendChild(head);
+
+      var body = document.createElement('tbody');
+      run.files.forEach(function (file) {
+        var tr = document.createElement('tr');
+        var nameCell = document.createElement('td');
+        nameCell.appendChild(link(file.href, file.name));
+        tr.appendChild(nameCell);
+        tr.appendChild(cellText(formatBytes(file.sizeBytes)));
+        body.appendChild(tr);
+      });
+      table.appendChild(body);
+      box.appendChild(table);
+    });
+  }
+
+  function renderErrors(data) {
+    renderWarnings('errors-warnings', data.errors.warnings);
+    var box = byId('errors-body');
+    clear(box);
+
+    var latest = data.errors.latest;
+    if (latest === null) {
+      box.appendChild(make('p', 'warn',
+        'No hay ningún informe de fallo del ejecutor: no existe un dry-run.json ni un create-run.json con una comprobación estructural fallida.'));
+      return;
+    }
+
+    box.appendChild(factsTable([
+      ['informe', latest.path],
+      ['archivo', latest.kind],
+      ['modo', textOr(latest.mode)],
+      ['terminado', textOr(latest.finishedAt)],
+      ['escrito', latest.recordedAt]
+    ]));
+
+    var downloadCell = link(latest.href, 'descargar ' + latest.kind);
+    box.appendChild(make('p', 'meta', 'descarga: '));
+    box.lastChild.appendChild(downloadCell);
+    box.appendChild(make('p', 'note', 'Este informe es de un run real: puede citar datos del destinatario.'));
+
+    box.appendChild(make('h3', null, 'Comprobación estructural que falló (verbatim)'));
+    var table = document.createElement('table');
+    var head = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    headRow.appendChild(make('th', null, 'campo del informe'));
+    headRow.appendChild(make('th', null, 'valor'));
+    head.appendChild(headRow);
+    table.appendChild(head);
+
+    var body = document.createElement('tbody');
+    latest.checks.forEach(function (check) {
+      var tr = document.createElement('tr');
+      tr.appendChild(cellText(check.check));
+      tr.appendChild(cellText(check.detail));
+      body.appendChild(tr);
+    });
+    table.appendChild(body);
+    box.appendChild(table);
+
+    box.appendChild(make('h3', null, 'Mensaje del informe (verbatim)'));
+    if (latest.message === null) {
+      box.appendChild(make('p', 'warn', 'El informe no trae un campo message, reason, failure ni error.'));
+    } else {
+      box.appendChild(make('p', 'mono', latest.message));
+    }
+  }
+
+  function renderConsole(data, extraSessionProblems) {
+    renderHealth(data);
+    renderRuntime(data);
+    renderSession(data);
+    renderRuns(data);
+    renderArtifacts(data);
+    renderErrors(data);
+    if (extraSessionProblems) appendWarningItems('session-warnings', extraSessionProblems);
+  }
+
+  function loadConsole(statusId) {
+    if (state.consoleBusy) return;
+    state.consoleBusy = true;
+    if (statusId) setText(statusId, 'Leyendo...');
+
+    fetch('/api/console', { method: 'GET' }).then(function (response) {
+      if (!response.ok) throw new Error('/api/console respondio ' + response.status);
+      return response.json();
+    }).then(function (data) {
+      renderConsole(data, null);
+      if (statusId) setText(statusId, 'Leido a las ' + data.readAt + '.');
+    }).catch(function (error) {
+      var reason = error && error.message ? error.message : String(error);
+      if (statusId) setText(statusId, 'Error: ' + reason);
+      byId('health').className = 'health bad';
+      byId('health-line').className = 'bad';
+      byId('health-line').textContent = 'No se pudo leer el estado del agente: ' + reason;
+    }).then(function () {
+      state.consoleBusy = false;
+    });
+  }
+
+  function runSessionCheck() {
+    if (state.consoleBusy) return;
+    state.consoleBusy = true;
+
+    var button = byId('session-check-run');
+    button.disabled = true;
+    setText('session-check-status', 'Corriendo el chequeo: abre un navegador y puede tardar uno o dos minutos.');
+
+    post('/api/session-check', {}).then(function (data) {
+      renderConsole(data, data.problems || []);
+      setText('session-check-status',
+        'Chequeo terminado: ' + data.check.result +
+        ' (' + (data.check.exitCode === null ? 'sin codigo de salida' : 'codigo ' + data.check.exitCode) + ').');
+    }).catch(function (error) {
+      setText('session-check-status', 'Error: ' + (error && error.message ? error.message : String(error)));
+    }).then(function () {
+      state.consoleBusy = false;
+      button.disabled = false;
+    });
+  }
+
+  var TABS = ['shipment', 'runtime', 'session', 'runs', 'artifacts', 'errors'];
+
+  function selectTab(name) {
+    TABS.forEach(function (tab) {
+      var button = document.querySelector('[data-tab="' + tab + '"]');
+      var panel = byId('panel-' + tab);
+      var active = tab === name;
+      if (button) button.setAttribute('aria-selected', active ? 'true' : 'false');
+      if (panel) panel.hidden = !active;
+    });
+    if (name !== 'shipment') loadConsole(name === 'runtime' ? 'runtime-status' : null);
+  }
+
+  var tabButtons = document.querySelectorAll('.tab');
+  for (var index = 0; index < tabButtons.length; index += 1) {
+    tabButtons[index].addEventListener('click', function () {
+      selectTab(this.getAttribute('data-tab'));
+    });
+  }
+
   byId('analyze').addEventListener('click', analyze);
   byId('approve').addEventListener('click', approve);
   byId('create').addEventListener('click', function () { run('create'); });
   byId('dry-run').addEventListener('click', function () { run('dry-run'); });
   byId('token').addEventListener('input', syncButtons);
+  byId('console-refresh').addEventListener('click', function () { loadConsole('runtime-status'); });
+  byId('session-check-run').addEventListener('click', runSessionCheck);
+
   syncButtons();
+  loadConsole(null);
 })();
 `;

@@ -1,20 +1,33 @@
 /**
- * The single page (plan §6: one screen, no navigation, no lists, no dashboard).
+ * The single page: a maintenance console with tabs, no navigation, no framework.
  *
- * Plain HTML with a little CSS, served as-is: no framework, no build step, no
- * client-side dependency. The markup carries no data — every value on screen
- * comes from the server, so the page can never show a payload that was not
- * parsed or hashed on the server.
+ * Plain HTML with a little CSS, served as-is: no build step, no client-side
+ * dependency. The markup carries **no data** — every value on screen (runtime,
+ * session, runs, artifacts, errors, the health line) comes from
+ * `GET /api/console`, and the shipment flow is built from the server's own
+ * analyze/approve responses. Nothing on this page is written by a model.
  *
- * The layout is the flow, top to bottom, and the steps below the preview stay
- * hidden until the parse succeeds: a rejected message leaves nothing actionable.
+ * Tabs, in order:
+ *
+ * 1. `Envío manual` — the existing flow: paste, review, approve, authorize.
+ * 2. `Runtime` — process, Node, PID, store host, session source, headless flag,
+ *    artifacts directory.
+ * 3. `Sesión` — the storageState/profile on disk and the last checks, plus the
+ *    one explicit button that runs `session-check` (it opens a browser).
+ * 4. `Runs` — every run record, newest first, with the open ones marked.
+ * 5. `Artefactos` — per run, the files with their sizes, and the plain warning
+ *    that traces and screenshots carry personal data.
+ * 6. `Errores` — the most recent failure report the executor wrote, verbatim.
+ *
+ * The health line sits above the tabs because it answers the only question that
+ * matters before touching anything: can the agent work right now?
  */
 export const PAGE_HTML = `<!doctype html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MDL Logistics — envío manual</title>
+<title>MDL Logistics — consola de mantenimiento</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -28,12 +41,13 @@ export const PAGE_HTML = `<!doctype html>
   * { box-sizing: border-box; }
   body {
     margin: 0 auto;
-    max-width: 62rem;
+    max-width: 68rem;
     padding: 1.5rem 1.25rem 4rem;
     font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
   h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
   h2 { font-size: 1.05rem; margin: 0 0 .75rem; }
+  h3 { font-size: .95rem; margin: 1.1rem 0 .4rem; }
   p.lead, p.hint { color: var(--muted); margin: 0 0 1rem; }
   section.card {
     border: 1px solid var(--line);
@@ -90,13 +104,61 @@ export const PAGE_HTML = `<!doctype html>
   th { font-weight: 600; color: var(--muted); }
   .status { color: var(--muted); min-height: 1.2rem; margin: .5rem 0 0; }
   .note { color: var(--warn); }
+  .mono { font-family: ui-monospace, monospace; word-break: break-all; white-space: pre-wrap; }
+  .health {
+    border: 2px solid var(--line);
+    border-radius: .6rem;
+    padding: .7rem .9rem;
+    margin: 0 0 1rem;
+  }
+  .health.ok { border-color: var(--ok); }
+  .health.warn { border-color: var(--warn); }
+  .health.bad { border-color: var(--danger); }
+  .health p { margin: 0; font-weight: 600; }
+  .health ul { margin: .35rem 0 0; padding-left: 1.2rem; font-size: .85rem; color: var(--muted); }
+  nav.tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .4rem;
+    border-bottom: 1px solid var(--line);
+    margin: 0 0 1rem;
+    padding: 0 0 .5rem;
+  }
+  nav.tabs button {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    font-weight: 600;
+  }
+  nav.tabs button[aria-selected="true"] {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .panel[hidden] { display: none; }
   footer { color: var(--muted); font-size: .82rem; border-top: 1px solid var(--line); padding-top: .8rem; }
 </style>
 </head>
 <body>
 
 <h1>Envío manual — MVP 01</h1>
-<p class="lead">Pegá el mensaje de WhatsApp, revisá los datos, aprobalos y recién después autorizá la creación. Una página, un envío.</p>
+<p class="lead">Una sola página para operar el agente: pegá el mensaje de WhatsApp para crear un envío, o revisá el runtime, la sesión, los runs, los artefactos y los errores sin salir de acá. Todo lo que se ve se lee del proceso o de los archivos; nada lo escribe un modelo.</p>
+
+<div class="health" id="health">
+  <p id="health-line">Leyendo el estado del agente…</p>
+  <ul id="health-facts"></ul>
+</div>
+
+<nav class="tabs" role="tablist" aria-label="Secciones de la consola">
+  <button type="button" class="tab" data-tab="shipment" role="tab" aria-selected="true">Envío manual</button>
+  <button type="button" class="tab" data-tab="runtime" role="tab" aria-selected="false">Runtime</button>
+  <button type="button" class="tab" data-tab="session" role="tab" aria-selected="false">Sesión</button>
+  <button type="button" class="tab" data-tab="runs" role="tab" aria-selected="false">Runs</button>
+  <button type="button" class="tab" data-tab="artifacts" role="tab" aria-selected="false">Artefactos</button>
+  <button type="button" class="tab" data-tab="errors" role="tab" aria-selected="false">Errores</button>
+</nav>
+
+<div class="panel" id="panel-shipment" role="tabpanel">
 
 <section class="card" id="step-message">
   <h2>1. Mensaje</h2>
@@ -149,7 +211,62 @@ export const PAGE_HTML = `<!doctype html>
   <div id="result"></div>
 </section>
 
-<footer>Esta página puede crear envíos, por eso escucha solo en 127.0.0.1. No hay ninguna acción sobre la etiqueta: el flujo termina con la etiqueta impaga.</footer>
+</div>
+
+<div class="panel" id="panel-runtime" role="tabpanel" hidden>
+<section class="card">
+  <h2>Runtime</h2>
+  <p class="hint">Lo que este proceso puede decir de sí mismo. El origen del panel se muestra solo como host: no hay token, cookie ni contraseña en ningún valor de esta página.</p>
+  <div class="actions">
+    <button id="console-refresh" type="button" class="secondary">Volver a leer ahora</button>
+    <p class="status" id="runtime-status" role="status"></p>
+  </div>
+  <div id="runtime-warnings"></div>
+  <div id="runtime-body"></div>
+</section>
+</div>
+
+<div class="panel" id="panel-session" role="tabpanel" hidden>
+<section class="card">
+  <h2>Sesión</h2>
+  <p class="hint">El chequeo de sesión abre un navegador Chromium contra el panel del admin y lo lee en modo lectura. No corre solo: se dispara únicamente con este botón, y cada corrida queda en el historial de abajo.</p>
+  <div class="actions">
+    <button id="session-check-run" type="button">Correr el chequeo de sesión ahora (abre un navegador)</button>
+  </div>
+  <p class="status" id="session-check-status" role="status"></p>
+  <div id="session-warnings"></div>
+  <div id="session-body"></div>
+</section>
+</div>
+
+<div class="panel" id="panel-runs" role="tabpanel" hidden>
+<section class="card">
+  <h2>Runs</h2>
+  <p class="hint">Todos los registros de ejecución, del más nuevo al más viejo. Un registro abierto bloquea la creación de ese mismo mensaje hasta que una persona lo resuelva a mano.</p>
+  <div id="runs-warnings"></div>
+  <div id="runs-body"></div>
+</section>
+</div>
+
+<div class="panel" id="panel-artifacts" role="tabpanel" hidden>
+<section class="card">
+  <h2>Artefactos</h2>
+  <p class="note">Las capturas y los traces contienen datos personales del destinatario (nombre, dirección, teléfono) y la sesión del panel. Se sirven solo desde este equipo, en 127.0.0.1, y conviene no compartirlos.</p>
+  <div id="artifacts-warnings"></div>
+  <div id="artifacts-body"></div>
+</section>
+</div>
+
+<div class="panel" id="panel-errors" role="tabpanel" hidden>
+<section class="card">
+  <h2>Errores</h2>
+  <p class="hint">El informe más reciente que el ejecutor escribió y que falló una comprobación estructural, con el mensaje tal como quedó en el archivo.</p>
+  <div id="errors-warnings"></div>
+  <div id="errors-body"></div>
+</section>
+</div>
+
+<footer>Esta página puede crear envíos, por eso escucha solo en 127.0.0.1. No hay ninguna acción sobre la etiqueta: el flujo termina con la etiqueta impaga. Las descargas de artefactos son de solo lectura y no salen del directorio artifacts/.</footer>
 
 <script src="/app.js"></script>
 </body>

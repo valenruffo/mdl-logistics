@@ -48,6 +48,7 @@ import { approvalPayloadFromRequest } from '../executor/approval';
 import { labelUnpaidProblem, type CardReadback } from '../executor/envioNube';
 import { ExecutorError, UnknownOutcomeError, detailsOf, messageOf } from '../executor/errors';
 import type { CreateRunResult, DryRunResult, RunOptions } from '../executor/run';
+import type { ConsoleOverrides } from './console';
 import { formFieldsFromRequest, requestFromForm, type FormField, type FormIssue, type FormValues } from './form';
 
 /** The executor surface the page needs. Injected, so tests never open a browser. */
@@ -60,6 +61,12 @@ export interface ActionDeps {
   executor: UiExecutor;
   /** Where the durable run records live (`artifacts/run-records` in production). */
   recordDir: string;
+  /**
+   * Overrides for the maintenance console's reads (artifacts root, session-check
+   * history, the injected check runner). Every field has the repository's own
+   * default, so a caller that only runs the create path keeps working unchanged.
+   */
+  console?: ConsoleOverrides;
 }
 
 function refusalOf(stage: RefusalStage, error: unknown): RunResponse {
