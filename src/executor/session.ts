@@ -1,5 +1,6 @@
-import { chromium, type BrowserContext, type Page } from 'playwright';
-import { readEnv, readEnvInt } from './env';
+import { statSync } from 'node:fs';
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
+import { readEnv, readEnvBool, readEnvInt } from './env';
 import { ExecutorError, messageOf } from './errors';
 import { storeAdminUrl } from './panel';
 import { poll } from './wait';
@@ -7,17 +8,35 @@ import { poll } from './wait';
 /**
  * The browser session.
  *
- * The executor reuses a **human-prepared, already logged-in Chromium profile**
- * that lives outside the repository (R15). Login is never automated: the store
- * sends a recovery code (2FA), so a human logs in once and this module simply
- * refuses to continue when the session is unusable.
+ * Login is never automated: the store sends a recovery code (2FA), so a human
+ * logs in once on a machine with a screen and the resulting session is
+ * transferred (R15). This module opens that session and refuses loudly when it is
+ * unusable — it never attempts a login and never retries.
  *
- * An unusable session is a loud `SessionError`, never a login attempt and never
- * a retry loop.
+ * Two modes, chosen by the environment and nothing else:
+ *
+ * - **persistent profile** (default, unchanged): a human-prepared, already
+ *   logged-in Chromium profile that lives outside the repository. This is how the
+ *   tool is used locally, next to the operator.
+ * - **transferred storage state** (`MDL_STORAGE_STATE`): a Playwright
+ *   `storageState` JSON file seeds a **non-persistent** context. This is the
+ *   server mode: there is no display and no profile on a VPS, and the profile
+ *   must not be copied around as a directory.
+ *
+ * `MDL_HEADLESS` (`true`/`false`, default `false`) applies to both modes. Both
+ * switches are resolved by `resolveSessionConfig()` through the env layer, so no
+ * other module reads `process.env` and an invalid value is refused instead of
+ * guessed.
  */
 
 /** Default profile location. Overridable with `MDL_PROFILE`. */
 export const DEFAULT_PROFILE_DIR = 'C:\\Users\\valen\\.mdl\\browser-profile';
+
+/** Switch that launches the browser without a window. */
+export const HEADLESS_VARIABLE = 'MDL_HEADLESS';
+
+/** Switch that seeds a non-persistent context from a transferred storageState file. */
+export const STORAGE_STATE_VARIABLE = 'MDL_STORAGE_STATE';
 
 export class SessionError extends ExecutorError {
   constructor(message: string, details: readonly string[] = []) {
@@ -26,16 +45,94 @@ export class SessionError extends ExecutorError {
   }
 }
 
+/** Where the session comes from. */
+export type SessionMode = 'persistent-profile' | 'storage-state';
+
+/** The resolved session switches. Data only: resolving them launches nothing. */
+export interface SessionConfig {
+  mode: SessionMode;
+  headless: boolean;
+  /** Persistent profile directory, or `null` in storage-state mode. */
+  profileDir: string | null;
+  /** Transferred storageState file, or `null` in persistent-profile mode. */
+  storageStatePath: string | null;
+}
+
 export interface Session {
+  mode: SessionMode;
   context: BrowserContext;
   page: Page;
-  profileDir: string;
+  profileDir: string | null;
+  storageStatePath: string | null;
   headless: boolean;
   close(): Promise<void>;
 }
 
 export function resolveProfileDir(): string {
   return readEnv('MDL_PROFILE') ?? DEFAULT_PROFILE_DIR;
+}
+
+/** One line naming the session source, safe to print and to put in failure details. */
+export function describeSessionConfig(config: SessionConfig): string {
+  const headless = `headless: ${String(config.headless)}`;
+  if (config.mode === 'storage-state') {
+    return `storage state ${JSON.stringify(config.storageStatePath)} (${headless})`;
+  }
+  return `persistent profile ${JSON.stringify(config.profileDir)} (${headless})`;
+}
+
+/**
+ * Resolves the two switches.
+ *
+ * - `MDL_HEADLESS` absent/empty → `false`; `true`/`false` accepted; anything else
+ *   (including the old truthy `1`) is an `EnvError`, because a misread switch on
+ *   a server means either a missing display or a silently wrong mode.
+ * - `MDL_STORAGE_STATE` absent/empty → today's persistent profile, untouched.
+ *   Present → must be an existing readable file; the mode becomes
+ *   `storage-state` and the profile is not used at all.
+ */
+export function resolveSessionConfig(): SessionConfig {
+  const headless = readEnvBool(HEADLESS_VARIABLE, false);
+  const storageStatePath = readEnv(STORAGE_STATE_VARIABLE);
+
+  if (storageStatePath === undefined) {
+    return {
+      mode: 'persistent-profile',
+      headless,
+      profileDir: resolveProfileDir(),
+      storageStatePath: null,
+    };
+  }
+
+  assertStorageStateFile(storageStatePath);
+  return { mode: 'storage-state', headless, profileDir: null, storageStatePath };
+}
+
+/**
+ * A missing or non-file storage state is refused before Playwright is launched:
+ * a blank browser would otherwise look like an expired session and send the
+ * operator chasing the wrong problem.
+ */
+function assertStorageStateFile(path: string): void {
+  let isFile = false;
+  try {
+    isFile = statSync(path).isFile();
+  } catch (error) {
+    throw new SessionError(`the transferred session file cannot be read: "${path}"`, [
+      `variable: ${STORAGE_STATE_VARIABLE}`,
+      `error: ${messageOf(error)}`,
+      'the file is the Playwright storageState produced by scripts/session-export.mjs on a machine with a screen',
+      'it holds the logged-in store session: copy it to the server, mount it read-only, never commit it (R15)',
+    ]);
+  }
+
+  if (!isFile) {
+    throw new SessionError(`the transferred session path is not a file: "${path}"`, [
+      `variable: ${STORAGE_STATE_VARIABLE}`,
+      'expected the storageState JSON file itself, not a directory',
+      'produce it with scripts/session-export.mjs and copy that exact file',
+    ]);
+  }
 }
 
 /** `/auth/...`, `/login`, `/recovery-code` — the paths that mean "not logged in". */
@@ -49,24 +146,51 @@ function looksLikeLoginUrl(url: string): boolean {
   return /\/auth(\/|$)/.test(pathname) || /\/(login|recovery-code|signin|sign-in)(\/|$)/.test(pathname);
 }
 
+/** The session shapes that matter to the operator and to the ops check. */
+export type SessionState = 'ready' | 'login' | 'login-form' | 'no-admin-shell';
+
 /**
- * Opens the prepared profile and asserts the store admin shell is really there.
- * A profile that Chromium cannot open (for example because another process holds
- * it) is reported as an actionable session problem, not as a mystery timeout.
+ * One non-polling probe of the session. `login-form` also covers the 2FA
+ * recovery step, which is a password/code form on the store's auth host.
  */
-export async function openSession(): Promise<Session> {
-  const profileDir = resolveProfileDir();
-  const headless = readEnv('MDL_HEADLESS') === '1';
-  const timeoutMs = readEnvInt('MDL_WAIT_TIMEOUT_MS', 60_000);
+export async function readSessionState(page: Page): Promise<SessionState> {
+  if (looksLikeLoginUrl(page.url())) return 'login';
+  if ((await page.locator('input[type="password"]').count().catch(() => 0)) > 0) return 'login-form';
+
+  const shellLink = page.getByRole('link', { name: /Envío Nube/i }).first();
+  if ((await shellLink.count()) === 0) return 'no-admin-shell';
+  return (await shellLink.isVisible()) ? 'ready' : 'no-admin-shell';
+}
+
+/**
+ * Launches the browser for the resolved mode and returns the session without
+ * navigating anywhere. Used by `openSession()` and by the two session scripts:
+ * `scripts/session-export.mjs` needs a headed window to log in, and
+ * `scripts/session-check.mjs` opens the app entry point itself.
+ */
+export async function openBrowserSession(config: SessionConfig): Promise<Session> {
+  return config.mode === 'storage-state'
+    ? openStorageStateSession(config)
+    : openPersistentProfileSession(config);
+}
+
+async function openPersistentProfileSession(config: SessionConfig): Promise<Session> {
+  const profileDir = config.profileDir;
+  if (profileDir === null) {
+    throw new SessionError('the persistent-profile session mode has no profile directory', [
+      'this is a configuration bug, not an operator problem',
+    ]);
+  }
 
   let context: BrowserContext;
   try {
     context = await chromium.launchPersistentContext(profileDir, {
-      headless,
+      headless: config.headless,
       viewport: { width: 1440, height: 900 },
     });
   } catch (error) {
     throw new SessionError(`could not open the prepared browser profile at "${profileDir}"`, [
+      `headless: ${String(config.headless)}`,
       `error: ${messageOf(error)}`,
       'the profile holds the logged-in store session and must not be recreated',
       'if another Chromium process is using it (for example scripts/observe.mjs), close that process first and run again',
@@ -75,25 +199,94 @@ export async function openSession(): Promise<Session> {
 
   const page = context.pages()[0] ?? (await context.newPage());
 
+  return {
+    mode: 'persistent-profile',
+    context,
+    page,
+    profileDir,
+    storageStatePath: null,
+    headless: config.headless,
+    close: async (): Promise<void> => {
+      await context.close();
+    },
+  };
+}
+
+async function openStorageStateSession(config: SessionConfig): Promise<Session> {
+  const storageStatePath = config.storageStatePath;
+  if (storageStatePath === null) {
+    throw new SessionError('the storage-state session mode has no file', [
+      'this is a configuration bug, not an operator problem',
+    ]);
+  }
+
+  const { browser, context } = await launchFromStorageState(config, storageStatePath);
+  const page = context.pages()[0] ?? (await context.newPage());
+
+  return {
+    mode: 'storage-state',
+    context,
+    page,
+    profileDir: null,
+    storageStatePath,
+    headless: config.headless,
+    close: async (): Promise<void> => {
+      await context.close().catch(() => {
+        // Closing context and browser is best-effort; the session file is untouched either way.
+      });
+      await browser.close().catch(() => {});
+    },
+  };
+}
+
+async function launchFromStorageState(
+  config: SessionConfig,
+  storageStatePath: string,
+): Promise<{ browser: Browser; context: BrowserContext }> {
+  let browser: Browser | null = null;
   try {
-    await ensureAdminPage(page, timeoutMs);
-    await assertUsableSession(page, timeoutMs);
+    // Non-persistent on purpose: the server must not keep a mutable profile, and
+    // the transferred file stays the single source of the session.
+    browser = await chromium.launch({ headless: config.headless });
+    const context = await browser.newContext({
+      storageState: storageStatePath,
+      viewport: { width: 1440, height: 900 },
+    });
+    return { browser, context };
   } catch (error) {
-    await context.close().catch(() => {
+    if (browser !== null) await browser.close().catch(() => {});
+    throw new SessionError(`could not open the browser seeded from "${storageStatePath}"`, [
+      `variable: ${STORAGE_STATE_VARIABLE}`,
+      `headless: ${String(config.headless)}`,
+      `error: ${messageOf(error)}`,
+      'the file must be a Playwright storageState JSON produced by scripts/session-export.mjs',
+      'on a server with no display, MDL_HEADLESS=true is required; on a desktop it may stay unset',
+    ]);
+  }
+}
+
+/**
+ * Opens the session for the resolved mode, navigates to the manual-shipment entry
+ * point and asserts the admin shell is usable. A profile that Chromium cannot
+ * open, an unusable session file or a login page is reported as an actionable
+ * session problem, not as a mystery timeout.
+ */
+export async function openSession(): Promise<Session> {
+  const timeoutMs = readEnvInt('MDL_WAIT_TIMEOUT_MS', 60_000);
+  const config = resolveSessionConfig();
+  const session = await openBrowserSession(config);
+
+  try {
+    await ensureAdminPage(session.page, timeoutMs);
+    await waitForUsableSession(session.page, { timeoutMs, source: describeSessionConfig(config) });
+  } catch (error) {
+    await session.close().catch(() => {
       // A failure to close must not hide the session problem being reported.
     });
     throw error;
   }
 
-  return {
-    context,
-    page,
-    profileDir,
-    headless,
-    close: async (): Promise<void> => {
-      await context.close();
-    },
-  };
+  return session;
 }
 
 async function ensureAdminPage(page: Page, timeoutMs: number): Promise<void> {
@@ -110,41 +303,44 @@ async function ensureAdminPage(page: Page, timeoutMs: number): Promise<void> {
   }
 }
 
-type ShellState = 'ready' | 'login' | 'login-form' | 'no-shell';
+export interface UsableSessionOptions {
+  timeoutMs: number;
+  /** One line naming where the session came from, for the failure details. */
+  source: string;
+}
 
 /**
  * Detects the two unusable-session shapes the operator cares about: the login
- * page (including the 2FA recovery step) and a missing admin shell.
+ * page (including the 2FA recovery step) and a missing admin shell. Hidden behind
+ * one polling helper so `scripts/session-check.mjs` reports exactly what the
+ * executor refuses on.
  */
-async function assertUsableSession(page: Page, timeoutMs: number): Promise<void> {
-  const shellLink = page.getByRole('link', { name: /Envío Nube/i }).first();
-
-  const state = await poll<ShellState>(
+export async function waitForUsableSession(page: Page, options: UsableSessionOptions): Promise<void> {
+  const state = await poll<SessionState>(
     async () => {
-      if (looksLikeLoginUrl(page.url())) return 'login';
-      if ((await page.locator('input[type="password"]').count().catch(() => 0)) > 0) return 'login-form';
-      if ((await shellLink.count()) === 0) return null;
-      return (await shellLink.isVisible()) ? 'ready' : null;
+      const current = await readSessionState(page);
+      if (current === 'ready' || current === 'login' || current === 'login-form') return current;
+      return null;
     },
-    { timeoutMs },
+    { timeoutMs: options.timeoutMs },
   );
 
   if (state === 'ready') return;
 
   const details = [
-    `profile: ${resolveProfileDir()}`,
+    `session: ${options.source}`,
     `page url: ${page.url()}`,
     `detected state: ${state ?? 'the admin shell never became visible'}`,
   ];
   if (state === 'login' || state === 'login-form') {
-    throw new SessionError('the prepared browser profile is not logged in to the store admin', [
+    throw new SessionError('the browser session is not logged in to the store admin', [
       ...details,
       'login is human-only: the store sends a recovery code (2FA), so this run never automates it and never handles credentials',
-      'open the profile by hand once, complete the login, close it, and run again',
+      're-seed the session with scripts/session-export.mjs on a machine with a screen, then copy the storageState file again',
     ]);
   }
 
-  throw new SessionError('the store admin shell was not found in the prepared profile', [
+  throw new SessionError('the store admin shell was not found in the browser session', [
     ...details,
     'expected the admin sidebar with an "Envío Nube" link',
     'the automation does not retry and does not try alternative URLs',

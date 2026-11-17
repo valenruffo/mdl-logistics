@@ -38,6 +38,20 @@ declare module 'node:fs/promises' {
   export function readdir(path: string): Promise<string[]>;
 }
 
+/**
+ * Used by `session.ts` to refuse a `MDL_STORAGE_STATE` path that is not a real
+ * file before Playwright is launched. `statSync` throws on a missing path, which
+ * is exactly the refusal being reported.
+ */
+declare module 'node:fs' {
+  export interface Stats {
+    size: number;
+    isFile(): boolean;
+    isDirectory(): boolean;
+  }
+  export function statSync(path: string): Stats;
+}
+
 /** Used only by the CLI to read the confirmation token the operator types. */
 declare module 'node:readline/promises' {
   export interface Interface {

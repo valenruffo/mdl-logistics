@@ -1,0 +1,63 @@
+# One operator, one store (plan §5): a single service, no orchestrator, no queue.
+#
+#   docker compose build          # public npm registry only, no login
+#   docker compose up -d
+#
+# Nothing is committed: MDL_STORE_ORIGIN comes from the shell or a `.env` file
+# (git-ignored), and the session file is a mounted path, not an image layer.
+services:
+  mdl-logistics:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mdl-logistics:local
+    restart: unless-stopped
+
+    # The UI binds 127.0.0.1 inside the process and refuses to bind anything else
+    # (src/ui/server.ts: HOST is not configurable, because this page can create
+    # shipments). Publishing a port through the default bridge network would
+    # require the app to listen on 0.0.0.0 inside the container, so this service
+    # uses host networking instead: the app's loopback bind *is* the host's
+    # loopback on 127.0.0.1:4319, a reverse proxy on the host can reach it, and
+    # nothing is exposed publicly. Linux hosts only, which is the target.
+    network_mode: host
+
+    environment:
+      # Required: the store admin origin (https:// + host, nothing else).
+      MDL_STORE_ORIGIN: ${MDL_STORE_ORIGIN:?define MDL_STORE_ORIGIN, e.g. https://<store>.mitiendanube.com, in the shell or .env}
+      # Server mode: a transferred storageState file seeds a non-persistent
+      # context. No browser profile is copied to the server.
+      MDL_STORAGE_STATE: /run/mdl/storage-state.json
+      # No display on a server.
+      MDL_HEADLESS: "true"
+
+    volumes:
+      # Screenshots, traces and run-records survive rebuilds and restarts.
+      - mdl-artifacts:/app/artifacts
+      # The exported session (scripts/session-export.mjs). The host file must
+      # exist before `up` — Docker would otherwise create a directory in its place.
+      # It is credential material: keep it outside the repo, mode 600, owned by the
+      # container user (uid 1000):  chown 1000:1000 <file> && chmod 600 <file>
+      # Point MDL_SESSION_FILE at it, or place it at ./session/storage-state.json.
+      - ${MDL_SESSION_FILE:-./session/storage-state.json}:/run/mdl/storage-state.json:ro
+
+    # Room for exactly one Chromium plus the Node process. Chromium also needs a
+    # sane /dev/shm, which Docker's 64 MB default is not.
+    mem_limit: 2g
+    shm_size: 512m
+
+    # Hits the UI's own route (`GET /`) inside the container, on the same loopback
+    # the app binds. A 200 means the page is served; it does not touch the panel.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4319/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  mdl-artifacts:

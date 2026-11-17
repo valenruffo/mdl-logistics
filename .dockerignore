@@ -1,0 +1,31 @@
+# Keep the build context small and keep credential material out of the image.
+# node_modules is rebuilt inside the image by `npm ci`; artifacts and tests are
+# runtime/local-only; every env and session file holds configuration or a
+# logged-in session and must never become an image layer (R15).
+
+node_modules
+artifacts
+traces
+test-results
+playwright-report
+coverage
+docs
+tests
+.git
+.gitignore
+
+# Env files, transferred sessions and other credential material.
+.env
+.env.*
+env.example
+**/storageState*.json
+session/
+secrets/
+*.pem
+*.key
+*.p12
+
+# Local noise.
+*.log
+.DS_Store
+Thumbs.db
