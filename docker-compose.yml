@@ -13,6 +13,12 @@ services:
     image: mdl-logistics:local
     restart: unless-stopped
 
+    # Credentials never go through `.env` interpolation, which eats the `$` of a
+    # scrypt hash. `env_file` passes the file's values literally into the
+    # container, so the hash arrives byte for byte.
+    env_file:
+      - ${MDL_CREDENTIALS_FILE:-./credentials.env}
+
     # The UI binds 127.0.0.1 inside the process and refuses to bind anything else
     # (src/ui/server.ts: HOST is not configurable, because this page can create
     # shipments). Publishing a port through the default bridge network would
@@ -30,11 +36,6 @@ services:
       MDL_STORAGE_STATE: /run/mdl/storage-state.json
       # No display on a server.
       MDL_HEADLESS: "true"
-      # Required by the in-app login: without both the process refuses to start.
-      # The hash is salted scrypt; the secret signs the session cookie. Neither
-      # has a default, and neither is ever written into the image.
-      MDL_PASSWORD_HASH: ${MDL_PASSWORD_HASH:?define MDL_PASSWORD_HASH in the shell or .env}
-      MDL_SESSION_SECRET: ${MDL_SESSION_SECRET:?define MDL_SESSION_SECRET in the shell or .env}
 
     volumes:
       # Screenshots, traces and run-records survive rebuilds and restarts.

@@ -31,3 +31,6 @@ coverage/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Credenciales del contenedor
+credentials.env

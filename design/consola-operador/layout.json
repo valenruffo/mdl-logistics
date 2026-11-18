@@ -1,0 +1,21 @@
+{
+  "arrangement": "free",
+  "positions": {
+    "01-mesa-de-trabajo.html": {
+      "x": 0,
+      "y": 69
+    },
+    "02-bandeja-operativa.html": {
+      "x": 1520,
+      "y": 69
+    },
+    "03-consola-densa.html": {
+      "x": 3069,
+      "y": 51
+    },
+    "04-mesa-con-rail.html": {
+      "x": 4589,
+      "y": 47
+    }
+  }
+}
