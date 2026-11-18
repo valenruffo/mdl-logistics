@@ -11,11 +11,17 @@
  *  3. a wrong password is a generic `401` with no cookie and no hint about the
  *     configuration;
  *  4. a tampered, expired or malformed cookie is not a session — same `302`/`401`;
- *  5. five failures per address per fifteen minutes, then a `429` with
- *     `Retry-After`, and a successful login clears the address's budget;
- *  6. the password, the hash and the secret appear in no response body, no header
+ *  5. five failures per client per fifteen minutes, then a `429` with
+ *     `Retry-After`, and a successful login clears the client's budget;
+ *  6. the budget cannot be bypassed by concurrency: the attempt is reserved before
+ *     any `await`, at most one scrypt runs at a time and a concurrent attempt gets
+ *     the documented `429` and gives its reservation back;
+ *  7. the bucket is keyed on the real client, not on the loopback proxy:
+ *     `X-Real-IP` is honoured only when the peer is loopback and only when it
+ *     parses as an IP, and `X-Forwarded-For` is never read;
+ *  8. the password, the hash and the secret appear in no response body, no header
  *     and no log line;
- *  7. startup refuses to run without `MDL_PASSWORD_HASH` and
+ *  9. startup refuses to run without `MDL_PASSWORD_HASH` and
  *     `MDL_SESSION_SECRET`, names the missing variable, and substitutes no default.
  *
  * Everything is loopback, fictional and offline: a temporary record directory, an
@@ -32,6 +38,8 @@ import path from 'node:path';
 import {
   AuthConfigError,
   LOGIN_API_PATH,
+  LOGIN_BUSY_MESSAGE,
+  LOGIN_BUSY_RETRY_AFTER_SECONDS,
   LOGIN_FAILED_MESSAGE,
   LOGIN_FAILURE_LIMIT,
   LOGIN_FAILURE_WINDOW_MS,
@@ -46,6 +54,7 @@ import {
   SESSION_SECRET_SCRIPT,
   SESSION_SECRET_VARIABLE,
   SESSION_TTL_SECONDS,
+  createPasswordGate,
   createSessionToken,
   expiredSessionCookie,
   parseStoredHash,
@@ -54,11 +63,13 @@ import {
   sessionCookie,
   verifyPassword,
   verifySessionToken,
+  type StoredPasswordHash,
 } from '../../src/ui/auth';
 import { LOGIN_HTML, LOGIN_ERROR_FALLBACK } from '../../src/ui/login';
 import {
   PUBLIC_ROUTE_KEYS,
   UNAUTHORIZED_MESSAGE,
+  clientAddress,
   createRoutes,
   startUiServer,
   type UiServerOptions,
@@ -127,6 +138,15 @@ function login(url: string, password: string): Promise<Response> {
   return fetch(`${url}${LOGIN_API_PATH}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password }),
+  });
+}
+
+/** The same POST, with the headers a proxied request carries. */
+function loginFrom(url: string, headers: Record<string, string>, password: string): Promise<Response> {
+  return fetch(`${url}${LOGIN_API_PATH}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
     body: JSON.stringify({ password }),
   });
 }
@@ -821,3 +841,280 @@ test('the cookie helpers agree on one name, one path and one expiry', () => {
   assert.notEqual(one, two, 'the salt must be per password, not global');
   assert.equal(parseStoredHash(one)?.n, 16_384);
 });
+
+// ----------------------------- 12. the budget cannot be bypassed by concurrency
+
+test('a parallel burst of wrong passwords cannot exceed the budget or run two scrypts at once', async () => {
+  const target = await box('burst');
+  try {
+    // Every derivation is counted, and the one-slot gate is observed from inside:
+    // `peak` is the largest number of verifications that were ever in flight.
+    let derivations = 0;
+    let inFlight = 0;
+    let peak = 0;
+    const slowVerifier = async (password: string, stored: StoredPasswordHash): Promise<boolean> => {
+      derivations += 1;
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 25);
+      });
+      inFlight -= 1;
+      return await verifyPassword(password, stored);
+    };
+
+    const started = await start(target, { loginVerifier: slowVerifier });
+    try {
+      let lastStatuses: number[] = [];
+      // Five rounds of a fully parallel burst, then a sixth with the budget gone.
+      for (let round = 1; round <= LOGIN_FAILURE_LIMIT + 1; round += 1) {
+        const burst = Array.from({ length: 20 }, (_, index) => login(started.url, `golpe-${round}-${index}`));
+        const responses = await Promise.all(burst);
+        lastStatuses = responses.map((response) => response.status);
+        for (const response of responses) {
+          assert.equal(response.ok, false, 'no parallel wrong password may open a session');
+          assert.equal(rawCookie(response), null, 'a wrong password sets no cookie');
+        }
+      }
+
+      // Every derivation leaves its reservation recorded, so the number of
+      // derivations inside the window can never exceed the budget.
+      assert.ok(
+        derivations <= LOGIN_FAILURE_LIMIT,
+        `at most ${LOGIN_FAILURE_LIMIT} derivations per window; observed ${derivations}`,
+      );
+      assert.equal(peak, 1, 'at most one scrypt verification runs at a time');
+      // The last burst runs with the budget spent: every request is a 429,
+      // refused before any CPU is spent.
+      assert.deepEqual([...new Set(lastStatuses)].sort(), [429], 'a spent budget refuses the whole burst');
+    } finally {
+      await started.close();
+    }
+  } finally {
+    await rm(target.root, { recursive: true, force: true });
+  }
+});
+
+test('the reservation is one synchronous step, and a busy slot gives the attempt back', () => {
+  let clock = 1_800_000_000_000;
+  const limiter = new LoginRateLimiter({ now: () => clock, limit: 2, windowMs: 60_000 });
+
+  const first = limiter.reserve('10.0.0.9');
+  assert.equal(first.allowed, true);
+  assert.equal(first.retryAfterSeconds, 0);
+  assert.equal(typeof first.attemptId, 'number', 'an allowed attempt is recorded and addressable');
+  assert.equal(limiter.check('10.0.0.9').allowed, true, 'one of the two is spent');
+
+  const second = limiter.reserve('10.0.0.9');
+  assert.equal(second.allowed, true);
+  assert.equal(limiter.check('10.0.0.9').allowed, false, 'the second reservation spends the budget');
+  assert.equal(limiter.check('10.0.0.11').allowed, true, 'another key keeps its own budget');
+
+  const third = limiter.reserve('10.0.0.9');
+  assert.equal(third.allowed, false);
+  assert.equal(third.attemptId, null, 'a refused attempt records nothing');
+  assert.ok(third.retryAfterSeconds > 0 && third.retryAfterSeconds <= 60);
+
+  // Giving the second back re-opens exactly one slot, never the whole window.
+  limiter.release('10.0.0.9', second.attemptId as number);
+  assert.equal(limiter.check('10.0.0.9').allowed, true);
+  assert.equal(limiter.reserve('10.0.0.9').allowed, true);
+  assert.equal(limiter.check('10.0.0.9').allowed, false);
+
+  // A release removes the named attempt, not whichever entry happens to be
+  // newest: both ids are given back out of order and the key returns to empty.
+  const otherFirst = limiter.reserve('10.0.0.10');
+  const otherSecond = limiter.reserve('10.0.0.10');
+  assert.equal(limiter.check('10.0.0.10').allowed, false);
+  limiter.release('10.0.0.10', otherSecond.attemptId as number);
+  limiter.release('10.0.0.10', otherFirst.attemptId as number);
+  assert.equal(limiter.check('10.0.0.10').allowed, true);
+  assert.equal(limiter.reserve('10.0.0.10').allowed, true);
+  assert.equal(limiter.reserve('10.0.0.10').allowed, true);
+  assert.equal(limiter.reserve('10.0.0.10').allowed, false, 'both reservations really were removed');
+});
+
+test('the gate admits one derivation at a time and reports the busy slot', async () => {
+  const stored = parseStoredHash(TEST_PASSWORD_HASH);
+  assert.ok(stored);
+
+  let open = (): void => {};
+  const held = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  let calls = 0;
+  const gate = createPasswordGate(stored, {
+    verify: async (password, hash) => {
+      calls += 1;
+      await held;
+      return await verifyPassword(password, hash);
+    },
+  });
+
+  const first = gate.check(TEST_PASSWORD);
+  assert.equal(gate.running, true, 'the slot is taken before the first await');
+
+  const refused = await gate.check('otra-contrasena');
+  assert.deepEqual(refused, { busy: true });
+  assert.equal(calls, 1, 'the refused attempt never derived anything');
+
+  open();
+  assert.deepEqual(await first, { busy: false, matched: true });
+  assert.equal(gate.running, false, 'the slot is given back');
+
+  assert.deepEqual(await gate.check(TEST_PASSWORD), { busy: false, matched: true });
+  assert.equal(gate.running, false);
+});
+
+test('a derivation that throws still gives the slot back', async () => {
+  const stored = parseStoredHash(TEST_PASSWORD_HASH);
+  assert.ok(stored);
+
+  const gate = createPasswordGate(stored, {
+    verify: async () => {
+      throw new Error('the derivation failed');
+    },
+  });
+
+  assert.equal(gate.running, false);
+  await assert.rejects(gate.check(TEST_PASSWORD), /the derivation failed/);
+  assert.equal(gate.running, false, 'a failure is not a held slot');
+  await assert.rejects(gate.check(TEST_PASSWORD), /the derivation failed/);
+});
+
+// -------------------------------------------- 13. the bucket key is the client
+
+test('the budget key is the real client, from X-Real-IP only behind a loopback peer', () => {
+  const peer = '127.0.0.1';
+
+  // The proxy case: the header is the client.
+  assert.equal(clientAddress(peer, { 'x-real-ip': '203.0.113.9' }), '203.0.113.9');
+  assert.equal(clientAddress('::1', { 'x-real-ip': '203.0.113.9' }), '203.0.113.9');
+  assert.equal(clientAddress('::ffff:127.0.0.1', { 'x-real-ip': '2001:db8::1' }), '2001:db8::1');
+  // An IPv4-mapped client is the same bucket as its plain form.
+  assert.equal(clientAddress(peer, { 'x-real-ip': '::ffff:203.0.113.9' }), '203.0.113.9');
+
+  // Not an IP: the peer is all the process can honestly say.
+  const junk = ['', '   ', 'not-an-ip', '203.0.113.9, 10.0.0.1', 'http://evil.test', '203.0.113.9:1234', '999.999.999.999', '0x7f.1'];
+  for (const value of junk) {
+    assert.equal(clientAddress(peer, { 'x-real-ip': value }), peer, `${JSON.stringify(value)} must fall back to the peer`);
+  }
+
+  // A header is never consulted when the peer is not the proxy.
+  assert.equal(clientAddress('10.0.0.5', { 'x-real-ip': '203.0.113.9' }), '10.0.0.5');
+  assert.equal(clientAddress('2001:db8::5', { 'x-real-ip': '203.0.113.9' }), '2001:db8::5');
+  assert.equal(clientAddress('10.0.0.5', {}), '10.0.0.5');
+  assert.equal(clientAddress('unknown', {}), 'unknown');
+
+  // X-Forwarded-For is never read, alone or next to a real (or junk) X-Real-IP.
+  assert.equal(clientAddress(peer, { 'x-forwarded-for': '203.0.113.9' }), peer);
+  assert.equal(clientAddress(peer, { 'x-forwarded-for': '203.0.113.9', 'x-real-ip': 'garbage' }), peer);
+  assert.equal(clientAddress(peer, { 'x-forwarded-for': '203.0.113.9', 'x-real-ip': '198.51.100.7' }), '198.51.100.7');
+  // A repeated header is not a candidate either.
+  assert.equal(clientAddress(peer, { 'x-real-ip': ['203.0.113.9', '198.51.100.7'] }), peer);
+  assert.equal(clientAddress(peer, {}), peer);
+});
+
+test('failures from one client leave another client able to log in, and X-Forwarded-For is never trusted', async () => {
+  const target = await box('per-client');
+  try {
+    const started = await start(target);
+    try {
+      const attacker = '203.0.113.9';
+      const operator = '198.51.100.7';
+
+      // One client burns the whole budget. Everything is proxied from 127.0.0.1,
+      // so if the bucket keyed on the peer this would be the operator's budget too.
+      for (let attempt = 1; attempt <= LOGIN_FAILURE_LIMIT; attempt += 1) {
+        assert.equal((await loginFrom(started.url, { 'x-real-ip': attacker }, `golpe-${attempt}`)).status, 401);
+      }
+      assert.equal(
+        (await loginFrom(started.url, { 'x-real-ip': attacker }, TEST_PASSWORD)).status,
+        429,
+        'the client that spent its budget is locked out',
+      );
+
+      // A different client still logs in, with the same correct password.
+      const ok = await loginFrom(started.url, { 'x-real-ip': operator }, TEST_PASSWORD);
+      assert.equal(ok.status, 200, 'a flood from one client must not prevent another from logging in');
+      assert.match(rawCookie(ok) ?? '', /Secure/);
+      const cookie = cookiePair(ok);
+      assert.equal((await fetch(`${started.url}/`, { headers: withCookie(cookie) })).status, 200);
+
+      // A rotating X-Forwarded-For cannot mint buckets: it is never read, so all
+      // of these share the loopback peer's bucket, which is untouched so far.
+      for (let attempt = 1; attempt <= LOGIN_FAILURE_LIMIT; attempt += 1) {
+        assert.equal(
+          (await loginFrom(started.url, { 'x-forwarded-for': `203.0.113.${100 + attempt}` }, `rotado-${attempt}`)).status,
+          401,
+          `attempt ${attempt} with a fresh X-Forwarded-For shares the peer bucket`,
+        );
+      }
+      assert.equal(
+        (await loginFrom(started.url, { 'x-forwarded-for': '203.0.113.200' }, TEST_PASSWORD)).status,
+        429,
+        'a fresh X-Forwarded-For must not open a fresh budget',
+      );
+    } finally {
+      await started.close();
+    }
+  } finally {
+    await rm(target.root, { recursive: true, force: true });
+  }
+});
+
+test('a concurrent verification answers 429 with Retry-After and says so in the body', async () => {
+  const target = await box('serialized');
+  try {
+    let release = (): void => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = (): void => {};
+    const enteredSignal = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+
+    const heldVerifier = async (password: string, stored: StoredPasswordHash): Promise<boolean> => {
+      entered();
+      await held;
+      return await verifyPassword(password, stored);
+    };
+
+    const started = await start(target, { loginVerifier: heldVerifier });
+    try {
+      // The first request takes the one derivation slot and stays in it.
+      const first = login(started.url, 'primera');
+      await enteredSignal;
+
+      const second = await login(started.url, TEST_PASSWORD);
+      assert.equal(second.status, 429, 'the second attempt is refused while the slot is taken');
+      assert.equal(second.headers.get('retry-after'), String(LOGIN_BUSY_RETRY_AFTER_SECONDS));
+      const body = (await second.json()) as {
+        status: string;
+        cause: string;
+        reason: string;
+        retryAfterSeconds: number;
+      };
+      assert.equal(body.status, 'rate-limited');
+      assert.equal(body.cause, 'verification-busy');
+      assert.equal(body.reason, LOGIN_BUSY_MESSAGE);
+      assert.equal(body.retryAfterSeconds, LOGIN_BUSY_RETRY_AFTER_SECONDS);
+      assert.equal(rawCookie(second), null);
+
+      release();
+      assert.equal((await first).status, 401, 'the first attempt was compared, and was wrong');
+
+      // The refused attempt gave its reservation back: the client's budget is not
+      // spent by a "server is busy" answer, so the correct password works now.
+      const third = await login(started.url, TEST_PASSWORD);
+      assert.equal(third.status, 200, 'a refused busy attempt does not spend the client budget');
+      assert.ok(rawCookie(third));
+    } finally {
+      await started.close();
+    }
+  } finally {
+    await rm(target.root, { recursive: true, force: true });
+  }
+});
+

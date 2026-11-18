@@ -129,6 +129,9 @@ if (args.error !== null) {
   console.log(`  ${started.url}`);
   console.log('  escucha solo en 127.0.0.1 porque esta pagina puede crear envios.');
   console.log(`  entrada: ${started.url}/login (cookie de sesion de 30 dias, HttpOnly, Secure, SameSite=Strict)`);
+  console.log('  la cookie es Secure a proposito: un navegador que abra http://127.0.0.1 directo NO la conserva.');
+  console.log('  uso local: entrá por el proxy TLS o por un tunel SSH (ver env.example); no hay forma de apagar Secure.');
+  console.log('  un solo password se verifica a la vez; los intentos se cuentan por cliente, no por el proxy.');
   console.log(`  registros de ejecucion: ${RUN_RECORD_DIR}`);
   console.log(`  artefactos: ${ARTIFACTS_DIR} (se listan en la pagina; no se sirven por HTTP)`);
   console.log(`  historial del chequeo de sesion: ${SESSION_CHECK_HISTORY_PATH}`);

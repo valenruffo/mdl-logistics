@@ -21,7 +21,8 @@ declare module 'node:http' {
     url?: string;
     /** The request headers, lower-cased by Node. `cookie` is the one auth reads. */
     readonly headers: Record<string, string | string[] | undefined>;
-    /** The peer socket, for the source address the login rate limit counts. */
+    /** The peer socket. `clientAddress` in `server.ts` turns it into the login
+     * budget's key: the real client when the peer is the loopback proxy. */
     readonly socket?: { readonly remoteAddress?: string | null };
     on(event: 'data', listener: (chunk: HttpChunk) => void): unknown;
     on(event: 'end', listener: () => void): unknown;

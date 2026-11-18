@@ -21,10 +21,21 @@
  *    fields, so a cookie cannot be aged forward, replayed under another expiry or
  *    forged without the secret. A tampered, expired or malformed cookie is simply
  *    not a session — there is no partial state.
- * 4. **The attempt budget** is per source address, in memory, and only failures
- *    count: five wrong passwords in fifteen minutes, then a `429` that says how
- *    long to wait. A successful login clears the address's failures.
- * 5. **Nothing here logs, returns or embeds a secret.** No error message quotes
+ * 4. **The attempt budget** is per client (see `clientAddress` in `server.ts`: the
+ *    real client behind the loopback proxy, never the proxy itself), in memory.
+ *    The login route *reserves* an attempt — checks the budget and records the
+ *    attempt in one synchronous step — before it awaits anything, so a parallel
+ *    burst cannot slip past the check while the first derivation is still
+ *    running. Five attempts in fifteen minutes, then a `429` that says how long
+ *    to wait. A correct password clears the client's budget; a wrong one leaves
+ *    the reservation recorded.
+ * 5. **One derivation at a time.** `createPasswordGate` admits a single
+ *    verification per process: a second concurrent attempt is answered with a
+ *    `429` carrying `Retry-After` (`LOGIN_BUSY_MESSAGE`) and its reservation is
+ *    given back, because the busy slot is the server's limit and not that
+ *    client's failure. The CPU cost is therefore at most one scrypt, even if an
+ *    attacker rotates the bucket key.
+ * 6. **Nothing here logs, returns or embeds a secret.** No error message quotes
  *    the password, the hash or the secret, and the configuration refusal names the
  *    *variable*, never a value and never a default: if `MDL_PASSWORD_HASH` or
  *    `MDL_SESSION_SECRET` is missing the process refuses to start rather than
@@ -53,7 +64,7 @@ export const LOGOUT_API_PATH = '/api/logout';
 /** The only sentence a failed login gets: it reveals nothing about the config. */
 export const LOGIN_FAILED_MESSAGE = 'No se pudo iniciar sesión: la contraseña no es correcta.';
 
-/** Five failures per address per window. Both numbers are asserted by tests. */
+/** Five attempts per client per window. Both numbers are asserted by tests. */
 export const LOGIN_FAILURE_LIMIT = 5;
 export const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 
@@ -334,12 +345,36 @@ export interface RateDecision {
 }
 
 /**
- * The in-memory failure budget for the login route: per source address, failures
- * only, pruned by time. Nothing is persisted — a restart forgets the counters,
- * which is the right trade for one operator on one box.
+ * What `LoginRateLimiter.reserve` decided, plus the id of the attempt it recorded.
+ * The id is how a caller gives the attempt back when it never got to compare the
+ * password: the release removes *that* reservation, not whichever entry happens to
+ * be newest.
+ */
+export interface RateReservation extends RateDecision {
+  /** `null` when the budget refused the attempt and nothing was recorded. */
+  readonly attemptId: number | null;
+}
+
+/** One recorded attempt. The id makes the entry addressable for a release. */
+interface Attempt {
+  readonly at: number;
+  readonly id: number;
+}
+
+/**
+ * The in-memory attempt budget for the login route: per bucket key, pruned by
+ * time. Nothing is persisted — a restart forgets the counters, which is the right
+ * trade for one operator on one box.
+ *
+ * **`reserve` is the entry point the login route uses**, because it checks the
+ * budget and records the attempt in one synchronous call: there is no `await`
+ * between "may this client try?" and "this client tried", so a parallel burst
+ * cannot all pass the check while the first scrypt is still running. `check` and
+ * `recordFailure` remain for callers that only need one half of that pair.
  */
 export class LoginRateLimiter {
-  private readonly failures = new Map<string, number[]>();
+  private readonly attempts = new Map<string, Attempt[]>();
+  private nextAttemptId = 1;
   private readonly limit: number;
   private readonly windowMs: number;
   private readonly now: () => number;
@@ -350,33 +385,59 @@ export class LoginRateLimiter {
     this.now = options.now ?? (() => Date.now());
   }
 
-  /** Whether this address may try a password now. Does not record anything. */
+  /** Whether this key may try a password now. Does not record anything. */
   check(address: string): RateDecision {
     const recent = this.prune(address);
     if (recent.length < this.limit) return { allowed: true, retryAfterSeconds: 0 };
 
-    const oldest = recent[0] ?? this.now();
-    const remainingMs = oldest + this.windowMs - this.now();
+    const oldest = recent[0] ?? { at: this.now(), id: 0 };
+    const remainingMs = oldest.at + this.windowMs - this.now();
     return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(remainingMs / 1000)) };
   }
 
-  /** Records one wrong password for this address. */
+  /**
+   * Checks the budget and, when it allows the attempt, records it — one
+   * synchronous step, so nothing can interleave between the check and the
+   * increment. This is the reservation the login route makes before it awaits a
+   * derivation.
+   */
+  reserve(address: string): RateReservation {
+    const decision = this.check(address);
+    if (!decision.allowed) return { ...decision, attemptId: null };
+    return { ...decision, attemptId: this.push(address) };
+  }
+
+  /** Gives back exactly this reservation: the attempt never compared a password. */
+  release(address: string, attemptId: number): void {
+    const recent = this.prune(address).filter((attempt) => attempt.id !== attemptId);
+    if (recent.length === 0) this.attempts.delete(address);
+    else this.attempts.set(address, recent);
+  }
+
+  /** Records one wrong password for this key. */
   recordFailure(address: string): void {
-    const recent = this.prune(address);
-    recent.push(this.now());
-    this.failures.set(address, recent);
+    this.push(address);
   }
 
-  /** Forgets this address entirely: a successful login resets its budget. */
+  /** Forgets this key entirely: a successful login resets its budget. */
   reset(address: string): void {
-    this.failures.delete(address);
+    this.attempts.delete(address);
   }
 
-  private prune(address: string): number[] {
+  private push(address: string): number {
+    const id = this.nextAttemptId;
+    this.nextAttemptId += 1;
+    const recent = this.prune(address);
+    recent.push({ at: this.now(), id });
+    this.attempts.set(address, recent);
+    return id;
+  }
+
+  private prune(address: string): Attempt[] {
     const cutoff = this.now() - this.windowMs;
-    const recent = (this.failures.get(address) ?? []).filter((at) => at > cutoff);
-    if (recent.length === 0) this.failures.delete(address);
-    else this.failures.set(address, recent);
+    const recent = (this.attempts.get(address) ?? []).filter((attempt) => attempt.at > cutoff);
+    if (recent.length === 0) this.attempts.delete(address);
+    else this.attempts.set(address, recent);
     return recent;
   }
 }
@@ -385,6 +446,70 @@ export class LoginRateLimiter {
 export function rateLimitMessage(retryAfterSeconds: number): string {
   const minutes = Math.max(1, Math.ceil(retryAfterSeconds / 60));
   return `Demasiados intentos fallidos desde esta dirección. Esperá ${minutes} ${minutes === 1 ? 'minuto' : 'minutos'} (${retryAfterSeconds} s) y volvé a intentar.`;
+}
+
+/**
+ * The sentence a `429` carries when the budget was fine but another password is
+ * already being derived. It is a different answer from a spent budget because it
+ * is a different condition — the attempt was refused, not judged.
+ */
+export const LOGIN_BUSY_MESSAGE =
+  'El servidor está verificando otra contraseña en este momento. Volvé a intentar en unos segundos.';
+
+/** How long a `429` for a busy verification slot asks the caller to wait. */
+export const LOGIN_BUSY_RETRY_AFTER_SECONDS = 1;
+
+// ------------------------------------------------------- serialized verification
+
+/** The result of one admission to the password gate. */
+export type PasswordCheck =
+  | { readonly busy: true }
+  | { readonly busy: false; readonly matched: boolean };
+
+/**
+ * The one-slot gate around `verifyPassword`.
+ *
+ * scrypt is deliberately expensive, which is exactly why an unauthenticated
+ * caller must not be able to run many derivations at once: the budget bounds how
+ * many *keys* may try, not how much CPU one burst can consume. This gate bounds
+ * the CPU: at most one derivation runs at a time in this process, and a request
+ * that arrives while one is running is told so (`busy`) instead of queued behind
+ * an unbounded attacker-driven queue.
+ */
+export interface PasswordGate {
+  /** True while a derivation is in flight. A test seam and nothing else. */
+  readonly running: boolean;
+  /** Takes the slot and derives the candidate key, or reports that it is taken. */
+  check(password: string): Promise<PasswordCheck>;
+}
+
+/**
+ * Builds the gate. `verify` is injectable so a test can hold the slot open and
+ * observe the refused request deterministically.
+ */
+export function createPasswordGate(
+  stored: StoredPasswordHash,
+  options: { verify?: (password: string, stored: StoredPasswordHash) => Promise<boolean> } = {},
+): PasswordGate {
+  const verify = options.verify ?? verifyPassword;
+  let running = false;
+
+  return {
+    get running() {
+      return running;
+    },
+    async check(password: string): Promise<PasswordCheck> {
+      // Taken synchronously, before the first `await`: two requests cannot both
+      // see a free slot. `finally` gives it back whatever the derivation does.
+      if (running) return { busy: true };
+      running = true;
+      try {
+        return { busy: false, matched: await verify(password, stored) };
+      } finally {
+        running = false;
+      }
+    },
+  };
 }
 
 // ------------------------------------------------------------------ config
@@ -430,16 +555,26 @@ export function readAuthConfig(env: Record<string, string | undefined>): AuthCon
   return { passwordHash, sessionSecret: rawSecret };
 }
 
-/** Everything the request path needs: the config, the failure budget and a clock. */
+/** Everything the request path needs: the config, the attempt budget, the one
+ * derivation slot and a clock. */
 export interface AuthRuntime {
   readonly config: AuthConfig;
   readonly limiter: LoginRateLimiter;
+  /** At most one `verifyPassword` runs at a time through this gate. */
+  readonly gate: PasswordGate;
   now(): number;
 }
 
 export function createAuthRuntime(
   config: AuthConfig,
-  options: { now?: () => number; limit?: number; windowMs?: number; limiter?: LoginRateLimiter } = {},
+  options: {
+    now?: () => number;
+    limit?: number;
+    windowMs?: number;
+    limiter?: LoginRateLimiter;
+    /** A test seam for the one-slot gate; production uses `verifyPassword`. */
+    verify?: (password: string, stored: StoredPasswordHash) => Promise<boolean>;
+  } = {},
 ): AuthRuntime {
   const now = options.now ?? (() => Date.now());
   const limiter =
@@ -449,6 +584,10 @@ export function createAuthRuntime(
       ...(options.limit === undefined ? {} : { limit: options.limit }),
       ...(options.windowMs === undefined ? {} : { windowMs: options.windowMs }),
     });
+  const gate = createPasswordGate(
+    config.passwordHash,
+    options.verify === undefined ? {} : { verify: options.verify },
+  );
 
-  return { config, limiter, now };
+  return { config, limiter, gate, now };
 }

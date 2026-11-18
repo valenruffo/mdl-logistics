@@ -50,13 +50,23 @@
  * (`lock.ts`) for the whole request: a second request gets a `409` carrying
  * `LOCK_BUSY_MESSAGE` and runs nothing at all, and the lock is released in a
  * `finally` whatever the run does.
+ *
+ * **The login budget is per client, and one password is derived at a time.**
+ * `clientAddress` resolves the bucket key — the real client behind the loopback
+ * proxy, not the proxy, and never `X-Forwarded-For` — so five wrong guesses from
+ * one address cannot lock anyone else out. The attempt is *reserved* before the
+ * route awaits anything, and `auth.gate` admits one scrypt per process; a
+ * concurrent attempt is a `429` with `Retry-After`, not a second derivation.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { isIP } from 'node:net';
 
 import { messageOf } from '../executor/errors';
 import { analyzeMessage, runAttempt, type ActionDeps } from './actions';
 import {
   LOGIN_API_PATH,
+  LOGIN_BUSY_MESSAGE,
+  LOGIN_BUSY_RETRY_AFTER_SECONDS,
   LOGIN_FAILED_MESSAGE,
   LOGIN_PATH,
   LOGOUT_API_PATH,
@@ -67,10 +77,10 @@ import {
   rateLimitMessage,
   readCookie,
   sessionCookie,
-  verifyPassword,
   verifySessionToken,
   type AuthConfig,
   type AuthRuntime,
+  type StoredPasswordHash,
 } from './auth';
 import { CLIENT_JS } from './client';
 import { performSessionCheck, readConsole, resolveConsoleDeps, type ConsoleDeps } from './console';
@@ -92,6 +102,60 @@ export const DEFAULT_PORT = 4319;
  * buffered.
  */
 export const MAX_BODY_LENGTH = 1_000_000;
+
+/**
+ * The bucket key the login budget counts: **the real client, not the proxy.**
+ *
+ * The rule, and why it is written this way:
+ *
+ * 1. **The peer decides first.** When the peer is not a loopback address the peer
+ *    *is* the client and no header is consulted at all: a request cannot choose
+ *    its own bucket by sending one.
+ * 2. **A loopback peer means a proxy.** In the documented deployment Nginx
+ *    listens on the public side and proxies to this port from `127.0.0.1`, so
+ *    every external request shares that one peer address. Keying on the peer
+ *    would put the operator and any attacker in one bucket, and five wrong
+ *    guesses would lock the only operator out for the whole window.
+ * 3. **So the client comes from `X-Real-IP`** — and *only* from `X-Real-IP`,
+ *    because the documented Nginx sets `proxy_set_header X-Real-IP $remote_addr`,
+ *    which overwrites anything the client sent. The value is used only when it
+ *    parses as an IP address; anything else falls back to the peer, so a junk
+ *    header cannot mint a bucket and cannot evade one.
+ * 4. **`X-Forwarded-For` is never read.** Nginx *appends* to that header, so its
+ *    first entry is attacker-supplied; keying on it would let one attacker rotate
+ *    a fresh bucket per request and walk straight through the budget.
+ *
+ * The returned text is also the map key, so an IPv4-mapped IPv6 form and its
+ * plain IPv4 form are one bucket rather than two. Two *different spellings* of
+ * one IPv6 address (`2001:db8::1` and `2001:db8:0:0:0:0:0:1`) are two keys: the
+ * proxy reports the address the kernel formatted, one spelling per client, so
+ * this is not a way in — and normalising IPv6 text by hand here would be a
+ * guess, not a rule.
+ */
+export function clientAddress(peer: string, headers: Record<string, string | string[] | undefined>): string {
+  const peerAddress = peer.trim();
+  if (!isLoopbackAddress(peerAddress)) return bucketKey(peerAddress);
+
+  // Loopback peer: `X-Real-IP` is the only candidate, and only if it is an IP.
+  const realIp = (headerValue(headers['x-real-ip']) ?? '').trim();
+  if (realIp !== '' && isIP(realIp) !== 0) return bucketKey(realIp);
+
+  // No usable header: the peer is all this process can honestly say.
+  return bucketKey(peerAddress);
+}
+
+/** `127.0.0.0/8` and `::1`, including the IPv4-mapped form a dual-stack peer reports. */
+function isLoopbackAddress(address: string): boolean {
+  const text = bucketKey(address);
+  if (text === '::1' || text === '0:0:0:0:0:0:0:1') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(text);
+}
+
+/** One canonical form per address, so a mapped and a plain IPv4 are one bucket. */
+function bucketKey(address: string): string {
+  const text = address.trim().toLowerCase();
+  return text.startsWith('::ffff:') ? text.slice('::ffff:'.length) : text;
+}
 
 /**
  * The whole exception list, as data. Everything not named here requires a valid,
@@ -123,14 +187,14 @@ export interface UiResponse {
 }
 
 /**
- * What one request carries into a route handler. The auth runtime (config, failure
- * budget and clock), the raw `cookie` header, the source address the rate limit
- * counts and the request's own clock.
+ * What one request carries into a route handler. The auth runtime (config, attempt
+ * budget, one-slot derivation gate and clock), the raw `cookie` header, the bucket
+ * key the login budget counts and the request's own clock.
  */
 export interface RouteContext {
   auth: AuthRuntime;
   cookieHeader: string | undefined;
-  /** The peer address, as `req.socket.remoteAddress` reports it. */
+  /** The login budget's key, from `clientAddress`: the real client, not the peer. */
   address: string;
   /** Milliseconds since the epoch, so a test can age a session. */
   now: number;
@@ -235,29 +299,64 @@ export function hasValidSession(context: RouteContext): boolean {
 }
 
 /**
+ * A `429`: the sentence, the seconds, and which limit answered. The `cause` is in
+ * the body so a caller (and a test) can tell a spent budget from a busy
+ * verification slot; it reveals nothing about the password or the configuration.
+ */
+function rateLimited(
+  reason: string,
+  retryAfterSeconds: number,
+  cause: 'attempt-budget' | 'verification-busy',
+): UiResponse {
+  return json(
+    429,
+    { status: 'rate-limited', cause, reason, retryAfterSeconds },
+    { 'retry-after': String(retryAfterSeconds) },
+  );
+}
+
+/**
  * `POST /api/login`, the one place a password is compared.
  *
- * The order is: budget first (so a locked address spends no CPU on scrypt), then
- * the comparison, then either a signed cookie or one generic sentence. A body
- * that is not a JSON object counts as a failure too: the route never explains the
- * difference, and a malformed attempt is still an attempt.
+ * The order is fixed, and every step before the derivation is synchronous:
+ *
+ * 1. **The body is validated** (a malformed or empty body is an attempt, not an
+ *    error, so it takes the same path as a wrong password).
+ * 2. **The attempt is reserved** — `limiter.reserve` checks the budget and records
+ *    the attempt in one synchronous call, with no `await` between them. A parallel
+ *    burst therefore cannot all pass the check while the first scrypt is still
+ *    running: reservations five onwards are a `429`, before any CPU is spent.
+ * 3. **One derivation runs at a time** (`auth.gate`). A request that finds the
+ *    slot busy is answered `429` with `Retry-After` and `cause:
+ *    'verification-busy'`, and its reservation is **given back**: the refusal is
+ *    the server's limit, not that client's failure, so it must not spend that
+ *    client's budget (an operator's double submit must not lock them out).
+ * 4. **A correct password clears the key's budget**; a wrong one leaves the
+ *    reservation in place.
  */
 async function login(body: string, context: RouteContext): Promise<UiResponse> {
-  const decision = context.auth.limiter.check(context.address);
-  if (!decision.allowed) {
-    return json(429, { status: 'rate-limited', reason: rateLimitMessage(decision.retryAfterSeconds) }, {
-      'retry-after': String(decision.retryAfterSeconds),
-    });
-  }
-
   const parsed = parseBody(body);
   const password = parsed.ok ? textField(parsed.value, 'password') : '';
-  const accepted = parsed.ok && password !== '' && (await verifyPassword(password, context.auth.config.passwordHash));
 
-  if (!accepted) {
-    context.auth.limiter.recordFailure(context.address);
-    return json(401, { status: 'unauthorized', reason: LOGIN_FAILED_MESSAGE });
+  // Reserve before awaiting anything: the check and the increment are one step.
+  const reservation = context.auth.limiter.reserve(context.address);
+  if (!reservation.allowed) {
+    return rateLimited(rateLimitMessage(reservation.retryAfterSeconds), reservation.retryAfterSeconds, 'attempt-budget');
   }
+
+  let matched = false;
+  if (password !== '') {
+    const check = await context.auth.gate.check(password);
+    if (check.busy) {
+      if (reservation.attemptId !== null) {
+        context.auth.limiter.release(context.address, reservation.attemptId);
+      }
+      return rateLimited(LOGIN_BUSY_MESSAGE, LOGIN_BUSY_RETRY_AFTER_SECONDS, 'verification-busy');
+    }
+    matched = check.matched;
+  }
+
+  if (!matched) return json(401, { status: 'unauthorized', reason: LOGIN_FAILED_MESSAGE });
 
   context.auth.limiter.reset(context.address);
   const token = createSessionToken(context.auth.config.sessionSecret, context.now);
@@ -473,7 +572,8 @@ async function respond(
   const context: RouteContext = {
     auth,
     cookieHeader: headerValue(request.headers['cookie']),
-    address: request.socket?.remoteAddress ?? 'unknown',
+    // The real client, not the proxy: see `clientAddress` for the rule.
+    address: clientAddress(request.socket?.remoteAddress ?? 'unknown', request.headers),
     now: auth.now(),
   };
 
@@ -512,8 +612,13 @@ export interface UiServerOptions {
   port?: number;
   /** The clock used for cookie expiry and the login budget. A test seam. */
   now?: () => number;
-  /** The login budget. A test seam; the defaults are five failures per 15 minutes. */
+  /** The login budget. A test seam; the defaults are five attempts per 15 minutes. */
   loginRateLimit?: { limit?: number; windowMs?: number };
+  /**
+   * The one-slot derivation gate's verifier. A test seam; production derives with
+   * `verifyPassword`, and only one derivation runs at a time either way.
+   */
+  loginVerifier?: (password: string, stored: StoredPasswordHash) => Promise<boolean>;
 }
 
 export interface StartedUiServer {
@@ -534,6 +639,7 @@ export async function startUiServer(options: UiServerOptions): Promise<StartedUi
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.loginRateLimit?.limit === undefined ? {} : { limit: options.loginRateLimit.limit }),
     ...(options.loginRateLimit?.windowMs === undefined ? {} : { windowMs: options.loginRateLimit.windowMs }),
+    ...(options.loginVerifier === undefined ? {} : { verify: options.loginVerifier }),
   });
 
   const server = createServer((request, response) => {
