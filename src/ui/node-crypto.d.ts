@@ -31,6 +31,14 @@ declare module 'node:crypto' {
     callback: (error: unknown, derivedKey: Uint8Array) => void,
   ): void;
 
+  /** The synchronous twin of `scrypt`: the same key, returned instead of handed to a callback. */
+  export function scryptSync(
+    password: string,
+    salt: string | Uint8Array | { toString(encoding: 'hex'): string },
+    keylen: number,
+    options?: ScryptOptions,
+  ): { toString(encoding: 'hex'): string };
+
   /** Used for the session cookie's nonce. */
   export function randomBytes(size: number): { toString(encoding: 'hex'): string };
 

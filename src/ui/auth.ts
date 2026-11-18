@@ -300,25 +300,27 @@ export function verifySessionToken(
 /**
  * The `Set-Cookie` value for a live session. Flags are exactly the required set,
  * and there is no `Domain`: the cookie belongs to the host that served it.
+ * `Secure` is added only when the request arrived over TLS, because a browser
+ * silently drops a `Secure` cookie set from plain `http://127.0.0.1`.
  */
-export function sessionCookie(token: SessionToken): string {
+export function sessionCookie(token: SessionToken, encrypted = false): string {
   return [
     `${SESSION_COOKIE_NAME}=${token.value}`,
     'Path=/',
     'HttpOnly',
-    'Secure',
+    ...(encrypted ? ['Secure'] : []),
     'SameSite=Strict',
     `Max-Age=${SESSION_TTL_SECONDS}`,
   ].join('; ');
 }
 
 /** The `Set-Cookie` value that clears it: same name, same path, zero age. */
-export function expiredSessionCookie(): string {
+export function expiredSessionCookie(encrypted = false): string {
   return [
     `${SESSION_COOKIE_NAME}=`,
     'Path=/',
     'HttpOnly',
-    'Secure',
+    ...(encrypted ? ['Secure'] : []),
     'SameSite=Strict',
     'Max-Age=0',
   ].join('; ');

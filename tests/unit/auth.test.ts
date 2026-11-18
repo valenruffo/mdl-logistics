@@ -229,7 +229,8 @@ test('a correct password sets one usable cookie with the required flags', async 
   try {
     const started = await start(target);
     try {
-      const response = await login(started.url, TEST_PASSWORD);
+      // Behind the TLS proxy this is what a browser receives, so the flag is here.
+      const response = await loginFrom(started.url, { 'x-forwarded-proto': 'https' }, TEST_PASSWORD);
       assert.equal(response.status, 200);
 
       const raw = rawCookie(response);
@@ -256,6 +257,10 @@ test('a correct password sets one usable cookie with the required flags', async 
       // The script the page needs is public on purpose: the login card is the only
       // page that exists before a session, and it loads no external script.
       assert.equal((await fetch(`${started.url}/app.js`)).status, 200);
+
+      // Over plain `http://127.0.0.1` the same login must send the cookie without
+      // `Secure`: a browser drops it and the login loops with no error at all.
+      assert.doesNotMatch(rawCookie(await login(started.url, TEST_PASSWORD)) ?? '', /Secure/);
     } finally {
       await started.close();
     }
@@ -448,7 +453,7 @@ test('every protected route is a 302 or a 401 without a session and works with o
 
       const logout = await fetch(`${started.url}${LOGOUT_API_PATH}`, {
         method: 'POST',
-        headers: { cookie },
+        headers: { cookie, 'x-forwarded-proto': 'https' },
         redirect: 'manual',
       });
       assert.equal(logout.status, 303);
@@ -817,8 +822,8 @@ test('the documented generator commands produce values this server accepts', asy
 
 test('the cookie helpers agree on one name, one path and one expiry', () => {
   const token = createSessionToken(TEST_SESSION_SECRET, 1_800_000_000_000);
-  const live = sessionCookie(token);
-  const cleared = expiredSessionCookie();
+  const live = sessionCookie(token, true);
+  const cleared = expiredSessionCookie(true);
 
   for (const value of [live, cleared]) {
     assert.match(value, new RegExp(`^${SESSION_COOKIE_NAME}=`));
@@ -1035,7 +1040,7 @@ test('failures from one client leave another client able to log in, and X-Forwar
       );
 
       // A different client still logs in, with the same correct password.
-      const ok = await loginFrom(started.url, { 'x-real-ip': operator }, TEST_PASSWORD);
+      const ok = await loginFrom(started.url, { 'x-real-ip': operator, 'x-forwarded-proto': 'https' }, TEST_PASSWORD);
       assert.equal(ok.status, 200, 'a flood from one client must not prevent another from logging in');
       assert.match(rawCookie(ok) ?? '', /Secure/);
       const cookie = cookiePair(ok);

@@ -23,7 +23,11 @@ declare module 'node:http' {
     readonly headers: Record<string, string | string[] | undefined>;
     /** The peer socket. `clientAddress` in `server.ts` turns it into the login
      * budget's key: the real client when the peer is the loopback proxy. */
-    readonly socket?: { readonly remoteAddress?: string | null };
+    readonly socket?: {
+      readonly remoteAddress?: string | null;
+      /** `true` when this very socket is TLS. A proxied request is plain HTTP. */
+      readonly encrypted?: boolean;
+    };
     on(event: 'data', listener: (chunk: HttpChunk) => void): unknown;
     on(event: 'end', listener: () => void): unknown;
     on(event: 'error', listener: (error: unknown) => void): unknown;

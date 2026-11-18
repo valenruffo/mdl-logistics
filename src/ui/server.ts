@@ -198,6 +198,8 @@ export interface RouteContext {
   address: string;
   /** Milliseconds since the epoch, so a test can age a session. */
   now: number;
+  /** `true` when the request arrived over TLS: the direct socket, or the proxy's header. */
+  encrypted?: boolean;
 }
 
 export interface Route {
@@ -363,7 +365,7 @@ async function login(body: string, context: RouteContext): Promise<UiResponse> {
   return json(
     200,
     { status: 'ok', expiresAt: token.expiry },
-    { 'set-cookie': sessionCookie(token) },
+    { 'set-cookie': sessionCookie(token, context.encrypted) },
   );
 }
 
@@ -410,7 +412,7 @@ export function createRoutes(deps: ActionDeps): Route[] {
       path: LOGOUT_API_PATH,
       purpose: 'cierra la sesión: borra la cookie y vuelve a la tarjeta de entrada',
       public: false,
-      handle: async () => redirectToLogin({ 'set-cookie': expiredSessionCookie() }),
+      handle: async (_body, context) => redirectToLogin({ 'set-cookie': expiredSessionCookie(context.encrypted) }),
     },
     {
       method: 'POST',
@@ -575,6 +577,8 @@ async function respond(
     // The real client, not the proxy: see `clientAddress` for the rule.
     address: clientAddress(request.socket?.remoteAddress ?? 'unknown', request.headers),
     now: auth.now(),
+    // `Secure` needs a real TLS hop: this socket, or the proxy reporting `https`.
+    encrypted: request.socket?.encrypted === true || request.headers['x-forwarded-proto'] === 'https',
   };
 
   let body = '';
