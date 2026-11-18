@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MDL · Consola</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#151a21; --panel-2:#1b2129; --ink:#dfe3e9; --muted:#8b93a1;
+    --line:#252c36; --accent:#7fd1a8; --accent-ink:#0e1116; --warn:#e0b062; --bad:#e07a6a;
+    --sans:-apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono:ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.55 var(--mono); }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .top { display:flex; gap:18px; align-items:center; padding:12px 20px; border-bottom:1px solid var(--line);
+         background:var(--panel); font-size:13px; flex-wrap:wrap; position:sticky; top:0; }
+  .top .name { color:var(--accent); font-weight:700; margin-right:auto; letter-spacing:.02em; }
+  .stat { color:var(--muted); display:inline-flex; gap:6px; align-items:center; }
+  .b { width:7px; height:7px; border-radius:50%; background:var(--muted); display:inline-block; }
+  .b.ok { background:var(--accent); } .b.warn { background:var(--warn); } .b.bad { background:var(--bad); }
+
+  .cols { display:grid; grid-template-columns:minmax(0,1fr) 380px; gap:0; min-height:calc(100vh - 49px); }
+  .main { padding:22px 24px 40px; }
+  .side { border-left:1px solid var(--line); background:var(--panel); padding:20px; }
+
+  h1 { font-family:var(--sans); font-size:18px; font-weight:650; margin:0 0 4px; letter-spacing:-.01em; }
+  .lede { color:var(--muted); font-size:13px; margin:0 0 20px; }
+
+  .cmd { display:flex; gap:10px; align-items:center; background:var(--panel-2); border:1px solid var(--line);
+         border-radius:8px; padding:10px 12px; margin-bottom:18px; }
+  .cmd span.prompt { color:var(--accent); }
+  .cmd input { flex:1; background:transparent; border:0; color:var(--ink); font:14px/1.4 var(--mono); }
+  .cmd input::placeholder { color:#5b6270; }
+  .cmd kbd { font:11px/1 var(--mono); color:var(--muted); border:1px solid var(--line); border-radius:4px; padding:4px 6px; }
+
+  .pane { background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; margin-bottom:18px; }
+  .pane > header { display:flex; gap:12px; align-items:center; padding:10px 14px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; }
+  .pane > .body { padding:14px; }
+  pre { margin:0; font:12.5px/1.65 var(--mono); color:var(--muted); overflow:auto; max-height:210px; }
+  pre b { color:var(--ink); font-weight:500; }
+  .k { color:var(--accent); }
+
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; font-weight:500; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; padding:0 10px 8px 0; }
+  td { padding:7px 10px 7px 0; border-top:1px solid var(--line); font-variant-numeric:tabular-nums; }
+  td.num { text-align:right; }
+
+  .row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 0; border-top:1px solid var(--line); font-size:13px; }
+  .row:first-of-type { border-top:0; }
+  .row .label { color:var(--muted); }
+
+  .acts { display:flex; gap:10px; margin-top:20px; flex-wrap:wrap; }
+  button { font:600 13px/1 var(--mono); border-radius:7px; padding:11px 16px; cursor:pointer; border:1px solid var(--line); background:var(--panel-2); color:var(--ink); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
+  .hint { color:var(--muted); font-size:12px; margin-top:10px; }
+
+  h2.side-h { font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); margin:0 0 10px; font-weight:500; }
+  .side section + section { margin-top:24px; }
+  @media (max-width:1000px){ .cols { grid-template-columns:1fr; } .side { border-left:0; border-top:1px solid var(--line); } }
+  @media (prefers-reduced-motion:reduce){ * { transition:none !important; } }
+</style>
+</head>
+<body>
+
+<div class="top">
+  <span class="name">MDL</span>
+  <span class="stat"><span class="b ok"></span>sesión ok · 12 min</span>
+  <span class="stat"><span class="b ok"></span>0 abiertas</span>
+  <span class="stat"><span class="b ok"></span>sin errores 24 h</span>
+  <span class="stat">70fe469</span>
+</div>
+
+<div class="cols">
+  <main class="main">
+    <h1>Envío manual</h1>
+    <p class="lede">Pegá el mensaje, revisá el resultado, creá el envío. La etiqueta queda sin pagar.</p>
+
+    <div class="cmd">
+      <span class="prompt">&gt;</span>
+      <input value="pegar mensaje" aria-label="Pegar mensaje de WhatsApp">
+      <kbd>Ctrl V</kbd>
+      <kbd>Enter</kbd>
+    </div>
+
+    <div class="pane">
+      <header>parse · ok · 8 campos</header>
+      <div class="body">
+        <pre><b>*MDL - Datos de envío*</b>
+<span class="k">Código postal</span>: 1424        → zipCode 1424
+<span class="k">Provincia</span>: CABA            → B (Buenos Aires) · CABA → C
+<span class="k">Ciudad</span>: Caballito          → address.city
+<span class="k">Calle</span>: Av. Rivadavia       → address.address
+<span class="k">Número</span>: 4820                → address.number
+<span class="k">Departamento</span>: 3 B           → address.complement
+<span class="k">Barrio</span>: Caballito           → izq. derivado de ciudad
+<span class="k">Nombre completo</span>: valentina gomez → Valentina / Gómez</pre>
+      </div>
+    </div>
+
+    <div class="pane">
+      <header>destino · validado</header>
+      <div class="body">
+        <table>
+          <tbody>
+            <tr><td>Provincia</td><td class="num">Ciudad Autónoma de Buenos Aires</td></tr>
+            <tr><td>Ciudad</td><td class="num">Caballito</td></tr>
+            <tr><td>Dirección</td><td class="num">Av. Rivadavia 4820, 3 B</td></tr>
+            <tr><td>CP</td><td class="num">1424</td></tr>
+            <tr><td>Paquete</td><td class="num">20 × 25 × 10 cm · 700 g</td></tr>
+            <tr><td>Modalidad</td><td class="num">Andreani a domicilio</td></tr>
+            <tr><td>Costo</td><td class="num">$ 9.815,40</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="acts">
+      <button class="primary">Crear envío</button>
+      <button>Probar en seco</button>
+    </div>
+    <p class="hint">Crear no cobra nada. Pagar la etiqueta es una acción aparte, en el panel de Envío Nube.</p>
+  </main>
+
+  <aside class="side">
+    <section>
+      <h2 class="side-h">Sesión</h2>
+      <div class="row"><span class="label">resultado</span><span>utilizable</span></div>
+      <div class="row"><span class="label">verificada</span><span>23:49 · 5,5 s</span></div>
+      <div class="row"><span class="label">archivo</span><span>31,2 KiB</span></div>
+      <div class="acts"><button>Verificar ahora</button></div>
+    </section>
+
+    <section>
+      <h2 class="side-h">Corridas</h2>
+      <table>
+        <tbody>
+          <tr><td>#EM1054</td><td>creada</td><td class="num">22:50</td></tr>
+          <tr><td>—</td><td>en seco</td><td class="num">22:38</td></tr>
+          <tr><td>#EM1053</td><td>creada</td><td class="num">21:14</td></tr>
+          <tr><td>—</td><td>en seco</td><td class="num">21:02</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2 class="side-h">Errores</h2>
+      <div class="row"><span class="label">último</span><span>ninguno</span></div>
+      <p class="hint">Los informes completos quedan en el volumen; se bajan por SSH.</p>
+    </section>
+  </aside>
+</div>
+</body>
+</html>

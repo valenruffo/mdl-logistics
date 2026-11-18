@@ -138,7 +138,7 @@ discovery, and override any convenience the agent might prefer.
 | R7 | Do not assume an API exists without verifying its documentation. |
 | R8 | Identify which data an AI must extract from WhatsApp messages, and which operations must be resolved with conventional code. |
 | R9 | Do not implement features until the flow is understood. |
-| R10 | Never create, modify, buy or confirm real shipments without the operator's explicit approval. |
+| R10 | Never buy or confirm a label. Creating a shipment is allowed without ceremony: the operator pastes, reviews and creates. The purchase remains forbidden and has no code path. |
 | R11 | Use fictional data during tests. |
 | R12 | Never invent missing recipient or address data. |
 | R13 | Prioritize official APIs when they are available. |
@@ -158,8 +158,7 @@ otherwise must be written as unverified.
 
 ## Irreversible operations policy
 
-R10 is a hard boundary, not a preference. Money leaves the account and a purchased label is
-not cleanly reversible, so this rule must be enforced by the system, never by remembering it.
+R10 was amended by the operator on their own authority: *"olvidate de eso de autorización de crear... la idea es que sea cómodo y fácil, si lo creo lo creo y punto, no pasa nada al crear el envío, no se compra ni nada"*. The two approval gates that guarded **creation** were removed from the flow. Creating a shipment does not charge anything, so it is not the irreversible step; **buying the label is**, and that stays forbidden with no code path. The hash-and-token ceremony survives only where it is cheap and useful: nowhere in the operator's happy path.
 
 ### Operations covered
 

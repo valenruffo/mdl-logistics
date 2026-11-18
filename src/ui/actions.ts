@@ -1,34 +1,37 @@
 /**
- * The server logic behind the one page (plan §6: paste, review, approve, run).
+ * The server logic behind the one page: analyze, then run.
  *
- * Everything irreversible is *reused*, never reimplemented:
+ * Creating a shipment in Envío Nube costs nothing, so it needs no ceremony
+ * (R10 as amended): the operator pastes, reviews, edits and clicks `Crear envío`.
+ * There is no approval hash to re-post and no typed token anywhere in this path.
+ * Buying the label does cost money, it stays forbidden, and nothing in this
+ * module can reach it: the executor's create journey stops on the detail page.
  *
- * - gate 1 is `assertApprovalHash` from `src/cli/gates.ts`. The approval hash is
- *   always recomputed here, from the values posted with the request. A client
- *   that keeps an old hash after an edit gets a refusal, and there is no state on
- *   the server that could remember "it was approved a moment ago";
- * - gate 2 is `assertConfirmationToken`, and it runs on its own, after gate 1,
- *   immediately before the attempt record is written;
+ * What this path *does* keep is everything that prevents a duplicate shipment,
+ * and all of it is reused from `src/cli/` instead of reimplemented:
+ *
  * - the prior-attempt check is `assertNoBlockingPriorAttempt` over
- *   `loadRunRecords`, so an unresolved record blocks the creation exactly as it
- *   does from the CLI;
+ *   `loadRunRecords`, so an unresolved record for the same message — and a record
+ *   that already created one — blocks the creation exactly as it does from the
+ *   CLI;
  * - the durable record is `writeAttemptRecord` / `writeOutcomeRecord`, written
- *   before and after the click.
+ *   before and after the click, so an interrupted run is visible instead of
+ *   silent;
+ * - the payload hash is still computed here from the values that were on screen
+ *   and handed to the executor, which recomputes it from the panel readback. That
+ *   is an integrity check between the page and the panel, not a human gate.
+ *
+ * The CLI keeps its own two gates (`assertApprovalHash`,
+ * `assertConfirmationToken`): `npm run ship` is a different surface and nothing
+ * here weakens it.
  *
  * The executor is injected so this module can be tested without a browser: the
  * page never imports Playwright itself.
- *
- * Nothing here creates anything on its own — `runAttempt` is the only function
- * that can, and only when both gates pass.
  */
 import {
   GateRefused,
-  assertApprovalHash,
-  assertConfirmationToken,
   assertNoBlockingPriorAttempt,
   computeApprovalHash,
-  confirmationTokenFor,
-  describeApprovalPayload,
   messageFingerprint,
   type ExistingRun,
 } from '../cli/gates';
@@ -85,6 +88,21 @@ function refusalOf(stage: RefusalStage, error: unknown): RunResponse {
 function reasonOf(error: unknown): string {
   if (error instanceof ExecutorError) return `${error.name}: ${error.message}`;
   return `unexpected error: ${messageOf(error)}`;
+}
+
+/**
+ * Open attempts for the same message, as a heads-up shown next to the run. The
+ * refusal itself is the gate's job; this is the sentence that explains why it
+ * would refuse, before the operator clicks.
+ */
+function openPriorAttemptNote(records: readonly ExistingRun[], messageHash: string): string | null {
+  const open = records.filter(
+    (record) => record.messageHash === messageHash && (record.outcome === null || record.outcome.status !== 'not-created'),
+  );
+  if (open.length === 0) return null;
+
+  const names = open.map((record) => `${record.runId} (${record.outcome?.status ?? 'attempted-unresolved'})`).join(', ');
+  return `${open.length} earlier run(s) for this exact message are still open: ${names}. The create path refuses until a human resolves them.`;
 }
 
 // ------------------------------------------------------------------- analyze
@@ -177,90 +195,24 @@ export function analyzeMessage(message: string): AnalyzeResponse {
   };
 }
 
-// ------------------------------------------------------------------- approve
-
-export interface ApproveInput {
-  message: string;
-  form: FormValues;
-}
-
-export type ApproveResponse =
-  | {
-      status: 'approved';
-      /** sha-256 of the payload described below, computed here and never posted in. */
-      approvalHash: string;
-      payload: { field: string; value: string }[];
-      /** The canonical values behind the hash, so the page can show exactly them. */
-      values: Record<string, string>;
-      /** An open prior attempt for the same message, as a heads-up. */
-      note: string | null;
-    }
-  | { status: 'invalid-form'; errors: FormIssue[] };
-
-/**
- * Gate 1, the data approval.
- *
- * The hash is computed from the values in *this* request. Approving does not
- * authorize anything: the token gate is a separate call, and an edit between the
- * two produces a different hash, which the run refuses.
- */
-export async function approveForm(input: ApproveInput, deps: ActionDeps): Promise<ApproveResponse> {
-  const built = requestFromForm(input.form);
-  if (!built.ok) return { status: 'invalid-form', errors: built.errors };
-
-  const request = built.value;
-  const approvalHash = computeApprovalHash(request);
-  const payload = describeApprovalPayload(approvalPayloadFromRequest(request, CARRIER_NAME));
-
-  return {
-    status: 'approved',
-    approvalHash,
-    payload,
-    values: built.values,
-    note: await openPriorAttemptsNote(input.message, deps),
-  };
-}
-
-/**
- * Open attempts for the same message, as a note. Reading is fail-closed
- * elsewhere; here a broken directory is reported instead of hidden, and the
- * creation path will refuse on its own.
- */
-async function openPriorAttemptsNote(message: string, deps: ActionDeps): Promise<string | null> {
-  let records: ExistingRun[];
-  try {
-    records = await loadRunRecords(deps.recordDir);
-  } catch (error) {
-    return `los registros de ejecución no se pudieron leer (${messageOf(error)}): la creación va a rechazarse hasta que se arregle ${deps.recordDir}`;
-  }
-  return openPriorAttemptNote(records, messageFingerprint(message));
-}
-
-function openPriorAttemptNote(records: readonly ExistingRun[], messageHash: string): string | null {
-  const open = records.filter(
-    (record) => record.messageHash === messageHash && (record.outcome === null || record.outcome.status !== 'not-created'),
-  );
-  if (open.length === 0) return null;
-
-  const names = open.map((record) => `${record.runId} (${record.outcome?.status ?? 'attempted-unresolved'})`).join(', ');
-  return `${open.length} earlier run(s) for this exact message are still open: ${names}. The create path refuses until a human resolves them.`;
-}
-
 // ----------------------------------------------------------------------- run
 
 export type RunMode = 'dry-run' | 'create';
 
+/**
+ * What the page posts to `/api/run`.
+ *
+ * Just the message, the values on screen and the mode. No hash to echo back, no
+ * token to type: those were the creation ceremony, and creation costs nothing.
+ */
 export interface RunInput {
   message: string;
   form: FormValues;
   mode: RunMode;
-  /** The hash the page received when the data was approved. Never trusted. */
-  approvedHash: string | null | undefined;
-  /** The typed confirmation token; ignored for a dry run. */
-  token?: string | null;
 }
 
-export type RefusalStage = 'approval' | 'prior-attempt' | 'confirmation';
+/** A refusal raised by a gate that prevents a duplicate shipment. */
+export type RefusalStage = 'prior-attempt';
 
 export interface RefusedResponse {
   status: 'refused';
@@ -273,8 +225,9 @@ export interface DryRunResponse {
   status: 'dry-run';
   /** The dry run's terminal state: the panel summary. Nothing was created. */
   summaryReached: true;
-  approvedHash: string;
-  currentHash: string;
+  /** The hash of the payload that was walked to the summary. */
+  payloadHash: string;
+  /** True when the panel's own readback hashes to the same payload. */
   formMatchesApproval: boolean;
   mismatches: string[];
   reportPath: string;
@@ -346,24 +299,22 @@ function recordNote(recordPath: string): string {
 /**
  * Runs one attempt.
  *
- * Order matters and mirrors the CLI: rebuild the payload, recompute its hash and
- * verify the approval, check prior attempts, then — only for a creation — the
- * typed token, then the durable record, then the panel.
+ * Order matters and mirrors the CLI minus its two human gates: rebuild the
+ * payload from the values on screen, fingerprint the message, read the records,
+ * refuse an unresolved or already-created attempt for that message, then write
+ * the pre-click record and touch the panel.
+ *
+ * `Probar en seco` stops at the panel summary and writes no record at all: it is
+ * the path with no side effects.
  */
 export async function runAttempt(input: RunInput, deps: ActionDeps): Promise<RunResponse> {
   const built = requestFromForm(input.form);
   if (!built.ok) return { status: 'invalid-form', errors: built.errors };
 
   const request: ShipmentRequest = built.value;
-  const currentHash = computeApprovalHash(request);
-
-  let approvedHash: string;
-  try {
-    approvedHash = assertApprovalHash(input.approvedHash ?? null, currentHash);
-  } catch (error) {
-    return refusalOf('approval', error);
-  }
-
+  // Integrity only: the executor recomputes this from the panel readback, so a
+  // page that shows one payload and a panel that receives another is caught.
+  const payloadHash = computeApprovalHash(request);
   const messageHash = messageFingerprint(input.message);
 
   let records: ExistingRun[];
@@ -382,28 +333,20 @@ export async function runAttempt(input: RunInput, deps: ActionDeps): Promise<Run
   }
   const note = openPriorAttemptNote(records, messageHash);
 
-  if (input.mode === 'dry-run') return await dryRun(request, approvedHash, currentHash, note, deps);
+  if (input.mode === 'dry-run') return await dryRun(request, payloadHash, note, deps);
 
-  let typedToken: string;
-  try {
-    typedToken = assertConfirmationToken(input.token ?? null, confirmationTokenFor(request));
-  } catch (error) {
-    return refusalOf('confirmation', error);
-  }
-
-  return await create(request, messageHash, approvedHash, typedToken, input.token ?? '', deps);
+  return await create(request, messageHash, payloadHash, deps);
 }
 
 async function dryRun(
   request: ShipmentRequest,
-  approvedHash: string,
-  currentHash: string,
+  payloadHash: string,
   note: string | null,
   deps: ActionDeps,
 ): Promise<RunResponse> {
   let result: DryRunResult;
   try {
-    result = await deps.executor.runDryRun({ request, approvedPayloadHash: approvedHash });
+    result = await deps.executor.runDryRun({ request, approvedPayloadHash: payloadHash });
   } catch (error) {
     return {
       status: 'failed',
@@ -417,21 +360,18 @@ async function dryRun(
   return {
     status: 'dry-run',
     summaryReached: true,
-    approvedHash,
-    currentHash,
+    payloadHash,
     formMatchesApproval: result.formMatchesApproval,
     mismatches: [...result.mismatches],
     reportPath: result.reportPath,
-    note: result.formMatchesApproval ? note : `el panel no tiene el payload aprobado. ${note ?? ''}`.trim(),
+    note: result.formMatchesApproval ? note : `el panel no tiene el payload que muestra la página. ${note ?? ''}`.trim(),
   };
 }
 
 async function create(
   request: ShipmentRequest,
   messageHash: string,
-  approvedHash: string,
-  expectedToken: string,
-  typedToken: string,
+  payloadHash: string,
   deps: ActionDeps,
 ): Promise<RunResponse> {
   const runId = `${stamp()}-${messageHash.slice(0, 12)}`;
@@ -444,9 +384,10 @@ async function create(
       recordedAt: new Date().toISOString(),
       messageFile: '(pasted in the UI)',
       messageHash,
-      approvalHash: approvedHash,
+      approvalHash: payloadHash,
       payload: approvalPayloadFromRequest(request, CARRIER_NAME),
-      confirmation: { expected: expectedToken, typed: typedToken.trim() },
+      // No confirmation: this surface has no typed token, by design (R10 as
+      // amended). The CLI still records the one it asks for.
       status: 'attempted-unresolved',
       note: 'written before the click; whether the button was clicked is only known to the process that died',
     });
@@ -462,7 +403,7 @@ async function create(
 
   let result: CreateRunResult;
   try {
-    result = await deps.executor.runCreate({ request, approvedPayloadHash: approvedHash });
+    result = await deps.executor.runCreate({ request, approvedPayloadHash: payloadHash });
   } catch (error) {
     if (error instanceof UnknownOutcomeError) {
       await writeOutcome(deps, {

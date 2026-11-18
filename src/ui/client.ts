@@ -4,25 +4,26 @@
  *
  * Deliberate boundaries:
  *
- * - The script never computes a hash. It receives `approvalHash` from
- *   `/api/approve`, shows it, and posts it back with the run. The server
- *   recomputes the hash from the posted values every time, so a stale hash after
- *   an edit is refused there, not here.
- * - Every value shown comes from a server response, and all of it is rendered
- *   with `textContent`/`createElement`: pasted data, record fields and file names
- *   are never interpreted as HTML.
- * - The two gates stay separate on screen: approving the data has its own
- *   section, the creation needs its own token in its own input.
- * - The console is read-only. The only request that changes anything is
- *   `/api/session-check`, sent by its own button, because it opens a browser.
+ * - **No native dialog.** `alert`, `confirm` and `prompt` are not used anywhere:
+ *   every message, warning, rejection, 409 and success is rendered in the page
+ *   itself, in `#analyze-status`, `#run-status`, `#result` or the rail. The
+ *   operator asked for that, and a test asserts it.
+ * - **No creation ceremony.** The script posts the message, the values on screen
+ *   and the mode. It never computes or echoes an approval hash and there is no
+ *   token input to fill: creating a shipment costs nothing (R10 as amended).
+ * - **No markup injection.** Every value shown comes from a server response and
+ *   is written with `textContent`/`createElement`: pasted data, panel text, file
+ *   names and record fields are never interpreted as HTML.
+ * - **The rail is read-only** except for its own `Verificar ahora` button, which
+ *   is the one control that opens a browser.
  */
 export const CLIENT_JS = `(function () {
   'use strict';
 
   var state = {
     message: '',
-    approvedHash: null,
-    applying: false,
+    analyzed: false,
+    provinces: [],
     busy: false,
     consoleBusy: false
   };
@@ -42,6 +43,12 @@ export const CLIENT_JS = `(function () {
 
   function setText(id, text) { byId(id).textContent = text; }
 
+  function setStatus(id, text, className) {
+    var node = byId(id);
+    node.className = 'inline-status' + (className ? ' ' + className : '');
+    node.textContent = text;
+  }
+
   function post(path, body) {
     return fetch(path, {
       method: 'POST',
@@ -52,12 +59,14 @@ export const CLIENT_JS = `(function () {
         return response.text().then(function (text) {
           // A 409 while another run holds the browser lock carries an actionable
           // sentence in "reason"; show that instead of the raw JSON.
-          var reason = text;
+          var detail = text;
           try {
             var parsed = JSON.parse(text);
-            if (parsed && typeof parsed.reason === 'string' && parsed.reason !== '') reason = parsed.reason;
+            if (parsed && typeof parsed.reason === 'string' && parsed.reason !== '') detail = parsed.reason;
           } catch (ignored) {}
-          throw new Error(path + ' respondio ' + response.status + ': ' + reason);
+          var error = new Error(detail);
+          error.status = response.status;
+          throw error;
         });
       }
       return response.json();
@@ -74,373 +83,22 @@ export const CLIENT_JS = `(function () {
   }
 
   function pathRow(label, value) {
-    return make('p', 'meta', label + ': ' + (value === '' || value === null ? '(no registrado)' : value));
+    return make('p', 'mono', label + ': ' + (value === '' || value === null || value === undefined ? '(no registrado)' : value));
   }
-
-  function setBusy(busy) {
-    state.busy = busy;
-    syncButtons();
-  }
-
-  function syncButtons() {
-    var token = byId('token').value.trim();
-    byId('create').disabled = state.busy || state.approvedHash === null || token === '';
-    byId('dry-run').disabled = state.busy || state.approvedHash === null;
-  }
-
-  function setApprovalState(text, className) {
-    var node = byId('approval-state');
-    node.className = 'status' + (className ? ' ' + className : '');
-    node.textContent = text;
-  }
-
-  // --------------------------------------------------------------- the form
-
-  function renderFields(fields, provinces) {
-    var form = byId('shipment-form');
-    clear(form);
-
-    fields.forEach(function (field) {
-      var derived = field.derived || [];
-      var row = make('div', 'row' + (derived.length > 0 ? ' derived' : ''));
-      var label = make('label', null, field.label + (field.unit ? ' (' + field.unit + ')' : ''));
-      label.setAttribute('for', 'field-' + field.key);
-      row.appendChild(label);
-
-      var control;
-      if (field.kind === 'province') {
-        control = document.createElement('select');
-        var blank = document.createElement('option');
-        blank.value = '';
-        blank.textContent = 'Selecciona una provincia';
-        control.appendChild(blank);
-        provinces.forEach(function (option) {
-          var node = document.createElement('option');
-          node.value = option.name;
-          node.textContent = option.name + ' (' + option.code + ')';
-          control.appendChild(node);
-        });
-        control.value = field.value;
-      } else {
-        control = document.createElement('input');
-        control.type = 'text';
-        if (field.kind === 'measure') control.setAttribute('inputmode', 'decimal');
-        control.value = field.value;
-        if (!field.required) control.placeholder = '(opcional)';
-      }
-
-      control.id = 'field-' + field.key;
-      control.setAttribute('data-key', field.key);
-      control.addEventListener('input', onFormEdited);
-      control.addEventListener('change', onFormEdited);
-      row.appendChild(control);
-
-      row.appendChild(make('p', 'meta', 'panel: ' + field.panelField + (field.help ? ' - ' + field.help : '')));
-      derived.forEach(function (derivation) {
-        row.appendChild(make('p', 'derived-note', 'derivado: ' + derivation.note));
-      });
-      form.appendChild(row);
-    });
-  }
-
-  function collect() {
-    var values = {};
-    var nodes = byId('shipment-form').querySelectorAll('[data-key]');
-    for (var index = 0; index < nodes.length; index += 1) {
-      values[nodes[index].getAttribute('data-key')] = nodes[index].value;
-    }
-    return values;
-  }
-
-  function applyValues(values) {
-    state.applying = true;
-    try {
-      var nodes = byId('shipment-form').querySelectorAll('[data-key]');
-      for (var index = 0; index < nodes.length; index += 1) {
-        var key = nodes[index].getAttribute('data-key');
-        if (Object.prototype.hasOwnProperty.call(values, key)) nodes[index].value = values[key];
-      }
-    } finally {
-      state.applying = false;
-    }
-  }
-
-  function onFormEdited() {
-    if (state.applying) return;
-    if (state.approvedHash !== null) {
-      state.approvedHash = null;
-      clear(byId('approval'));
-      setApprovalState('Los datos cambiaron: la aprobacion anterior ya no vale. Aproba otra vez.', 'warn');
-    }
-    syncButtons();
-  }
-
-  // ------------------------------------------------------------- the actions
-
-  function hideAfterPreview() {
-    show('step-approve', false);
-    show('step-authorize', false);
-    show('step-result', false);
-  }
-
-  function analyze() {
-    var message = byId('message').value;
-    if (message.trim() === '') {
-      setText('analyze-status', 'Pega el mensaje primero.');
-      return;
-    }
-
-    state.message = message;
-    state.approvedHash = null;
-    clear(byId('approval'));
-    setApprovalState('', null);
-    hideAfterPreview();
-    setText('analyze-status', 'Analizando...');
-
-    post('/api/analyze', { message: message }).then(function (data) {
-      if (data.status === 'rejected') {
-        renderRejection(data);
-        setText('analyze-status', 'El mensaje fue rechazado: nada mas en la pagina esta disponible.');
-        return;
-      }
-      renderParsed(data);
-      setText('analyze-status', 'Mensaje aceptado. Revisa los datos antes de aprobarlos.');
-    }).catch(function (error) {
-      setText('analyze-status', 'Error: ' + (error && error.message ? error.message : String(error)));
-    });
-  }
-
-  function renderRejection(data) {
-    var box = byId('rejection');
-    clear(box);
-    box.appendChild(make('p', 'bad', 'RECHAZADO. El mensaje no se puede usar: el panel no se abrio y no se creo nada.'));
-
-    if (data.missing.length > 0) {
-      box.appendChild(make('p', 'bad', 'Faltan datos obligatorios:'));
-      box.appendChild(issueList(data.missing.map(function (item) {
-        return item.label + ' - ' + item.reason;
-      })));
-    }
-
-    if (data.invalid.length > 0) {
-      box.appendChild(make('p', 'bad', 'Datos invalidos:'));
-      box.appendChild(issueList(data.invalid.map(function (item) {
-        return item.label + ' (' + (item.value === '' ? 'vacio' : item.value) + ') - ' + item.reason;
-      })));
-    }
-
-    if (data.unknownLabels.length > 0) {
-      box.appendChild(make('p', 'bad', 'Etiquetas que el formato no define:'));
-      box.appendChild(issueList(data.unknownLabels.map(function (label) {
-        return label + ' - el formato solo acepta las etiquetas conocidas; revisa como esta escrito el mensaje';
-      })));
-    }
-
-    show('step-preview', true);
-    show('rejection', true);
-    show('preview', false);
-    hideAfterPreview();
-  }
-
-  function renderParsed(data) {
-    var warnings = byId('warnings');
-    clear(warnings);
-    if (data.warnings.length > 0) {
-      warnings.appendChild(make('p', 'warn', 'Avisos del parser (no bloquean, confirmalos al aprobar):'));
-      warnings.appendChild(issueList(data.warnings.map(function (warning) { return warning.message; })));
-    }
-    warnings.appendChild(make('p', 'meta', 'Transporte: ' + data.carrier));
-
-    renderFields(data.fields, data.provinces);
-
-    show('step-preview', true);
-    show('rejection', false);
-    show('preview', true);
-    show('step-approve', true);
-    show('step-authorize', true);
-    show('step-result', false);
-    setApprovalState('Los datos todavia no estan aprobados.', null);
-    syncButtons();
-  }
-
-  function approve() {
-    if (state.message === '') {
-      setApprovalState('Analiza un mensaje primero.', 'warn');
-      return;
-    }
-
-    setBusy(true);
-    setApprovalState('Aprobando...', null);
-
-    post('/api/approve', { message: state.message, form: collect() }).then(function (data) {
-      if (data.status === 'invalid-form') {
-        var box = byId('approval');
-        clear(box);
-        box.appendChild(make('p', 'bad', 'Revisa estos campos antes de aprobar:'));
-        box.appendChild(issueList(data.errors.map(function (item) { return item.message; })));
-        setApprovalState('Los datos no se aprobaron.', 'bad');
-        return;
-      }
-
-      state.approvedHash = data.approvalHash;
-      applyValues(data.values);
-      renderApproval(data);
-      setApprovalState('Datos aprobados. Autorizar la creacion es un paso aparte.', 'ok');
-    }).then(function () {
-      setBusy(false);
-    }, function (error) {
-      setApprovalState('Error: ' + (error && error.message ? error.message : String(error)), 'bad');
-      setBusy(false);
-    });
-  }
-
-  function renderApproval(data) {
-    var box = byId('approval');
-    clear(box);
-    box.appendChild(make('p', 'ok', 'Payload aprobado, tal como se escribira en el panel:'));
-
-    var table = document.createElement('table');
-    var head = document.createElement('thead');
-    var headRow = document.createElement('tr');
-    headRow.appendChild(make('th', null, 'Campo del panel'));
-    headRow.appendChild(make('th', null, 'Valor'));
-    head.appendChild(headRow);
-    table.appendChild(head);
-
-    var body = document.createElement('tbody');
-    data.payload.forEach(function (row) {
-      var tr = document.createElement('tr');
-      tr.appendChild(make('td', null, row.field));
-      tr.appendChild(make('td', null, row.value === '' ? '(vacio)' : row.value));
-      body.appendChild(tr);
-    });
-    table.appendChild(body);
-    box.appendChild(table);
-
-    box.appendChild(make('p', 'meta', 'Hash de aprobacion (sha-256, calculado en el servidor):'));
-    box.appendChild(make('p', 'hash', data.approvalHash));
-    box.appendChild(make('p', 'hint', 'Si editas cualquier campo, el servidor recalcula el hash y este deja de valer.'));
-    if (data.note) box.appendChild(make('p', 'note', data.note));
-  }
-
-  function run(mode) {
-    if (state.approvedHash === null) {
-      setApprovalState('Aprueba los datos antes de continuar.', 'warn');
-      return;
-    }
-
-    var body = {
-      message: state.message,
-      form: collect(),
-      mode: mode,
-      approvedHash: state.approvedHash,
-      token: mode === 'create' ? byId('token').value : null
-    };
-
-    setBusy(true);
-    setApprovalState(
-      mode === 'create' ? 'Creando el envio...' : 'Recorriendo el panel hasta el resumen...',
-      null
-    );
-
-    post('/api/run', body).then(function (data) {
-      renderResult(data);
-      setApprovalState(data.status === 'created' ? 'Envio creado.' : 'Terminado: revisa el resultado.', null);
-      loadConsole(null);
-    }).then(function () {
-      setBusy(false);
-    }, function (error) {
-      setApprovalState('Error: ' + (error && error.message ? error.message : String(error)), 'bad');
-      setBusy(false);
-    });
-  }
-
-  function renderResult(data) {
-    var box = byId('result');
-    clear(box);
-    show('step-result', true);
-
-    if (data.status === 'invalid-form') {
-      box.appendChild(make('p', 'bad', 'No se ejecuto nada: revisa los campos.'));
-      box.appendChild(issueList(data.errors.map(function (item) { return item.message; })));
-      return;
-    }
-
-    if (data.status === 'refused') {
-      box.appendChild(make('p', 'bad', 'RECHAZADO en el paso "' + data.stage + '": ' + data.reason));
-      if (data.details.length > 0) box.appendChild(issueList(data.details));
-      box.appendChild(make('p', 'hint', 'No se creo nada.'));
-      return;
-    }
-
-    if (data.status === 'dry-run') {
-      box.appendChild(make('p', data.formMatchesApproval ? 'ok' : 'bad',
-        data.formMatchesApproval
-          ? 'Resumen alcanzado. No se creo nada y no se toco la etiqueta.'
-          : 'El panel no tiene el payload aprobado. No se creo nada.'));
-      if (data.mismatches.length > 0) box.appendChild(issueList(data.mismatches));
-      box.appendChild(pathRow('informe del recorrido', data.reportPath));
-      box.appendChild(pathRow('hash aprobado', data.approvedHash));
-      box.appendChild(pathRow('hash leido del formulario', data.currentHash));
-      if (data.note) box.appendChild(make('p', 'note', data.note));
-      return;
-    }
-
-    if (data.status === 'created') {
-      box.appendChild(make('p', 'ok', 'Envio creado ' + data.shipmentId + '.'));
-      box.appendChild(make('p', null, 'Estado en el panel: ' + (data.statusBadges.join(', ') || '(no leido)')));
-      box.appendChild(make('p', null, 'Costo (resumen): ' + (data.cost.summary || '(no leido)')));
-      box.appendChild(make('p', null, 'Costo (detalle): ' + (data.cost.detail || '(no leido)')));
-      if (data.labelUnpaid.proven) {
-        box.appendChild(make('p', 'ok',
-          'Prueba de etiqueta impaga: el identificador, el estado del panel y el control de etiqueta siguen presentes; no se acciono nada sobre la etiqueta.'));
-      } else {
-        box.appendChild(make('p', 'bad', 'INCOMPLETO: no se puede probar que la etiqueta siga impaga.'));
-        if (data.labelUnpaid.problem) box.appendChild(make('p', 'bad', data.labelUnpaid.problem));
-        if (data.labelUnpaid.details.length > 0) box.appendChild(issueList(data.labelUnpaid.details));
-      }
-      box.appendChild(pathRow('informe del ejecutor', data.reportPath));
-      if (data.detailScreenshot) box.appendChild(pathRow('captura del detalle', data.detailScreenshot));
-      box.appendChild(pathRow('registro previo al click', data.recordPath));
-      box.appendChild(pathRow('desenlace', data.outcomePath));
-      return;
-    }
-
-    if (data.status === 'unknown') {
-      box.appendChild(make('p', 'warn', 'Resultado DESCONOCIDO: ' + data.reason));
-      box.appendChild(make('p', null, 'Conciliacion: ' + data.interpretation));
-      if (data.matches.length > 0) box.appendChild(issueList(data.matches));
-      if (data.details.length > 0) box.appendChild(issueList(data.details));
-      box.appendChild(pathRow('registro a inspeccionar', data.recordPath));
-      box.appendChild(pathRow('desenlace', data.outcomePath));
-      box.appendChild(make('p', 'note', data.note));
-      return;
-    }
-
-    box.appendChild(make('p', 'bad', 'La ejecucion se detuvo: ' + data.reason));
-    if (data.details.length > 0) box.appendChild(issueList(data.details));
-    if (data.recordPath) box.appendChild(pathRow('registro a inspeccionar', data.recordPath));
-    box.appendChild(make('p', 'note', data.note));
-  }
-
-  // --------------------------------------------------------------- the console
 
   function textOr(value, fallback) {
     if (value === null || value === undefined || value === '') return fallback || '(no registrado)';
     return String(value);
   }
 
-  function formatSeconds(total) {
-    var seconds = Math.floor(total % 60);
-    var minutes = Math.floor(total / 60) % 60;
-    var hours = Math.floor(total / 3600) % 24;
-    var days = Math.floor(total / 86400);
-    var parts = [];
-    if (days > 0) parts.push(days + 'd');
-    if (hours > 0) parts.push(hours + 'h');
-    if (minutes > 0) parts.push(minutes + 'm');
-    parts.push(seconds + 's');
-    return parts.join(' ');
+  function pad2(value) { return value < 10 ? '0' + value : String(value); }
+
+  /** A wall-clock label for an ISO timestamp; the raw value when it is not one. */
+  function timeOf(iso) {
+    if (iso === null || iso === undefined || iso === '') return '(sin fecha)';
+    var parsed = new Date(String(iso));
+    if (isNaN(parsed.getTime())) return String(iso);
+    return pad2(parsed.getHours()) + ':' + pad2(parsed.getMinutes());
   }
 
   function formatBytes(bytes) {
@@ -456,369 +114,519 @@ export const CLIENT_JS = `(function () {
     return (Math.round(value * 10) / 10) + ' ' + units[index];
   }
 
-  function cellText(text, className) {
-    return make('td', className || null, text);
-  }
+  // ------------------------------------------------------------ the message
 
   /**
-   * Labels for the closed vocabulary of failed checks. Fixed sentences that name
-   * the structural check; never text read out of a report.
+   * How many "label: value" pairs the operator just pasted. It is a counter, not
+   * a parser: the server decides whether the message is usable, this only fills
+   * the badge next to the heading.
    */
-  var CHECK_LABELS = {
-    'shipment-id': 'el encabezado del detalle no trae un identificador #EM<numero>',
-    'status-badge': 'ningun estado del panel dice "Por enviar"',
-    'label-button': 'no hay un boton visible para la etiqueta',
-    'form-mismatch': 'el panel no coincide con el payload aprobado',
-    'form-not-approved': 'el hash aprobado no coincide con el formulario leido',
-    'outcome-unknown': 'el desenlace quedo desconocido',
-    'status-failed': 'el informe quedo en estado failed',
-    'status-error': 'el informe quedo en estado error',
-    'reconciliation-unread': 'el informe trae una conciliacion'
-  };
-
-  function factsTable(rows) {
-    var table = document.createElement('table');
-    var body = document.createElement('tbody');
-    rows.forEach(function (row) {
-      var tr = document.createElement('tr');
-      tr.appendChild(make('th', null, row[0]));
-      var td = document.createElement('td');
-      if (row[1] instanceof Node || typeof row[1] === 'object') td.appendChild(row[1]);
-      else td.textContent = String(row[1]);
-      tr.appendChild(td);
-      body.appendChild(tr);
+  function countPastedFields(text) {
+    var count = 0;
+    text.split(String.fromCharCode(10)).forEach(function (line) {
+      var trimmed = line.split('*').join('').trim();
+      if (trimmed === '') return;
+      var colon = trimmed.indexOf(':');
+      if (colon <= 0) return;
+      if (trimmed.slice(colon + 1).trim() === '') return;
+      count += 1;
     });
-    table.appendChild(body);
-    return table;
+    return count;
   }
 
-  function renderWarnings(containerId, warnings) {
-    var box = byId(containerId);
-    clear(box);
-    if (!warnings || warnings.length === 0) return;
-    box.appendChild(make('p', 'warn', 'Avisos de lectura (la pagina sigue funcionando):'));
-    var list = make('ul', 'issues');
-    warnings.forEach(function (warning) {
-      list.appendChild(make('li', 'warn', warning.source + ' - ' + warning.message));
-    });
-    box.appendChild(list);
+  function updateMessageBadge() {
+    var count = countPastedFields(byId('message').value);
+    setText('message-badge', count === 0 ? 'sin datos' : count === 1 ? '1 campo' : count + ' campos');
   }
 
-  function appendWarningItems(containerId, problems) {
-    if (!problems || problems.length === 0) return;
-    var box = byId(containerId);
-    var list = box.querySelector('ul.issues');
-    if (list === null) {
-      box.appendChild(make('p', 'warn', 'Avisos de lectura (la pagina sigue funcionando):'));
-      list = make('ul', 'issues');
-      box.appendChild(list);
-    }
-    problems.forEach(function (problem) {
-      list.appendChild(make('li', 'warn', problem));
-    });
+  // --------------------------------------------------------------- the form
+
+  function fieldLabel(field) {
+    var suffix = [];
+    if (field.unit) suffix.push(field.unit);
+    if (!field.required) suffix.push('opcional');
+    return suffix.length === 0 ? field.label : field.label + ' (' + suffix.join(', ') + ')';
   }
 
-  function renderHealth(data) {
-    var level = data.health.level;
-    byId('health').className = 'health ' + level;
-    var line = byId('health-line');
-    line.className = level;
-    line.textContent = data.health.line;
-
-    var facts = byId('health-facts');
-    clear(facts);
-    data.health.facts.forEach(function (fact) {
-      facts.appendChild(make('li', fact.level, fact.label + ': ' + fact.detail));
-    });
-  }
-
-  function renderRuntime(data) {
-    renderWarnings('runtime-warnings', data.runtime.warnings);
-    var box = byId('runtime-body');
-    clear(box);
-
-    var runtime = data.runtime;
-    box.appendChild(factsTable([
-      ['uptime', formatSeconds(runtime.uptimeSeconds) + ' (arrancó ' + runtime.startedAt + ')'],
-      ['node', runtime.nodeVersion],
-      ['pid', String(runtime.pid)],
-      ['plataforma', runtime.platform],
-      ['directorio de trabajo', runtime.cwd],
-      ['origen del panel',
-        runtime.storeHost === null
-          ? '(no configurado: ' + runtime.storeVariable + ')'
-          : runtime.storeHost + ' - solo el host, sin credenciales (' + runtime.storeVariable + ')'],
-      ['fuente de la sesión', runtime.sessionSource],
-      ['ruta de la sesión', runtime.sessionPath === null ? '(sin resolver)' : runtime.sessionPath],
-      ['headless', runtime.headless === null ? '(no se pudo leer el interruptor)' : String(runtime.headless)],
-      ['directorio de artefactos', runtime.artifactsDirAbsolute],
-      ['registros de ejecución', runtime.recordDirAbsolute]
-    ]));
-
-    if (runtime.storeProblem !== null) {
-      box.appendChild(make('p', 'bad', 'origen del panel: ' + runtime.storeProblem));
-    }
-    if (runtime.headlessProblem !== null) {
-      box.appendChild(make('p', 'bad', 'headless: ' + runtime.headlessProblem));
-    }
-  }
-
-  /**
-   * The session-check history: four closed facts per row and nothing else.
-   *
-   * The check's own output is deliberately absent from this table. It is the
-   * script's stdout, it can name the recipient, and it stays in the history file
-   * on disk, which the operator reads over SSH.
-   */
-  function checkTable(checks) {
-    var table = document.createElement('table');
-    var head = document.createElement('thead');
-    var headRow = document.createElement('tr');
-    ['cuándo', 'resultado', 'código de salida', 'duración'].forEach(function (title) {
-      headRow.appendChild(make('th', null, title));
-    });
-    head.appendChild(headRow);
-    table.appendChild(head);
-
-    var body = document.createElement('tbody');
-    checks.forEach(function (check) {
-      var tr = document.createElement('tr');
-      tr.appendChild(cellText(check.runAt));
-      tr.appendChild(cellText(check.result, check.result === 'usable' ? 'ok' : 'bad'));
-      tr.appendChild(cellText(check.exitCode === null ? 'sin código' : String(check.exitCode)));
-      tr.appendChild(cellText(check.durationMs + ' ms'));
-      body.appendChild(tr);
-    });
-    table.appendChild(body);
-    return table;
-  }
-
-  function renderSession(data) {
-    renderWarnings('session-warnings', data.session.warnings);
-    var box = byId('session-body');
-    clear(box);
-
-    var file = data.session.file;
-    box.appendChild(make('h3', null, 'El archivo de la sesión'));
-    box.appendChild(factsTable([
-      ['modo',
-        file.mode === 'storage-state'
-          ? 'storageState transferido'
-          : file.mode === 'persistent-profile'
-            ? 'perfil persistente de Chromium'
-            : '(no se pudo resolver)'],
-      ['ruta', file.path === null ? '(sin resolver)' : file.path],
-      ['existe', file.exists ? 'sí' : 'no'],
-      ['es un archivo', file.isFile ? 'sí' : 'no'],
-      ['tamaño', file.exists ? formatBytes(file.sizeBytes) : '(no aplica)'],
-      ['última modificación', file.exists ? textOr(file.modifiedAt) : '(no aplica)']
-    ]));
-
-    if (file.problems.length > 0) {
-      box.appendChild(make('p', 'warn', 'Problemas con el archivo de la sesión:'));
-      box.appendChild(issueList(file.problems));
-    }
-    box.appendChild(make('p', 'hint', 'El contenido de este archivo es la sesión del panel: la página solo mira tamaño y fecha, nunca lo abre.'));
-
-    box.appendChild(make('p', 'meta', 'historial de chequeos: ' + data.session.history.path));
-
-    if (data.session.history.unparseable) {
-      box.appendChild(make('p', 'bad',
-        'historial ilegible (unparseable): no se pudo reducir a ningún chequeo. Se informa solo la ruta; su contenido no se copia acá porque es la salida que imprimió el chequeo.'));
-    }
-
-    box.appendChild(make('h3', null, 'Últimos chequeos (' + data.session.checks.length + ' de ' + data.session.limit + ')'));
-    if (data.session.checks.length === 0) {
-      box.appendChild(make('p', 'warn', data.session.history.unparseable
-        ? 'El historial existe pero no se puede leer: no hay ningún chequeo que mostrar, y la salud no puede afirmar que la sesión esté usable.'
-        : 'Todavía no hay ningún chequeo registrado: la salud no puede afirmar que la sesión esté usable hasta que corras uno.'));
-      return;
-    }
-
-    box.appendChild(checkTable(data.session.checks));
-    box.appendChild(make('p', 'hint',
-      'De cada chequeo se muestran solo el resultado, el código de salida, la fecha y la duración. La salida completa queda en el historial, en disco, y se retira por SSH; esta página no la copia ni la muestra.'));
-  }
-
-  function renderRuns(data) {
-    renderWarnings('runs-warnings', data.runs.warnings);
-    var box = byId('runs-body');
-    clear(box);
-
-    box.appendChild(make('p', 'meta', data.runs.rows.length + ' registro(s) visible(s) de ' + data.runs.total + '.'));
-    if (data.runs.rows.length === 0) {
-      box.appendChild(make('p', 'warn', 'No hay ningún run registrado todavía.'));
-      return;
-    }
-
-    var table = document.createElement('table');
-    var head = document.createElement('thead');
-    var headRow = document.createElement('tr');
-    ['run', 'cuándo', 'hash del mensaje', 'hash de aprobación', 'estado', 'desenlace', 'envío', 'artefactos'].forEach(function (title) {
-      headRow.appendChild(make('th', null, title));
-    });
-    head.appendChild(headRow);
-    table.appendChild(head);
-
-    var body = document.createElement('tbody');
-    data.runs.rows.forEach(function (row) {
-      var tr = document.createElement('tr');
-      tr.appendChild(cellText(row.runId, row.unresolved ? 'bad' : null));
-      tr.appendChild(cellText(textOr(row.recordedAt)));
-      tr.appendChild(cellText(textOr(row.messageHashShort)));
-      tr.appendChild(cellText(textOr(row.approvalHashShort)));
-      tr.appendChild(cellText(textOr(row.status)));
-      tr.appendChild(cellText(row.outcome === null ? 'sin desenlace' : row.outcome, row.unresolved ? 'bad' : null));
-      tr.appendChild(cellText(textOr(row.shipmentId, '(sin envío)')));
-
-      var artifactCell = document.createElement('td');
-      artifactCell.textContent = row.artifactDir === null ? '(no registrado)' : 'artifacts/' + row.artifactDir;
-      tr.appendChild(artifactCell);
-
-      body.appendChild(tr);
-    });
-    table.appendChild(body);
-    box.appendChild(table);
-
-    var withProblems = data.runs.rows.filter(function (row) { return row.problems.length > 0; });
-    if (withProblems.length > 0) {
-      box.appendChild(make('h3', 'warn', 'Registros con problemas de lectura'));
-      withProblems.forEach(function (row) {
-        box.appendChild(make('p', 'mono', row.runId));
-        box.appendChild(issueList(row.problems));
+  function controlFor(field) {
+    var control;
+    if (field.kind === 'province') {
+      control = document.createElement('select');
+      var blank = document.createElement('option');
+      blank.value = '';
+      blank.textContent = 'Seleccioná una provincia';
+      control.appendChild(blank);
+      state.provinces.forEach(function (option) {
+        var node = document.createElement('option');
+        node.value = option.name;
+        node.textContent = option.name + ' (' + option.code + ')';
+        control.appendChild(node);
       });
+      control.value = field.value;
+    } else {
+      control = document.createElement('input');
+      control.type = 'text';
+      control.autocomplete = 'off';
+      if (field.kind === 'measure') control.setAttribute('inputmode', 'decimal');
+      control.value = field.value;
     }
-
-    var unresolved = data.runs.rows.filter(function (row) { return row.unresolved; });
-    if (unresolved.length > 0) {
-      box.appendChild(make('h3', 'bad',
-        'Runs sin resolver (' + unresolved.length + '): la creación de ese mismo mensaje queda bloqueada hasta que una persona los resuelva a mano'));
-      unresolved.forEach(function (row) {
-        box.appendChild(make('p', 'mono',
-          row.runId + ' - ' + (row.outcome === 'unknown' ? 'desenlace desconocido' : 'sin desenlace escrito')));
-        box.appendChild(make('p', 'mono', textOr(row.resolution, '(el gate no produjo una instrucción)'), 'bad'));
-      });
-    }
+    control.id = 'field-' + field.key;
+    control.setAttribute('data-key', field.key);
+    return control;
   }
 
-  function renderArtifacts(data) {
-    renderWarnings('artifacts-warnings', data.artifacts.warnings);
-    var box = byId('artifacts-body');
-    clear(box);
+  function renderFields(fields) {
+    var grid = byId('shipment-form');
+    clear(grid);
 
-    if (data.artifacts.runs.length === 0) {
-      box.appendChild(make('p', 'warn', 'No hay runs, así que no hay artefactos que listar.'));
-      return;
-    }
-
-    data.artifacts.runs.forEach(function (run) {
-      box.appendChild(make('h3', null, run.runId));
-      box.appendChild(make('p', 'meta',
-        run.dir === null
-          ? 'sin directorio de artefactos registrado'
-          : 'artifacts/' + run.dir + ' - ' + formatBytes(run.totalBytes) + ' en total'));
-
-      if (run.problems.length > 0) box.appendChild(issueList(run.problems));
-      if (run.files.length === 0) {
-        box.appendChild(make('p', 'warn', 'No hay archivos que listar en este directorio.'));
-        return;
+    var currentGroup = null;
+    fields.forEach(function (field) {
+      if (field.group !== currentGroup) {
+        currentGroup = field.group;
+        grid.appendChild(make('div', 'group', field.groupLabel));
       }
 
-      box.appendChild(make('p', 'note',
-        'Capturas y traces de este run: pueden contener datos personales del destinatario y la sesión del panel. Se retiran del volumen por SSH; esta página no los sirve ni los muestra.'));
+      var wrap = make('div', field.wide ? 'wide' : null);
+      var label = document.createElement('label');
+      label.className = 'field-wrap';
+      label.setAttribute('for', 'field-' + field.key);
+      label.appendChild(make('span', 'field-label', fieldLabel(field)));
 
-      var table = document.createElement('table');
-      var head = document.createElement('thead');
-      var headRow = document.createElement('tr');
-      headRow.appendChild(make('th', null, 'archivo'));
-      headRow.appendChild(make('th', null, 'tamaño'));
-      head.appendChild(headRow);
-      table.appendChild(head);
+      var control = controlFor(field);
+      label.appendChild(control);
 
-      var body = document.createElement('tbody');
-      run.files.forEach(function (file) {
-        var tr = document.createElement('tr');
-        tr.appendChild(cellText(file.name));
-        tr.appendChild(cellText(formatBytes(file.sizeBytes)));
-        body.appendChild(tr);
+      // The panel field and the unit hint are useful but noisy: they stay
+      // available to a screen reader and out of the artboard's visual rhythm.
+      if (field.help) {
+        var help = make('span', 'sr-only', field.help + ' (campo del panel: ' + field.panelField + ')');
+        help.id = 'help-' + field.key;
+        label.appendChild(help);
+        control.setAttribute('aria-describedby', help.id);
+      } else {
+        control.setAttribute('title', 'campo del panel: ' + field.panelField);
+      }
+
+      wrap.appendChild(label);
+
+      (field.derived || []).forEach(function (derivation) {
+        wrap.appendChild(make('p', 'field-note', 'derivado: ' + derivation.note));
       });
-      table.appendChild(body);
-      box.appendChild(table);
+
+      grid.appendChild(wrap);
     });
   }
 
-  function renderErrors(data) {
-    renderWarnings('errors-warnings', data.errors.warnings);
-    var box = byId('errors-body');
+  function collect() {
+    var values = {};
+    var nodes = byId('shipment-form').querySelectorAll('[data-key]');
+    for (var index = 0; index < nodes.length; index += 1) {
+      values[nodes[index].getAttribute('data-key')] = nodes[index].value;
+    }
+    return values;
+  }
+
+  function syncButtons() {
+    var ready = state.analyzed && !state.busy;
+    byId('create').disabled = !ready;
+    byId('dry-run').disabled = !ready;
+    byId('analyze').disabled = state.busy;
+  }
+
+  // ------------------------------------------------------------- the actions
+
+  function analyze() {
+    var message = byId('message').value;
+    if (message.trim() === '') {
+      setStatus('analyze-status', 'Pegá el mensaje primero.', 'bad');
+      return;
+    }
+
+    state.message = message;
+    state.analyzed = false;
+    syncButtons();
+    setStatus('analyze-status', 'Analizando el mensaje…', null);
+    clear(byId('result'));
+    clear(byId('warnings'));
+    clear(byId('rejection'));
+    setText('data-badge', 'analizando');
+
+    post('/api/analyze', { message: message }).then(function (data) {
+      if (data.status === 'rejected') {
+        renderRejection(data);
+        setStatus('analyze-status', 'El mensaje fue rechazado: revisá los motivos y corregí el texto.', 'bad');
+        return;
+      }
+      renderParsed(data);
+      setStatus('analyze-status', 'Mensaje leído: revisá los datos antes de crear el envío.', 'ok');
+    }).catch(function (error) {
+      state.analyzed = false;
+      syncButtons();
+      setText('data-badge', 'sin analizar');
+      setStatus('analyze-status', describeError(error), 'bad');
+    });
+  }
+
+  function describeError(error) {
+    var reason = error && error.message ? error.message : String(error);
+    if (error && error.status) return 'No se pudo completar (' + error.status + '): ' + reason;
+    return 'No se pudo completar: ' + reason;
+  }
+
+  function renderRejection(data) {
+    state.analyzed = false;
+    state.provinces = [];
+    syncButtons();
+    clear(byId('shipment-form'));
+    show('data-empty', true);
+    setText('data-badge', 'rechazado');
+
+    var box = byId('rejection');
     clear(box);
+    box.appendChild(make('p', 'bad', 'RECHAZADO. El mensaje no se puede usar: el panel no se abrió y no se creó nada.'));
+
+    if (data.missing.length > 0) {
+      box.appendChild(make('p', 'bad', 'Faltan datos obligatorios:'));
+      box.appendChild(issueList(data.missing.map(function (item) {
+        return item.label + ' - ' + item.reason;
+      })));
+    }
+
+    if (data.invalid.length > 0) {
+      box.appendChild(make('p', 'bad', 'Datos inválidos:'));
+      box.appendChild(issueList(data.invalid.map(function (item) {
+        return item.label + ' (' + (item.value === '' ? 'vacío' : item.value) + ') - ' + item.reason;
+      })));
+    }
+
+    if (data.unknownLabels.length > 0) {
+      box.appendChild(make('p', 'bad', 'Etiquetas que el formato no define:'));
+      box.appendChild(issueList(data.unknownLabels.map(function (label) {
+        return label + ' - el formato solo acepta las etiquetas conocidas; revisá cómo está escrito el mensaje';
+      })));
+    }
+  }
+
+  function renderParsed(data) {
+    state.analyzed = true;
+    state.provinces = data.provinces;
+
+    var warnings = byId('warnings');
+    clear(warnings);
+    if (data.warnings.length > 0) {
+      warnings.appendChild(make('p', 'warn', 'Avisos del parser (no bloquean, confirmalos al revisar):'));
+      warnings.appendChild(issueList(data.warnings.map(function (warning) { return warning.message; })));
+    }
+
+    clear(byId('rejection'));
+    renderFields(data.fields);
+    show('data-empty', false);
+    setText('data-badge', 'editable');
+    setText('quote-text', data.carrier + ' · el costo y el plazo se leen del panel en el resumen');
+    clear(byId('result'));
+    setStatus('run-status', '', null);
+    syncButtons();
+  }
+
+  function run(mode) {
+    if (!state.analyzed) {
+      setStatus('run-status', 'Analizá el mensaje antes de continuar.', 'warn');
+      return;
+    }
+
+    state.busy = true;
+    syncButtons();
+    clear(byId('result'));
+    setStatus(
+      'run-status',
+      mode === 'create' ? 'Creando el envío: recorre el panel y hace un solo click en Crear envío…' : 'Recorriendo el panel hasta el resumen, sin crear nada…',
+      null
+    );
+
+    post('/api/run', { message: state.message, form: collect(), mode: mode }).then(function (data) {
+      renderResult(data);
+      loadConsole(null);
+    }).catch(function (error) {
+      var box = byId('result');
+      clear(box);
+      box.appendChild(make('p', 'bad', describeError(error)));
+      if (error && error.status === 409) {
+        box.appendChild(make('p', 'note', 'No se cambió nada: cuando la corrida en curso termine, volvé a intentar.'));
+      }
+      setStatus('run-status', 'La corrida no se completó.', 'bad');
+      loadConsole(null);
+    }).then(function () {
+      state.busy = false;
+      syncButtons();
+    });
+  }
+
+  function renderResult(data) {
+    var box = byId('result');
+    clear(box);
+
+    if (data.status === 'invalid-form') {
+      box.appendChild(make('p', 'bad', 'No se ejecutó nada: revisá estos campos.'));
+      box.appendChild(issueList(data.errors.map(function (item) { return item.message; })));
+      setStatus('run-status', 'El envío no se creó.', 'bad');
+      return;
+    }
+
+    if (data.status === 'refused') {
+      box.appendChild(make('p', 'bad', 'RECHAZADO antes de tocar el panel: ' + data.reason));
+      if (data.details.length > 0) box.appendChild(issueList(data.details));
+      box.appendChild(make('p', 'note', 'No se creó nada y no se escribió ningún registro nuevo.'));
+      setStatus('run-status', 'El envío no se creó.', 'bad');
+      return;
+    }
+
+    if (data.status === 'dry-run') {
+      box.appendChild(make('p', data.formMatchesApproval ? 'ok' : 'bad',
+        data.formMatchesApproval
+          ? 'Resumen alcanzado. No se creó nada y no se tocó la etiqueta.'
+          : 'El panel no tiene el payload que muestra la página. No se creó nada.'));
+      if (data.mismatches.length > 0) box.appendChild(issueList(data.mismatches));
+      box.appendChild(pathRow('hash del payload', data.payloadHash));
+      box.appendChild(pathRow('informe del recorrido', data.reportPath));
+      if (data.note) box.appendChild(make('p', 'note', data.note));
+      setStatus('run-status', 'Prueba en seco terminada: nada se creó.', data.formMatchesApproval ? 'ok' : 'warn');
+      return;
+    }
+
+    if (data.status === 'created') {
+      var heading = make('p', 'result-id ok', 'Envío creado ' + data.shipmentId);
+      box.appendChild(heading);
+      box.appendChild(make('p', null, 'Estado en el panel: ' + (data.statusBadges.join(', ') || '(no leído)')));
+      box.appendChild(make('p', null, 'Costo (resumen): ' + (data.cost.summary || '(no leído)')));
+      box.appendChild(make('p', null, 'Costo (detalle): ' + (data.cost.detail || '(no leído)')));
+      if (data.labelUnpaid.proven) {
+        box.appendChild(make('p', 'ok',
+          'Prueba de etiqueta impaga: el identificador, el estado del panel y el control de etiqueta siguen presentes; no se accionó nada sobre la etiqueta.'));
+      } else {
+        box.appendChild(make('p', 'bad', 'INCOMPLETO: no se puede probar que la etiqueta siga impaga.'));
+        if (data.labelUnpaid.problem) box.appendChild(make('p', 'bad', data.labelUnpaid.problem));
+        if (data.labelUnpaid.details.length > 0) box.appendChild(issueList(data.labelUnpaid.details));
+      }
+      box.appendChild(pathRow('registro previo al click', data.recordPath));
+      box.appendChild(pathRow('desenlace', data.outcomePath));
+      box.appendChild(pathRow('informe del ejecutor', data.reportPath));
+      if (data.detailScreenshot) box.appendChild(pathRow('captura del detalle', data.detailScreenshot));
+      setStatus('run-status', 'Listo: la etiqueta queda impaga.', 'ok');
+      return;
+    }
+
+    if (data.status === 'unknown') {
+      box.appendChild(make('p', 'warn', 'Resultado DESCONOCIDO: ' + data.reason));
+      box.appendChild(make('p', null, 'Conciliación: ' + data.interpretation));
+      if (data.matches.length > 0) box.appendChild(issueList(data.matches));
+      if (data.details.length > 0) box.appendChild(issueList(data.details));
+      box.appendChild(pathRow('registro a inspeccionar', data.recordPath));
+      box.appendChild(pathRow('desenlace', data.outcomePath));
+      box.appendChild(make('p', 'note', data.note));
+      setStatus('run-status', 'Hay que conciliar a mano antes de repetir este mensaje.', 'warn');
+      return;
+    }
+
+    box.appendChild(make('p', 'bad', 'La ejecución se detuvo: ' + data.reason));
+    if (data.details.length > 0) box.appendChild(issueList(data.details));
+    if (data.recordPath) box.appendChild(pathRow('registro a inspeccionar', data.recordPath));
+    box.appendChild(make('p', 'note', data.note));
+    setStatus('run-status', 'La corrida no se completó.', 'bad');
+  }
+
+  // ---------------------------------------------------------------- the rail
+
+  /**
+   * Every rail state is a dot **plus its own words**, so nothing is conveyed by
+   * colour alone: ok / warn / bad only tints the dot.
+   */
+  function railState(stateId, textId, level, text, meta) {
+    var box = byId(stateId);
+    var dot = box.querySelector('.b');
+    if (dot) dot.className = 'b ' + level;
+
+    var span = byId(textId);
+    span.textContent = text;
+    if (meta) span.appendChild(make('span', 'meta', meta));
+  }
+
+  function renderSessionRail(data) {
+    var last = data.session.lastCheck;
+    if (last === null) {
+      railState('rail-session-state', 'rail-session-text', 'warn', 'Sin chequeos',
+        'la sesión no se puede afirmar utilizable hasta que corras uno');
+    } else if (last.result === 'usable') {
+      railState('rail-session-state', 'rail-session-text', 'ok', 'Utilizable',
+        'verificada ' + timeOf(last.runAt) + ' · ' + last.durationMs + ' ms');
+    } else {
+      railState('rail-session-state', 'rail-session-text', 'bad', 'No utilizable',
+        'chequeo del ' + timeOf(last.runAt) + ' · ' +
+          (last.exitCode === null ? 'sin código de salida' : 'código ' + last.exitCode));
+    }
+    setText('rail-health', data.health.line);
+  }
+
+  function runRowLabel(row) {
+    var when = timeOf(row.recordedAt);
+    if (row.outcome === 'created') return 'creada · ' + when;
+    if (row.outcome === 'unknown') return 'desconocida · ' + when;
+    if (row.outcome === 'not-created') return 'sin crear · ' + when;
+    return 'sin desenlace · ' + when;
+  }
+
+  function renderRunsRail(data) {
+    var list = byId('rail-runs-list');
+    clear(list);
+
+    var rows = data.runs.rows.slice(0, 6);
+    if (rows.length === 0) {
+      var empty = document.createElement('li');
+      empty.appendChild(make('span', 'meta', 'no hay ningún run registrado todavía'));
+      list.appendChild(empty);
+      return;
+    }
+
+    rows.forEach(function (row) {
+      var item = document.createElement('li');
+      item.appendChild(make('span', 'id', textOr(row.shipmentId, '—')));
+      item.appendChild(make('span', 'meta', runRowLabel(row)));
+      if (row.unresolved) item.appendChild(make('span', 'meta bad', 'sin resolver'));
+      list.appendChild(item);
+    });
+  }
+
+  /** The closed vocabulary of failed structural checks, as fixed sentences. */
+  var CHECK_LABELS = {
+    'shipment-id': 'el encabezado del detalle no trae un identificador #EM<numero>',
+    'status-badge': 'ningún estado del panel dice "Por enviar"',
+    'label-button': 'no hay un botón visible para la etiqueta',
+    'form-mismatch': 'el panel no coincide con el payload mostrado',
+    'form-not-approved': 'el hash del payload no coincide con el formulario leído',
+    'outcome-unknown': 'el desenlace quedó desconocido',
+    'status-failed': 'el informe quedó en estado failed',
+    'status-error': 'el informe quedó en estado error',
+    'reconciliation-unread': 'el informe trae una conciliación'
+  };
+
+  function renderErrorsRail(data) {
+    var detail = byId('rail-errors-detail');
+    clear(detail);
 
     var latest = data.errors.latest;
     if (latest === null) {
-      box.appendChild(make('p', 'warn',
-        'No hay ningún informe de fallo del ejecutor: no existe un dry-run.json ni un create-run.json con una comprobación estructural fallida.'));
-      return;
-    }
-
-    box.appendChild(factsTable([
-      ['informe', latest.path],
-      ['archivo', latest.kind],
-      ['terminado (según el informe)', textOr(latest.finishedAt)],
-      ['escrito (fecha del archivo)', latest.recordedAt]
-    ]));
-
-    box.appendChild(make('p', 'note',
-      'El informe completo queda en disco en esa ruta y se retira por SSH: puede contener el nombre y la dirección del destinatario, por eso acá solo se muestran hechos estructurados y nunca su texto.'));
-
-    if (latest.unparseable) {
-      box.appendChild(make('p', 'bad',
-        'informe ilegible (unparseable report): no se pudo reducir a las comprobaciones conocidas. Se informa solo la ruta; su contenido no se copia acá.'));
-      return;
-    }
-
-    box.appendChild(make('h3', null, 'Comprobaciones estructurales que fallaron'));
-    if (latest.checks.length === 0) {
-      box.appendChild(make('p', 'warn', 'El informe no nombró ninguna comprobación del vocabulario conocido.'));
+      railState('rail-errors-state', 'rail-errors-text', 'ok', 'Ninguno',
+        'ningún informe del ejecutor falló sus comprobaciones');
     } else {
-      var list = make('ul', 'issues');
-      latest.checks.forEach(function (id) {
-        list.appendChild(make('li', 'bad mono', id + ' - ' + textOr(CHECK_LABELS[id], id)));
-      });
-      box.appendChild(list);
+      railState('rail-errors-state', 'rail-errors-text', 'bad', 'Hay un informe con fallas',
+        latest.kind + ' · ' + timeOf(latest.recordedAt));
+
+      detail.appendChild(make('p', 'mono', latest.path));
+      if (latest.unparseable) {
+        detail.appendChild(make('p', 'bad', 'informe ilegible: se informa solo la ruta, nunca su contenido'));
+      } else if (latest.checks.length === 0) {
+        detail.appendChild(make('p', 'warn', 'el informe no nombró ninguna comprobación conocida'));
+      } else {
+        var list = make('ul', 'issues');
+        latest.checks.forEach(function (id) {
+          list.appendChild(make('li', 'bad', CHECK_LABELS[id] || id));
+        });
+        detail.appendChild(list);
+      }
     }
 
-    if (latest.unrecognisedChecks > 0) {
-      box.appendChild(make('p', 'warn',
-        latest.unrecognisedChecks + ' comprobación(es) del informe no están en el vocabulario conocido: sus nombres no se copian acá.'));
+    var warnings = byId('rail-warnings');
+    clear(warnings);
+    if (data.warnings && data.warnings.length > 0) {
+      warnings.appendChild(make('p', 'note', 'Avisos de lectura (' + data.warnings.length + '), la página sigue funcionando:'));
+      var warningList = make('ul', 'issues');
+      data.warnings.forEach(function (warning) {
+        warningList.appendChild(make('li', null, warning.source + ' - ' + warning.message));
+      });
+      warnings.appendChild(warningList);
     }
   }
 
-  function renderConsole(data, extraSessionProblems) {
-    renderHealth(data);
-    renderRuntime(data);
-    renderSession(data);
-    renderRuns(data);
-    renderArtifacts(data);
-    renderErrors(data);
-    if (extraSessionProblems) appendWarningItems('session-warnings', extraSessionProblems);
+  function renderArtifactsRail(data) {
+    var list = byId('rail-artifacts-list');
+    clear(list);
+
+    var runs = data.artifacts.runs.filter(function (run) { return run.dir !== null; }).slice(0, 4);
+    if (runs.length === 0) {
+      var empty = document.createElement('li');
+      empty.appendChild(make('span', 'meta', 'no hay archivos que listar'));
+      list.appendChild(empty);
+      return;
+    }
+
+    runs.forEach(function (run) {
+      var item = document.createElement('li');
+      item.appendChild(make('span', 'id', run.runId));
+      item.appendChild(make('span', 'meta',
+        'artifacts/' + run.dir + ' · ' + run.files.length + ' archivo(s) · ' + formatBytes(run.totalBytes)));
+      // The page lists names and sizes and never serves a byte: traces and
+      // screenshots carry recipient data and leave the volume over SSH.
+      item.appendChild(make('span', 'meta', 'se retiran por SSH; no se sirven por HTTP'));
+      list.appendChild(item);
+    });
+  }
+
+  /**
+   * The process facts the old Runtime tab showed, collapsed so the rail keeps the
+   * artboard's rhythm. The store origin appears as a host and nothing else: the
+   * console never resolves a credential, and this list only prints what it read.
+   */
+  function renderRuntimeRail(data) {
+    var box = byId('rail-runtime');
+    clear(box);
+
+    var rows = [
+      ['node', data.runtime.nodeVersion],
+      ['pid', String(data.runtime.pid)],
+      ['panel', data.runtime.storeHost === null ? '(sin configurar)' : data.runtime.storeHost],
+      ['sesión', data.runtime.sessionSource],
+      ['artefactos', data.runtime.artifactsDirAbsolute],
+      ['registros', data.runtime.recordDirAbsolute]
+    ];
+    rows.forEach(function (row) {
+      box.appendChild(make('p', 'meta', row[0] + ': ' + row[1]));
+    });
+  }
+
+  function renderOpenAttempts(data) {
+    var open = data.runs.rows.filter(function (row) { return row.unresolved; }).length;
+    var node = byId('rail-open');
+    node.className = open === 0 ? null : 'bad';
+    node.textContent = open === 0 ? 'sin abiertas' : open === 1 ? '1 abierta' : open + ' abiertas';
+  }
+
+  function renderRail(data) {
+    renderSessionRail(data);
+    renderRunsRail(data);
+    renderErrorsRail(data);
+    renderArtifactsRail(data);
+    renderRuntimeRail(data);
+    renderOpenAttempts(data);
+  }
+
+  function renderRailFailure(reason) {
+    railState('rail-session-state', 'rail-session-text', 'bad', 'No se pudo leer', reason);
+    setText('rail-health', 'No se pudo leer el estado del agente: ' + reason);
   }
 
   function loadConsole(statusId) {
     if (state.consoleBusy) return;
     state.consoleBusy = true;
-    if (statusId) setText(statusId, 'Leyendo...');
+    if (statusId) setStatus(statusId, 'Leyendo el estado del agente…', null);
 
     fetch('/api/console', { method: 'GET' }).then(function (response) {
-      if (!response.ok) throw new Error('/api/console respondio ' + response.status);
+      if (!response.ok) throw new Error('/api/console respondió ' + response.status);
       return response.json();
     }).then(function (data) {
-      renderConsole(data, null);
-      if (statusId) setText(statusId, 'Leido a las ' + data.readAt + '.');
+      renderRail(data);
+      if (statusId) setStatus(statusId, 'Leído a las ' + timeOf(data.readAt) + '.', 'ok');
     }).catch(function (error) {
       var reason = error && error.message ? error.message : String(error);
-      if (statusId) setText(statusId, 'Error: ' + reason);
-      byId('health').className = 'health bad';
-      byId('health-line').className = 'bad';
-      byId('health-line').textContent = 'No se pudo leer el estado del agente: ' + reason;
+      renderRailFailure(reason);
+      if (statusId) setStatus(statusId, 'No se pudo leer: ' + reason, 'bad');
     }).then(function () {
       state.consoleBusy = false;
     });
@@ -830,49 +638,30 @@ export const CLIENT_JS = `(function () {
 
     var button = byId('session-check-run');
     button.disabled = true;
-    setText('session-check-status', 'Corriendo el chequeo: abre un navegador y puede tardar uno o dos minutos.');
+    setStatus('session-check-status', 'Corriendo el chequeo: abre un navegador y puede tardar uno o dos minutos.', null);
 
     post('/api/session-check', {}).then(function (data) {
-      renderConsole(data, data.problems || []);
-      setText('session-check-status',
+      renderRail(data);
+      setStatus('session-check-status',
         'Chequeo terminado: ' + data.check.result +
-        ' (' + (data.check.exitCode === null ? 'sin codigo de salida' : 'codigo ' + data.check.exitCode) + ').');
+        ' (' + (data.check.exitCode === null ? 'sin código de salida' : 'código ' + data.check.exitCode) + ').',
+        data.check.result === 'usable' ? 'ok' : 'bad');
     }).catch(function (error) {
-      setText('session-check-status', 'Error: ' + (error && error.message ? error.message : String(error)));
+      setStatus('session-check-status', describeError(error), 'bad');
+      if (error && error.status === 409) loadConsole(null);
     }).then(function () {
       state.consoleBusy = false;
       button.disabled = false;
     });
   }
 
-  var TABS = ['shipment', 'runtime', 'session', 'runs', 'artifacts', 'errors'];
-
-  function selectTab(name) {
-    TABS.forEach(function (tab) {
-      var button = document.querySelector('[data-tab="' + tab + '"]');
-      var panel = byId('panel-' + tab);
-      var active = tab === name;
-      if (button) button.setAttribute('aria-selected', active ? 'true' : 'false');
-      if (panel) panel.hidden = !active;
-    });
-    if (name !== 'shipment') loadConsole(name === 'runtime' ? 'runtime-status' : null);
-  }
-
-  var tabButtons = document.querySelectorAll('.tab');
-  for (var index = 0; index < tabButtons.length; index += 1) {
-    tabButtons[index].addEventListener('click', function () {
-      selectTab(this.getAttribute('data-tab'));
-    });
-  }
-
   byId('analyze').addEventListener('click', analyze);
-  byId('approve').addEventListener('click', approve);
+  byId('message').addEventListener('input', updateMessageBadge);
   byId('create').addEventListener('click', function () { run('create'); });
   byId('dry-run').addEventListener('click', function () { run('dry-run'); });
-  byId('token').addEventListener('input', syncButtons);
-  byId('console-refresh').addEventListener('click', function () { loadConsole('runtime-status'); });
   byId('session-check-run').addEventListener('click', runSessionCheck);
 
+  updateMessageBadge();
   syncButtons();
   loadConsole(null);
 })();

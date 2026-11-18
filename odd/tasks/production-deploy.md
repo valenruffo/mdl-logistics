@@ -38,3 +38,7 @@ R10 (no real shipment without explicit approval), R12 (never invent data), R15 (
 L1 (verbatim): "pera, solo yo ingreso, sin multiusaurio, luego es solo una tiend,a es dedicado a mdl el proyecto no a mil tiendas. la interfaz si todo lo que me indique el estado del agente, errores, logs, toda la info para que yo mpueda ir manteniendolo, sin salir de esa interfaz, nada de ia, oy veo los erroe sy voy corrigiendolo aca mismo ene sta sesion. tema dominio, el dominio oficial es mujeresdelinaje.store, lo tengo en hostinger, asi seria diela que sea agents.mujeresdelinaje.store . desplega vos."
 
 L2 (verbatim): "pero yo necesito desplegarlo en mi vps para hace run proyecot completo, real, aparte para luego que empleados puedan usar agentes, xq este lo uso yo y puecdo hacerlo local pero la ideas es hacer un par mas para mdl, asi que hagamos la interfaz bien par aproduccion linda, y en el vps "C:\Users\valen\Desktop\vps-oracle""
+
+L3: The operator rejected the deployed UI ("esa interfaz es un asco") and named the missing step: the design skills were never read. Also: a native `alert()` on load is forbidden, and the creation ceremony must go — creating does not charge, so it needs no approval; buying stays forbidden. R10 amended accordingly.
+
+L4: Design directions written to `design/consola-operador/` (01-mesa-de-trabajo, 02-bandeja-operativa, 03-consola-densa), with their tradeoffs in `design.json`. Alternatives, not final: the next step is the operator's pick, then implementation in `src/ui/`.

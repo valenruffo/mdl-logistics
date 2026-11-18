@@ -26,8 +26,6 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { computeApprovalHash } from '../../src/cli/gates';
-import { parseMessage } from '../../src/core/parse-message';
 import { analyzeMessage } from '../../src/ui/actions';
 import { readConsole, resolveConsoleDeps, type ConsoleDeps } from '../../src/ui/console';
 import { formValuesFromFields } from '../../src/ui/form';
@@ -518,9 +516,6 @@ test('a throwing handler releases the lock, and so does an executor that throws 
   // The real route: a creation whose executor throws right after the attempt
   // record was written still returns, still leaves the record unresolved, and
   // still frees the lock.
-  const parsed = parseMessage(HAPPY_MESSAGE);
-  assert.ok(parsed.ok, 'the fictional fixture must parse');
-  const approvedHash = computeApprovalHash(parsed.value);
   const analyzed = analyzeMessage(HAPPY_MESSAGE);
   assert.equal(analyzed.status, 'parsed');
   if (analyzed.status !== 'parsed') return;
@@ -541,13 +536,7 @@ test('a throwing handler releases the lock, and so does an executor that throws 
       fetch(`${started.url}/api/run`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          mode: 'create',
-          message: HAPPY_MESSAGE,
-          form,
-          approvedHash,
-          token: '1901 crear',
-        }),
+        body: JSON.stringify({ mode: 'create', message: HAPPY_MESSAGE, form }),
       });
 
     const response = await post();

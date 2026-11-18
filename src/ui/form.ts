@@ -1,9 +1,9 @@
 /**
- * The editable preview model (plan §4b S3/S7, §6).
+ * The editable form model (plan §4b S3/S7, §6).
  *
- * The preview is the approval artifact: the operator sees every panel field with
- * the value that will be typed, may edit any of them, and only the values that
- * are on screen at approval time are hashed. So the form is a *data* model, not
+ * The form is the payload: the operator sees every panel field with the value
+ * that will be typed, may edit any of them, and exactly the values that are on
+ * screen are what `runAttempt` writes to the panel. So this is a *data* model, not
  * markup: the page renders whatever `formFieldsFromRequest` returns, and every
  * run direction rebuilds a `ShipmentRequest` from the posted values with
  * `requestFromForm`.
@@ -46,6 +46,22 @@ export type FormKey =
 /** How the page must render one field. */
 export type FormKind = 'text' | 'province' | 'measure';
 
+/**
+ * The three groups the artboard draws, plus the optional declaration.
+ *
+ * Grouping is data, not markup: the page renders whatever groups the form model
+ * declares, so a field can be moved between groups without touching `client.ts`.
+ */
+export type FormGroup = 'destino' | 'destinatario' | 'paquete' | 'declaracion';
+
+/** The heading each group prints, in the order the page shows them. */
+export const FORM_GROUP_LABELS: Readonly<Record<FormGroup, string>> = {
+  destino: 'Destino',
+  destinatario: 'Destinatario',
+  paquete: 'Paquete · valores por defecto',
+  declaracion: 'Monto declarado (opcional)',
+};
+
 interface FormSpec {
   key: FormKey;
   label: string;
@@ -57,11 +73,17 @@ interface FormSpec {
   unit: string;
   kind: FormKind;
   required: boolean;
+  group: FormGroup;
+  /** True when the field spans both columns of the grid. */
+  wide: boolean;
   help: string;
 }
 
 /**
- * Order matters: it is the reading order of the preview.
+ * Order matters: it is the reading order of the preview, and it follows the
+ * artboard (`04-mesa-con-rail.html`) field for field: the postal code, the
+ * province, the city, the neighbourhood, the street, the number, then the
+ * optional apartment.
  * `required` mirrors the panel where it is known (`Apellido` and `Departamento`
  * are marked optional there; `Barrio` carries no marker, so it is treated as
  * required — plan §4c).
@@ -75,6 +97,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     unit: '',
     kind: 'text',
     required: true,
+    group: 'destino',
+    wide: false,
     help: '4 dígitos (1901) u 8 caracteres CPA (B1900ABC)',
   },
   {
@@ -85,6 +109,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     unit: '',
     kind: 'province',
     required: true,
+    group: 'destino',
+    wide: false,
     help: 'se escribe por código y se relee por nombre',
   },
   {
@@ -95,7 +121,21 @@ const FORM_SPECS: readonly FormSpec[] = [
     unit: '',
     kind: 'text',
     required: true,
+    group: 'destino',
+    wide: false,
     help: 'texto libre en el panel',
+  },
+  {
+    key: 'neighborhood',
+    label: 'Barrio',
+    panelField: 'address.neighborhood',
+    anchor: 'address.neighborhood',
+    unit: '',
+    kind: 'text',
+    required: true,
+    group: 'destino',
+    wide: false,
+    help: 'el panel no lo marca opcional',
   },
   {
     key: 'address',
@@ -105,6 +145,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     unit: '',
     kind: 'text',
     required: true,
+    group: 'destino',
+    wide: false,
     help: '',
   },
   {
@@ -115,6 +157,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     unit: '',
     kind: 'text',
     required: true,
+    group: 'destino',
+    wide: false,
     help: 'campo separado de la calle',
   },
   {
@@ -125,17 +169,9 @@ const FORM_SPECS: readonly FormSpec[] = [
     unit: '',
     kind: 'text',
     required: false,
+    group: 'destino',
+    wide: true,
     help: 'opcional en el panel',
-  },
-  {
-    key: 'neighborhood',
-    label: 'Barrio',
-    panelField: 'address.neighborhood',
-    anchor: 'address.neighborhood',
-    unit: '',
-    kind: 'text',
-    required: true,
-    help: 'el panel no lo marca opcional',
   },
   {
     key: 'name',
@@ -145,6 +181,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     unit: '',
     kind: 'text',
     required: true,
+    group: 'destinatario',
+    wide: false,
     help: '',
   },
   {
@@ -155,6 +193,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     unit: '',
     kind: 'text',
     required: false,
+    group: 'destinatario',
+    wide: false,
     help: 'opcional en el panel',
   },
   {
@@ -165,6 +205,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     unit: 'cm',
     kind: 'measure',
     required: true,
+    group: 'paquete',
+    wide: false,
     help: 'valor declarado por el proyecto (S7)',
   },
   {
@@ -175,6 +217,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     unit: 'cm',
     kind: 'measure',
     required: true,
+    group: 'paquete',
+    wide: false,
     help: 'valor declarado por el proyecto (S7)',
   },
   {
@@ -185,6 +229,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     unit: 'cm',
     kind: 'measure',
     required: true,
+    group: 'paquete',
+    wide: false,
     help: 'valor declarado por el proyecto (S7)',
   },
   {
@@ -195,16 +241,20 @@ const FORM_SPECS: readonly FormSpec[] = [
     unit: 'g',
     kind: 'measure',
     required: true,
+    group: 'paquete',
+    wide: false,
     help: 'el panel lee gramos, no kilos',
   },
   {
     key: 'declaredValue',
-    label: 'Monto total abonado',
+    label: 'Monto declarado',
     panelField: 'declaredValue',
     anchor: null,
     unit: '$',
     kind: 'measure',
     required: false,
+    group: 'declaracion',
+    wide: true,
     help: 'opcional en el panel',
   },
 ];
@@ -217,6 +267,12 @@ export interface FormField {
   unit: string;
   kind: FormKind;
   required: boolean;
+  /** Which group heading the field is rendered under. */
+  group: FormGroup;
+  /** The heading text of `group`, so the page never holds its own copy. */
+  groupLabel: string;
+  /** True when the field spans the whole grid width. */
+  wide: boolean;
   help: string;
   value: string;
   /** Non-empty when the value was computed rather than parsed (R12). */
@@ -284,6 +340,9 @@ export function formFieldsFromRequest(request: ShipmentRequest): FormField[] {
     unit: spec.unit,
     kind: spec.kind,
     required: spec.required,
+    group: spec.group,
+    groupLabel: FORM_GROUP_LABELS[spec.group],
+    wide: spec.wide,
     help: spec.help,
     value: values[spec.key],
     derived: request.derived.filter((derivation) => derivationAnchorField(derivation) === spec.key),

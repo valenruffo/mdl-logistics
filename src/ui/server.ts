@@ -1,7 +1,7 @@
 /**
- * The local HTTP server: the console page, its script, three shipment actions and
- * the console's read-only snapshot plus one explicit session check. No framework,
- * no runtime dependency beyond Node's own `http` module.
+ * The local HTTP server: the page, its script, two shipment actions and the
+ * console's read-only snapshot plus one explicit session check. No framework, no
+ * runtime dependency beyond Node's own `http` module.
  *
  * **It binds `127.0.0.1` and nothing else.** This page can create shipments in
  * Envío Nube, so it must not be reachable from another machine: there is no
@@ -12,10 +12,14 @@
  *
  * The routes are data (`createRoutes`) so the surface can be asserted instead of
  * trusted: the only mutating shipment route is `/api/run`, which itself refuses
- * unless both gates in `actions.ts` pass, and the only route that leaves the
- * process is `/api/session-check`, which opens a browser because the operator
- * asked for it. Everything else is a read of `/api/console`, which returns a JSON
- * snapshot and never file bytes.
+ * a duplicate or unresolved attempt in `actions.ts`, and the only route that
+ * leaves the process is `/api/session-check`, which opens a browser because the
+ * operator asked for it. Everything else is a read of `/api/console`, which
+ * returns a JSON snapshot and never file bytes.
+ *
+ * **There is no approval route.** Creating a shipment costs nothing, so the page
+ * has no hash to approve and no token to confirm (R10 as amended). The CLI keeps
+ * both gates; this server simply has nothing to gate.
  *
  * **There is no artifact route.** An earlier revision served every regular file
  * under `artifacts/` at `GET /artifacts/...` with no authentication of its own.
@@ -35,7 +39,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 import { messageOf } from '../executor/errors';
-import { analyzeMessage, approveForm, runAttempt, type ActionDeps } from './actions';
+import { analyzeMessage, runAttempt, type ActionDeps } from './actions';
 import { CLIENT_JS } from './client';
 import { performSessionCheck, readConsole, resolveConsoleDeps, type ConsoleDeps } from './console';
 import { LOCK_BUSY_MESSAGE, withBrowserLock } from './lock';
@@ -132,9 +136,9 @@ function formField(source: Record<string, unknown>): Record<string, unknown> {
 }
 
 /**
- * The whole surface of the page. Seven routes: the document, its script, the
- * three shipment actions, the console snapshot and the one explicit session
- * check. Nothing else exists to navigate to, and nothing below exists to fetch.
+ * The whole surface of the page. Six routes: the document, its script, the two
+ * shipment actions, the console snapshot and the one explicit session check.
+ * Nothing else exists to navigate to, and nothing below exists to fetch.
  */
 export function createRoutes(deps: ActionDeps): Route[] {
   const consoleDeps: ConsoleDeps = resolveConsoleDeps({ recordDir: deps.recordDir, ...(deps.console ?? {}) });
@@ -143,13 +147,13 @@ export function createRoutes(deps: ActionDeps): Route[] {
     {
       method: 'GET',
       path: '/',
-      purpose: 'la unica pagina: pegar el mensaje, revisar, aprobar, ejecutar',
+      purpose: 'la unica pagina: pegar el mensaje, revisar los datos y crear el envio',
       handle: async () => html(PAGE_HTML),
     },
     {
       method: 'GET',
       path: '/app.js',
-      purpose: 'el script de la pagina: tres llamadas fetch, sin framework',
+      purpose: 'el script de la pagina: unas pocas llamadas fetch, sin framework',
       handle: async () => javascript(CLIENT_JS),
     },
     {
@@ -164,22 +168,8 @@ export function createRoutes(deps: ActionDeps): Route[] {
     },
     {
       method: 'POST',
-      path: '/api/approve',
-      purpose: 'recalcula en el servidor el hash del payload editado y lo devuelve para mostrar',
-      handle: async (body) => {
-        const parsed = parseBody(body);
-        if (!parsed.ok) return json(400, { status: 'bad-request', reason: parsed.reason });
-        const result = await approveForm(
-          { message: textField(parsed.value, 'message'), form: formField(parsed.value) },
-          deps,
-        );
-        return json(200, result);
-      },
-    },
-    {
-      method: 'POST',
       path: '/api/run',
-      purpose: 'recorre el panel en seco, o crea el envio solo con la aprobacion y la confirmacion escritas',
+      purpose: 'recorre el panel en seco, o crea el envio: sin aprobacion ni token, solo el mensaje y los datos',
       handle: async (body) => {
         const parsed = parseBody(body);
         if (!parsed.ok) return json(400, { status: 'bad-request', reason: parsed.reason });
@@ -192,20 +182,15 @@ export function createRoutes(deps: ActionDeps): Route[] {
           });
         }
 
-        const approvedHash = parsed.value['approvedHash'];
-        const token = parsed.value['token'];
-
         // Both modes drive the panel, so both take the one browser lock. The
-        // gates are read inside it too: a prior-attempt check must not race a
-        // run that is about to write its own record.
+        // duplicate check is read inside it too: it must not race a run that is
+        // about to write its own record.
         const guarded = await withBrowserLock('run', async () =>
           runAttempt(
             {
               message: textField(parsed.value, 'message'),
               form: formField(parsed.value),
               mode,
-              approvedHash: typeof approvedHash === 'string' ? approvedHash : null,
-              token: typeof token === 'string' ? token : null,
             },
             deps,
           ),
@@ -218,7 +203,7 @@ export function createRoutes(deps: ActionDeps): Route[] {
       method: 'GET',
       path: '/api/console',
       purpose:
-        'estado de solo lectura: runtime, sesion, runs, artefactos, errores y la linea de salud derivada',
+        'estado de solo lectura para el rail: sesion, runs, artefactos, errores, runtime y la linea de salud derivada',
       handle: async () => json(200, await readConsole(consoleDeps)),
     },
     {

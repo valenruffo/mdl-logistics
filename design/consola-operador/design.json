@@ -1,0 +1,35 @@
+{
+  "title": "Consola del operador",
+  "brief": "Interfaz de escritorio para un operador único: pega un mensaje de WhatsApp, revisa los datos y crea el envío manual en Envío Nube, con el mantenimiento del agente en la misma pantalla. Crear no pide ceremonia; comprar la etiqueta no existe en esta interfaz.",
+  "feature": "odd/tasks/production-deploy.md",
+  "artboards": [
+    {
+      "file": "01-mesa-de-trabajo.html",
+      "title": "Mesa de trabajo",
+      "tradeoff": "Una sola columna y una sola acción principal: el camino más corto del pegado al envío creado. El mantenimiento queda plegado al pie, así que mirar el estado exige un clic.",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "file": "02-bandeja-operativa.html",
+      "title": "Bandeja operativa",
+      "tradeoff": "Rail oscuro con estado y corridas siempre visibles, y mensaje y resultado lado a lado para comparar antes de crear. Mejor para volver después de un rato; más cromo para un envío rápido.",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "file": "03-consola-densa.html",
+      "title": "Consola densa",
+      "tradeoff": "Tema oscuro, monoespaciado y volcado del parseo campo por campo: ideal para diagnosticar y para tener abierta todo el día. Menos amable para el operario que solo quiere pegar y crear.",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "file": "04-mesa-con-rail.html",
+      "title": "Mesa con rail compacto",
+      "tradeoff": "La columna única de la mesa de trabajo con el estado del agente siempre visible en un rail oscuro de 224 px. Se paga con ~220 px de ancho útil y con un rail que, en pantallas angostas, se pliega arriba.",
+      "width": 1440,
+      "height": 900
+    }
+  ]
+}

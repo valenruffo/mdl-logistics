@@ -6,9 +6,9 @@
  * like everything else in `artifacts/`):
  *
  * - `<runId>.json` — written **before** the `Crear envío` click. It holds the
- *   timestamp, the message hash, the approval hash, the full approved payload and
- *   the confirmation the operator typed. If the process dies mid-click, this is
- *   the only trace that a shipment may have been created.
+ *   timestamp, the message hash, the payload hash, the full payload and — when the
+ *   CLI asked for one — the confirmation the operator typed. If the process dies
+ *   mid-click, this is the only trace that a shipment may have been created.
  * - `<runId>.outcome.json` — added only once an outcome is known: `created` with
  *   the `#EM<number>`, or `unknown` with the single reconciliation report. A
  *   human adds `not-created` by hand after checking the shipment list.
@@ -41,7 +41,12 @@ export interface ApprovalRunRecord {
   approvalHash: string;
   /** The full approved payload, not just its hash. */
   payload: ApprovalPayload;
-  confirmation: { expected: string; typed: string };
+  /**
+   * The token the CLI asks the operator to type. **Absent** for the local page,
+   * where creating a shipment needs no ceremony (R10 as amended); `loadRunRecords`
+   * already tolerates a record without it.
+   */
+  confirmation?: { expected: string; typed: string };
   status: 'attempted-unresolved';
   note: string;
 }

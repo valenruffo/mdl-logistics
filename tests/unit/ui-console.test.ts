@@ -9,12 +9,14 @@
  * What is asserted:
  *  - a rejected message renders missing / invalid / unknown labels with reasons
  *    and leaves nothing actionable;
- *  - the approval hash is recomputed **server-side** from the current form
- *    values, so editing a field after approval invalidates the approval;
- *  - approving the data never authorizes the creation: the token gate is
- *    separate and a wrong or absent token creates nothing;
+ *  - creating a shipment needs no ceremony: the message and the values on screen
+ *    are enough, with no approval hash to echo back and no token to type (R10 as
+ *    amended);
  *  - an unresolved prior attempt for the same message refuses the creation
- *    (reusing `assertNoBlockingPriorAttempt`);
+ *    (reusing `assertNoBlockingPriorAttempt`), and so does a record that already
+ *    created one;
+ *  - the payload hash the executor receives is always computed here from the
+ *    posted values, never taken from the client;
  *  - executor failures surface verbatim, details included;
  *  - there is no route, handler or served byte that offers a purchase.
  */
@@ -31,13 +33,7 @@ import { computeApprovalHash, messageFingerprint } from '../../src/cli/gates';
 import { attemptRecordPath, outcomeRecordPath, writeAttemptRecord } from '../../src/cli/runRecord';
 import { approvalPayloadFromRequest } from '../../src/executor/approval';
 import { ExecutorError } from '../../src/executor/errors';
-import {
-  analyzeMessage,
-  approveForm,
-  runAttempt,
-  type ActionDeps,
-  type UiExecutor,
-} from '../../src/ui/actions';
+import { analyzeMessage, runAttempt, type ActionDeps, type UiExecutor } from '../../src/ui/actions';
 import { formValuesFromFields } from '../../src/ui/form';
 import { HAPPY_MESSAGE, withLines, withoutLine } from './fixtures';
 
@@ -219,10 +215,10 @@ test('a parsed message prefills every panel field and marks the derived ones', (
     'zipCode',
     'province',
     'city',
+    'neighborhood',
     'address',
     'number',
     'complement',
-    'neighborhood',
     'name',
     'lastName',
     'height',
@@ -262,56 +258,45 @@ test('a non-blocking warning travels to the preview instead of blocking the mess
   assert.match(analyzed.warnings[0]?.message ?? '', /differs from/i);
 });
 
-// ------------------------------------------------------------------ 2. approve
+// ------------------------------------------------- 2. creation, no ceremony
 
-test('approving recomputes the canonical hash server-side from the posted values', async () => {
-  const { executor } = fakeExecutor();
-  const form = fixtureForm();
-  const approved = await approveForm({ message: HAPPY_MESSAGE, form }, await deps(executor));
+/**
+ * The whole point of the amended R10: `Crear envío` is one click on the values
+ * that are already on screen. Nothing posts an approval hash, nothing types a
+ * token, and creation still costs nothing on the operator's account.
+ */
+test('creating without an approval hash and without a token succeeds', async () => {
+  const fake = fakeExecutor();
+  const d = await deps(fake.executor);
 
-  assert.equal(approved.status, 'approved');
-  if (approved.status !== 'approved') return;
-  assert.equal(approved.approvalHash, EXPECTED_HASH, 'the hash is the one the executor will compare against');
-  assert.equal(approved.payload.length, 16, 'every panel field is shown for approval');
-  assert.ok(approved.payload.some((row) => row.field === 'box.weight (g)' && row.value === '700'));
-  assert.ok(approved.payload.some((row) => row.field === 'carrier' && row.value === CARRIER_NAME));
+  const created = await runAttempt({ message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'create' }, d);
+
+  assert.equal(created.status, 'created');
+  if (created.status !== 'created') return;
+  assert.equal(created.shipmentId, '#EM9999');
+  assert.equal(fake.calls.length, 1, 'the panel was driven exactly once');
+  assert.equal(fake.calls[0]?.approvedPayloadHash, EXPECTED_HASH, 'the executor compares against our own hash');
 });
 
-test('one edited field after approval produces a different hash and the run refuses', async () => {
+test('the posted values are the payload: no hash field is read, and an edit is simply what runs', async () => {
   const fake = fakeExecutor();
   const d = await deps(fake.executor);
   const form = fixtureForm();
 
-  const approved = await approveForm({ message: HAPPY_MESSAGE, form }, d);
-  assert.equal(approved.status, 'approved');
-  if (approved.status !== 'approved') return;
+  // A hash field, valid or forged, changes nothing: it is not part of the input.
+  const withForgedHash = await runAttempt(
+    { message: HAPPY_MESSAGE, form, mode: 'create', approvedHash: 'f'.repeat(64), token: 'nope' } as never,
+    d,
+  );
+  assert.equal(withForgedHash.status, 'created');
+  assert.equal(fake.calls[0]?.approvedPayloadHash, EXPECTED_HASH, 'the hash is recomputed from the posted values');
 
+  const other = fakeExecutor();
+  const editedDeps = await deps(other.executor);
   const edited = { ...form, city: 'Villa Ejemplx' };
-  const refused = await runAttempt(
-    { message: HAPPY_MESSAGE, form: edited, mode: 'create', approvedHash: approved.approvalHash, token: TOKEN },
-    d,
-  );
-
-  assert.equal(refused.status, 'refused');
-  if (refused.status !== 'refused') return;
-  assert.equal(refused.stage, 'approval');
-  assert.match(refused.reason, /approval refused/i);
-  assert.match(refused.details.join('\n'), /current payload hash/);
-  assert.equal(fake.calls.length, 0, 'nothing reached the executor');
-
-  // Re-approving the edited values yields a different hash, and that hash passes.
-  const reapproved = await approveForm({ message: HAPPY_MESSAGE, form: edited }, d);
-  assert.equal(reapproved.status, 'approved');
-  if (reapproved.status !== 'approved') return;
-  assert.notEqual(reapproved.approvalHash, approved.approvalHash);
-
-  const pastGate = await runAttempt(
-    { message: HAPPY_MESSAGE, form: edited, mode: 'create', approvedHash: reapproved.approvalHash, token: '' },
-    d,
-  );
-  assert.equal(pastGate.status, 'refused');
-  if (pastGate.status !== 'refused') return;
-  assert.equal(pastGate.stage, 'confirmation', 'the approval gate let it through; the token gate stopped it');
+  const created = await runAttempt({ message: HAPPY_MESSAGE, form: edited, mode: 'create' }, editedDeps);
+  assert.equal(created.status, 'created');
+  assert.notEqual(other.calls[0]?.approvedPayloadHash, EXPECTED_HASH, 'an edited payload hashes differently');
 });
 
 test('an edited value the panel could not hold is an invalid form, not a run', async () => {
@@ -319,62 +304,68 @@ test('an edited value the panel could not hold is an invalid form, not a run', a
   const d = await deps(fake.executor);
   const form = fixtureForm();
 
-  const approved = await approveForm({ message: HAPPY_MESSAGE, form: { ...form, weight: '0' } }, d);
-  assert.equal(approved.status, 'invalid-form');
-  if (approved.status !== 'invalid-form') return;
-  assert.equal(approved.errors[0]?.field, 'weight');
-  assert.match(approved.errors[0]?.message ?? '', /positivo|positive/i);
+  const badWeight = await runAttempt({ message: HAPPY_MESSAGE, form: { ...form, weight: '0' }, mode: 'create' }, d);
+  assert.equal(badWeight.status, 'invalid-form');
+  if (badWeight.status !== 'invalid-form') return;
+  assert.equal(badWeight.errors[0]?.field, 'weight');
+  assert.match(badWeight.errors[0]?.message ?? '', /positivo|positive/i);
 
-  const badZip = await approveForm({ message: HAPPY_MESSAGE, form: { ...form, zipCode: '12' } }, d);
+  const badZip = await runAttempt({ message: HAPPY_MESSAGE, form: { ...form, zipCode: '12' }, mode: 'create' }, d);
   assert.equal(badZip.status, 'invalid-form');
 
-  const badProvince = await approveForm({ message: HAPPY_MESSAGE, form: { ...form, province: 'Bs As' } }, d);
+  const badProvince = await runAttempt({ message: HAPPY_MESSAGE, form: { ...form, province: 'Bs As' }, mode: 'create' }, d);
   assert.equal(badProvince.status, 'invalid-form');
   if (badProvince.status !== 'invalid-form') return;
-  assert.match(badProvince.errors[0]?.message ?? '', /ambiguous/i, 'the province reason is the parser\'s own');
+  assert.match(badProvince.errors[0]?.message ?? '', /ambiguous/i, "the province reason is the parser's own");
 
-  const emptyName = await approveForm({ message: HAPPY_MESSAGE, form: { ...form, name: '   ' } }, d);
+  const emptyName = await runAttempt({ message: HAPPY_MESSAGE, form: { ...form, name: '   ' }, mode: 'create' }, d);
   assert.equal(emptyName.status, 'invalid-form');
 
-  assert.equal(fake.calls.length, 0);
+  assert.equal(fake.calls.length, 0, 'nothing reached the executor');
 });
 
-// ------------------------------------------------------ 3. the two gates apart
+// ------------------------------------------------ 3. the duplicate refusals
 
-test('approving the data does not authorize the creation: no token means no run', async () => {
+test('a message that already created a shipment is refused, with nothing created twice', async () => {
   const fake = fakeExecutor();
   const d = await deps(fake.executor);
-  const form = fixtureForm();
+  const runId = '2026-01-01T00-00-00-000Z-cccccccccccc';
 
-  const refused = await runAttempt(
-    { message: HAPPY_MESSAGE, form, mode: 'create', approvedHash: EXPECTED_HASH, token: '' },
-    d,
+  await writeAttemptRecord(d.recordDir, {
+    runId,
+    recordedAt: '2026-01-01T00:00:00.000Z',
+    messageFile: '(pasted in the UI)',
+    messageHash: messageFingerprint(HAPPY_MESSAGE),
+    approvalHash: EXPECTED_HASH,
+    payload: approvalPayloadFromRequest(REQUEST, CARRIER_NAME),
+    status: 'attempted-unresolved',
+    note: 'written before the click',
+  });
+  await writeFile(
+    outcomeRecordPath(d.recordDir, runId),
+    `${JSON.stringify({
+      runId,
+      finishedAt: '2026-01-01T00:01:00.000Z',
+      status: 'created',
+      shipmentId: '#EM9999',
+      costShown: { summaryModality: null, detailShipmentData: null },
+      buyButtonVisible: true,
+      buyCardText: null,
+      reconciliation: null,
+      reportPath: '',
+      recordedBy: 'executor',
+    })}\n`,
+    { encoding: 'utf8' },
   );
+
+  const refused = await runAttempt({ message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'create' }, d);
 
   assert.equal(refused.status, 'refused');
   if (refused.status !== 'refused') return;
-  assert.equal(refused.stage, 'confirmation');
-  assert.match(refused.reason, /confirmation refused/i);
-  assert.match(refused.details.join('\n'), /1901 crear/);
-  assert.equal(fake.calls.length, 0, 'nothing was clicked and nothing was created');
-});
-
-test('a token that does not match the destination is refused, with nothing created', async () => {
-  const fake = fakeExecutor();
-  const d = await deps(fake.executor);
-  const form = fixtureForm();
-
-  for (const token of ['1902 crear', '1901', 'crear', '1901 crear por favor']) {
-    const refused = await runAttempt(
-      { message: HAPPY_MESSAGE, form, mode: 'create', approvedHash: EXPECTED_HASH, token },
-      d,
-    );
-    assert.equal(refused.status, 'refused', `token ${JSON.stringify(token)} must be refused`);
-    if (refused.status !== 'refused') continue;
-    assert.equal(refused.stage, 'confirmation');
-    assert.match(refused.details.join('\n'), /typed/);
-  }
-  assert.equal(fake.calls.length, 0);
+  assert.equal(refused.stage, 'prior-attempt');
+  assert.match(refused.reason, /already created a shipment/i);
+  assert.match(refused.details.join('\n'), /#EM9999/, 'the existing shipment is named');
+  assert.equal(fake.calls.length, 0, 'the panel is never driven for a message that already has a shipment');
 });
 
 // ------------------------------------------------------------ 4. prior attempts
@@ -397,7 +388,7 @@ test('an unresolved prior attempt for the same message refuses the creation', as
   });
 
   const refused = await runAttempt(
-    { message: HAPPY_MESSAGE, form, mode: 'create', approvedHash: EXPECTED_HASH, token: TOKEN },
+    { message: HAPPY_MESSAGE, form, mode: 'create' },
     d,
   );
 
@@ -426,7 +417,7 @@ test('the same unresolved record does not block a dry run, which creates nothing
   });
 
   const result = await runAttempt(
-    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'dry-run', approvedHash: EXPECTED_HASH, token: null },
+    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'dry-run' },
     d,
   );
 
@@ -445,7 +436,7 @@ test('the dry run stops on the summary and reports the panel diff', async () => 
   const d = await deps(fake.executor);
 
   const result = await runAttempt(
-    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'dry-run', approvedHash: EXPECTED_HASH, token: null },
+    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'dry-run' },
     d,
   );
 
@@ -454,9 +445,7 @@ test('the dry run stops on the summary and reports the panel diff', async () => 
   assert.equal(result.summaryReached, true);
   assert.equal(result.formMatchesApproval, true);
   assert.deepEqual(result.mismatches, []);
-  assert.match(result.approvedHash, /^[0-9a-f]{64}$/);
-  assert.match(result.currentHash, /^[0-9a-f]{64}$/);
-  assert.equal(result.approvedHash, result.currentHash);
+  assert.match(result.payloadHash, /^[0-9a-f]{64}$/, 'the payload hash is the one the executor compares');
   assert.equal(result.reportPath, 'artifacts/executor-fixture/dry-run.json');
 });
 
@@ -465,7 +454,7 @@ test('a created shipment reports the id, the cost and the structural unpaid-labe
   const d = await deps(fake.executor);
 
   const result = await runAttempt(
-    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'create', approvedHash: EXPECTED_HASH, token: TOKEN },
+    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'create' },
     d,
   );
 
@@ -505,7 +494,7 @@ test('an executor failure is surfaced verbatim, details included, and names the 
   const d = await deps(fake.executor);
 
   const result = await runAttempt(
-    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'create', approvedHash: EXPECTED_HASH, token: TOKEN },
+    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'create' },
     d,
   );
 
@@ -544,7 +533,7 @@ test('an unknown creation outcome reports the reconciliation and the record to i
   const d = await deps(fake.executor);
 
   const result = await runAttempt(
-    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'create', approvedHash: EXPECTED_HASH, token: TOKEN },
+    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'create' },
     d,
   );
 
@@ -557,29 +546,19 @@ test('an unknown creation outcome reports the reconciliation and the record to i
   assert.equal(outcome.status, 'unknown');
 });
 
-test('the approval hash the client sends is never trusted: the run recomputes it', async () => {
+test('the payload hash the executor receives comes from the posted values, never from the client', async () => {
   const fake = fakeExecutor();
   const d = await deps(fake.executor);
 
-  // A hash forged by the client (any other payload's hash) is refused by gate 1.
-  const forged = 'f'.repeat(64);
-  const refused = await runAttempt(
-    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'create', approvedHash: forged, token: TOKEN },
-    d,
-  );
-  assert.equal(refused.status, 'refused');
-  if (refused.status !== 'refused') return;
-  assert.equal(refused.stage, 'approval');
-  assert.equal(fake.calls.length, 0);
+  // Whatever the page (or anything else) puts in a hash-shaped field is ignored:
+  // the only hash that exists is the one this module computes.
+  const forged = { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'create', approvedHash: 'f'.repeat(64) };
+  const result = await runAttempt(forged as never, d);
 
-  const missing = await runAttempt(
-    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'create', approvedHash: null, token: TOKEN },
-    d,
-  );
-  assert.equal(missing.status, 'refused');
-  if (missing.status !== 'refused') return;
-  assert.equal(missing.stage, 'approval');
-  assert.equal(fake.calls.length, 0);
+  assert.equal(result.status, 'created');
+  assert.equal(fake.calls.length, 1);
+  assert.equal(fake.calls[0]?.approvedPayloadHash, EXPECTED_HASH);
+  assert.notEqual(fake.calls[0]?.approvedPayloadHash, 'f'.repeat(64));
 });
 
 // ----------------------------------------------------- 6. no purchase anywhere
@@ -650,8 +629,10 @@ test('the server listens on 127.0.0.1 only and answers without CORS headers', as
     const html = await page.text();
     assert.match(html, /<textarea/, 'the page has the paste box');
     assert.match(html, /Analizar/);
-    assert.match(html, /Aprobar estos datos/);
-    assert.match(html, /Autorizar la creación/);
+    assert.match(html, /Crear envío/);
+    assert.match(html, /Probar en seco/);
+    assert.doesNotMatch(html, /Aprobar estos datos/, 'the approval step is gone');
+    assert.doesNotMatch(html, /Autorizar la creación/, 'the token step is gone');
   } finally {
     await started.close();
   }
@@ -669,7 +650,6 @@ test('the routes are the page, its script, the shipment actions and the console 
       'GET /api/console',
       'GET /app.js',
       'POST /api/analyze',
-      'POST /api/approve',
       'POST /api/run',
       'POST /api/session-check',
     ],
@@ -773,7 +753,7 @@ test('candidate purchase paths are 404 and grant nothing', async () => {
   }
 });
 
-test('the HTTP layer drives the same gates as the CLI', async () => {
+test('the HTTP layer creates without ceremony and still refuses a duplicate', async () => {
   const fake = fakeExecutor();
   const { startUiServer } = await import('../../src/ui/server');
   const d = await deps(fake.executor);
@@ -787,20 +767,17 @@ test('the HTTP layer drives the same gates as the CLI', async () => {
     assert.equal(analyzed.status, 'parsed');
     const form = formValuesFromFields(analyzed.fields);
 
-    const approved = await post(`${started.url}/api/approve`, { message: HAPPY_MESSAGE, form });
-    assert.equal(approved.status, 'approved');
-    assert.equal(approved.approvalHash, EXPECTED_HASH);
+    // The whole creation request: the message, the values on screen and the mode.
+    const created = await post(`${started.url}/api/run`, { message: HAPPY_MESSAGE, form, mode: 'create' });
+    assert.equal(created.status, 'created');
+    assert.equal(created.shipmentId, '#EM9999');
+    assert.equal(fake.calls.length, 1);
 
-    const refused = await post(`${started.url}/api/run`, {
-      message: HAPPY_MESSAGE,
-      form: { ...form, city: 'Otra Ciudad' },
-      mode: 'create',
-      approvedHash: approved.approvalHash,
-      token: TOKEN,
-    });
-    assert.equal(refused.status, 'refused');
-    assert.equal(refused.stage, 'approval');
-    assert.equal(fake.calls.length, 0);
+    // The same message again is the duplicate the gate exists to stop.
+    const duplicate = await post(`${started.url}/api/run`, { message: HAPPY_MESSAGE, form, mode: 'create' });
+    assert.equal(duplicate.status, 'refused');
+    assert.equal(duplicate.stage, 'prior-attempt');
+    assert.equal(fake.calls.length, 1, 'the second request never reached the panel');
 
     const badUser = await fetch(`${started.url}/api/run`, { method: 'POST', body: 'not json' });
     assert.equal(badUser.status, 400);
