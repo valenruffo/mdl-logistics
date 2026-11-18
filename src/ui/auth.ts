@@ -154,7 +154,10 @@ function parsePositiveInt(text: string): number | null {
  * read is not a hash we may compare against, and there is no fallback format.
  */
 export function parseStoredHash(value: string): StoredPasswordHash | null {
-  const parts = value.split('$');
+  // A `$` separator breaks `docker compose`, which interpolates it away from
+  // `.env` and `env_file` values alike. `:` is accepted for deployments; the
+  // derivation is identical, only the separator differs.
+  const parts = value.split(value.includes('$') ? '$' : ':');
   if (parts.length !== 6) return null;
 
   const [prefix, nText, rText, pText, saltHex, keyHex] = parts as [string, string, string, string, string, string];
@@ -536,7 +539,7 @@ export function readAuthConfig(env: Record<string, string | undefined>): AuthCon
   if (passwordHash === null) {
     throw new AuthConfigError(
       PASSWORD_HASH_VARIABLE,
-      'no tiene el formato scrypt$N$r$p$salt$key; generala con el comando documentado en env.example',
+      'no tiene el formato scrypt$N$r$p$salt$key ni scrypt:N:r:p:salt:key; generala con el comando documentado en env.example',
     );
   }
 
