@@ -36,6 +36,7 @@ import { ExecutorError } from '../../src/executor/errors';
 import { analyzeMessage, runAttempt, type ActionDeps, type UiExecutor } from '../../src/ui/actions';
 import { formValuesFromFields } from '../../src/ui/form';
 import { HAPPY_MESSAGE, withLines, withoutLine } from './fixtures';
+import { TEST_AUTH, authFetch, testContext } from './auth-fixtures';
 
 const REQUEST = (() => {
   const parsed = parseMessage(HAPPY_MESSAGE);
@@ -616,13 +617,13 @@ test('no route, handler or served byte offers a purchase', async () => {
 test('the server listens on 127.0.0.1 only and answers without CORS headers', async () => {
   const { executor } = fakeExecutor();
   const { startUiServer } = await import('../../src/ui/server');
-  const started = await startUiServer({ port: 0, deps: await deps(executor) });
+  const started = await startUiServer({ port: 0, deps: await deps(executor), auth: TEST_AUTH });
 
   try {
     assert.equal(started.host, '127.0.0.1');
     assert.match(started.url, /^http:\/\/127\.0\.0\.1:\d+$/);
 
-    const page = await fetch(started.url);
+    const page = await authFetch(started.url);
     assert.equal(page.status, 200);
     assert.match(page.headers.get('content-type') ?? '', /text\/html/);
     assert.equal(page.headers.get('access-control-allow-origin'), null, 'no CORS: nothing else may call this page');
@@ -649,10 +650,23 @@ test('the routes are the page, its script, the shipment actions and the console 
       'GET /',
       'GET /api/console',
       'GET /app.js',
+      'GET /login',
       'POST /api/analyze',
+      'POST /api/login',
+      'POST /api/logout',
       'POST /api/run',
       'POST /api/session-check',
     ],
+  );
+
+  // The exception list is data, and it is exactly three routes: the login card,
+  // its script and the login POST. Everything else requires a session cookie.
+  assert.deepEqual(
+    routes
+      .filter((route) => route.public)
+      .map((route) => `${route.method} ${route.path}`)
+      .sort(),
+    ['GET /app.js', 'GET /login', 'POST /api/login'],
   );
 
   // No route is a prefix, so a request cannot name a file below one, and none of
@@ -686,7 +700,7 @@ test('no route returns artifact bytes and no rendered link points at /artifacts/
     recordDir: await mkdtemp(path.join(tmpdir(), 'mdl-ui-records-')),
     console: { artifactsDir },
   };
-  const started = await startUiServer({ port: 0, deps: runDeps });
+  const started = await startUiServer({ port: 0, deps: runDeps, auth: TEST_AUTH });
 
   try {
     const candidates = [
@@ -704,7 +718,7 @@ test('no route returns artifact bytes and no rendered link points at /artifacts/
 
     for (const candidate of candidates) {
       for (const method of ['GET', 'POST'] as const) {
-        const response = await fetch(`${started.url}${candidate}`, method === 'GET' ? {} : { method });
+        const response = await authFetch(`${started.url}${candidate}`, method === 'GET' ? {} : { method });
         assert.equal(response.status, 404, `${method} ${candidate} answered ${response.status}`);
         const body = await response.text();
         assert.doesNotMatch(body, new RegExp(marker), `${method} ${candidate} must not return the file`);
@@ -713,7 +727,7 @@ test('no route returns artifact bytes and no rendered link points at /artifacts/
     }
 
     // The console snapshot lists names and sizes only: no URL anywhere.
-    const snapshot = await (await fetch(`${started.url}/api/console`)).text();
+    const snapshot = await (await authFetch(`${started.url}/api/console`)).text();
     assert.doesNotMatch(snapshot, /\/artifacts\//);
     assert.doesNotMatch(snapshot, new RegExp(marker));
 
@@ -726,7 +740,7 @@ test('no route returns artifact bytes and no rendered link points at /artifacts/
 
     // And the raw dispatcher refuses the same shapes.
     for (const candidate of candidates) {
-      const answer = await handleRequest('GET', candidate, '', runDeps);
+      const answer = await handleRequest('GET', candidate, '', runDeps, testContext());
       assert.equal(answer.status, 404, `handleRequest ${candidate} answered ${answer.status}`);
       assert.doesNotMatch(answer.body, new RegExp(marker));
     }
@@ -739,11 +753,11 @@ test('no route returns artifact bytes and no rendered link points at /artifacts/
 test('candidate purchase paths are 404 and grant nothing', async () => {
   const { executor } = fakeExecutor();
   const { startUiServer } = await import('../../src/ui/server');
-  const started = await startUiServer({ port: 0, deps: await deps(executor) });
+  const started = await startUiServer({ port: 0, deps: await deps(executor), auth: TEST_AUTH });
 
   try {
     for (const candidate of ['/comprar', '/comprar-etiqueta', '/api/comprar', '/api/purchase', '/api/pay', '/buy']) {
-      const response = await fetch(`${started.url}${candidate}`, { method: 'POST', body: '{}' });
+      const response = await authFetch(`${started.url}${candidate}`, { method: 'POST', body: '{}' });
       assert.equal(response.status, 404, `${candidate} must not exist`);
       const body = await response.text();
       assert.doesNotMatch(body, /ok|created/i);
@@ -757,7 +771,7 @@ test('the HTTP layer creates without ceremony and still refuses a duplicate', as
   const fake = fakeExecutor();
   const { startUiServer } = await import('../../src/ui/server');
   const d = await deps(fake.executor);
-  const started = await startUiServer({ port: 0, deps: d });
+  const started = await startUiServer({ port: 0, deps: d, auth: TEST_AUTH });
 
   try {
     const rejected = await post(`${started.url}/api/analyze`, { message: withoutLine(HAPPY_MESSAGE, 'Calle') });
@@ -779,7 +793,7 @@ test('the HTTP layer creates without ceremony and still refuses a duplicate', as
     assert.equal(duplicate.stage, 'prior-attempt');
     assert.equal(fake.calls.length, 1, 'the second request never reached the panel');
 
-    const badUser = await fetch(`${started.url}/api/run`, { method: 'POST', body: 'not json' });
+    const badUser = await authFetch(`${started.url}/api/run`, { method: 'POST', body: 'not json' });
     assert.equal(badUser.status, 400);
   } finally {
     await started.close();
@@ -787,7 +801,7 @@ test('the HTTP layer creates without ceremony and still refuses a duplicate', as
 });
 
 async function post(url: string, body: unknown): Promise<Record<string, unknown>> {
-  const response = await fetch(url, {
+  const response = await authFetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),

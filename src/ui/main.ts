@@ -12,10 +12,24 @@
  * the console only `stat`s them.
  *
  * Only the port is an option. The host is not: this page can create shipments.
+ *
+ * The process also refuses to start without `MDL_PASSWORD_HASH` and
+ * `MDL_SESSION_SECRET`. There is no default password and no default secret: a
+ * default would be a published credential, so the only answer is to stop and name
+ * the variable that is missing. The messages never quote a value.
  */
 import { ARTIFACTS_DIR } from './console';
 import { RUN_RECORD_DIR } from '../cli/runRecord';
 import type { ActionDeps, UiExecutor } from './actions';
+import {
+  AuthConfigError,
+  PASSWORD_HASH_COMMAND,
+  PASSWORD_HASH_VARIABLE,
+  SESSION_SECRET_COMMAND,
+  SESSION_SECRET_VARIABLE,
+  readAuthConfig,
+  type AuthConfig,
+} from './auth';
 import { DEFAULT_PORT, startUiServer } from './server';
 import { SESSION_CHECK_HISTORY_PATH, runSessionCheckScript } from './sessionCheck';
 
@@ -40,7 +54,28 @@ function usage(): string {
     '     npm run ui -- --port 4400',
     '     npm run ui -- --help',
     'no hay opcion de host: la pagina puede crear envios y solo escucha en loopback.',
+    '',
+    `para arrancar hacen falta ${PASSWORD_HASH_VARIABLE} y ${SESSION_SECRET_VARIABLE}:`,
+    `  ${PASSWORD_HASH_VARIABLE}=$( ${PASSWORD_HASH_COMMAND} )`,
+    `  ${SESSION_SECRET_VARIABLE}=$( ${SESSION_SECRET_COMMAND} )`,
   ].join('\n');
+}
+
+/**
+ * Reads the login configuration, or explains which variable is missing and how to
+ * generate it. Returns `null` when the process must not serve anything.
+ */
+function requireAuthConfig(): AuthConfig | null {
+  try {
+    return readAuthConfig(process.env);
+  } catch (error) {
+    if (!(error instanceof AuthConfigError)) throw error;
+    console.error(`No se puede arrancar la consola: ${error.message}.`);
+    console.error('No hay contraseña ni secreto por defecto: el servidor no sirve nada sin ellos.');
+    console.error(`  ${PASSWORD_HASH_VARIABLE}: ${PASSWORD_HASH_COMMAND}`);
+    console.error(`  ${SESSION_SECRET_VARIABLE}: ${SESSION_SECRET_COMMAND}`);
+    return null;
+  }
 }
 
 interface ParsedArgs {
@@ -75,6 +110,7 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
 }
 
 const args = parseArgs(process.argv.slice(2));
+const auth = args.error === null && !args.help ? requireAuthConfig() : null;
 
 if (args.error !== null) {
   console.error(args.error);
@@ -83,12 +119,16 @@ if (args.error !== null) {
 } else if (args.help) {
   console.log(usage());
   process.exitCode = 0;
+} else if (auth === null) {
+  // The message that names the missing variable is already printed.
+  process.exitCode = 2;
 } else {
-  const started = await startUiServer({ port: args.port, deps });
+  const started = await startUiServer({ port: args.port, deps, auth });
 
   console.log('MDL Logistics — consola de mantenimiento');
   console.log(`  ${started.url}`);
   console.log('  escucha solo en 127.0.0.1 porque esta pagina puede crear envios.');
+  console.log(`  entrada: ${started.url}/login (cookie de sesion de 30 dias, HttpOnly, Secure, SameSite=Strict)`);
   console.log(`  registros de ejecucion: ${RUN_RECORD_DIR}`);
   console.log(`  artefactos: ${ARTIFACTS_DIR} (se listan en la pagina; no se sirven por HTTP)`);
   console.log(`  historial del chequeo de sesion: ${SESSION_CHECK_HISTORY_PATH}`);

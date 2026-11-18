@@ -34,6 +34,7 @@ import { analyzeMessage, type ActionDeps, type UiExecutor } from '../../src/ui/a
 import { formValuesFromFields } from '../../src/ui/form';
 import { APP_VERSION } from '../../src/ui/page';
 import { HAPPY_MESSAGE } from './fixtures';
+import { TEST_AUTH, sessionCookieHeader } from './auth-fixtures';
 
 const REQUEST = (() => {
   const parsed = parseMessage(HAPPY_MESSAGE);
@@ -104,9 +105,11 @@ function deps(target: Box): ActionDeps {
 }
 
 function post(url: string, body: unknown): Promise<Response> {
+  // Every route below the login card requires the session cookie; the dispatcher
+  // answers 302/401 without one, which is asserted in tests/unit/auth.test.ts.
   return fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', cookie: sessionCookieHeader() },
     body: JSON.stringify(body),
   });
 }
@@ -145,7 +148,7 @@ test('neither the page nor the client script can open a native dialog', async ()
 test('create mode works without an approval hash or a token, and records no confirmation', async () => {
   const target = await box('create');
   const { startUiServer } = await import('../../src/ui/server');
-  const started = await startUiServer({ port: 0, deps: deps(target) });
+  const started = await startUiServer({ port: 0, deps: deps(target), auth: TEST_AUTH });
 
   try {
     const analyzed = await post(`${started.url}/api/analyze`, { message: HAPPY_MESSAGE });
@@ -179,7 +182,7 @@ test('create mode works without an approval hash or a token, and records no conf
 test('a message that already created a shipment is still refused, with nothing created twice', async () => {
   const target = await box('duplicate');
   const { startUiServer } = await import('../../src/ui/server');
-  const started = await startUiServer({ port: 0, deps: deps(target) });
+  const started = await startUiServer({ port: 0, deps: deps(target), auth: TEST_AUTH });
   const runId = '2026-01-01T00-00-00-000Z-duplicateaaaa';
 
   try {
@@ -234,7 +237,7 @@ test('a message that already created a shipment is still refused, with nothing c
 test('an unresolved prior attempt for the same message is still refused', async () => {
   const target = await box('unresolved');
   const { startUiServer } = await import('../../src/ui/server');
-  const started = await startUiServer({ port: 0, deps: deps(target) });
+  const started = await startUiServer({ port: 0, deps: deps(target), auth: TEST_AUTH });
   const runId = '2026-01-01T00-00-00-000Z-unresolvedaa';
 
   try {
@@ -275,7 +278,7 @@ test('an unresolved prior attempt for the same message is still refused', async 
 test('a dry run walks the panel and writes no record at all', async () => {
   const target = await box('dry-run');
   const { startUiServer } = await import('../../src/ui/server');
-  const started = await startUiServer({ port: 0, deps: deps(target) });
+  const started = await startUiServer({ port: 0, deps: deps(target), auth: TEST_AUTH });
 
   try {
     const response = await post(`${started.url}/api/run`, {

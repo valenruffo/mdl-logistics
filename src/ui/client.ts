@@ -15,7 +15,10 @@
  *   is written with `textContent`/`createElement`: pasted data, panel text, file
  *   names and record fields are never interpreted as HTML.
  * - **The rail is read-only** except for its own `Verificar ahora` button, which
- *   is the one control that opens a browser.
+ *   is the one control that opens a browser, and `Cerrar sesión`, which posts the
+ *   logout and returns to the login card.
+ * - **An expired session is not an error dialog.** A `401` from any call sends the
+ *   browser to `/login`: the operator sees the card, not a JSON reason in the rail.
  */
 export const CLIENT_JS = `(function () {
   'use strict';
@@ -56,6 +59,9 @@ export const CLIENT_JS = `(function () {
       body: JSON.stringify(body)
     }).then(function (response) {
       if (!response.ok) {
+        // The session expired or the cookie is gone: there is nothing to show in
+        // the page, so go back to the card that can establish a new one.
+        if (response.status === 401) document.location.assign('/login');
         return response.text().then(function (text) {
           // A 409 while another run holds the browser lock carries an actionable
           // sentence in "reason"; show that instead of the raw JSON.
@@ -618,6 +624,10 @@ export const CLIENT_JS = `(function () {
     if (statusId) setStatus(statusId, 'Leyendo el estado del agente…', null);
 
     fetch('/api/console', { method: 'GET' }).then(function (response) {
+      if (response.status === 401) {
+        document.location.assign('/login');
+        throw new Error('/api/console respondió 401');
+      }
       if (!response.ok) throw new Error('/api/console respondió ' + response.status);
       return response.json();
     }).then(function (data) {
@@ -655,11 +665,23 @@ export const CLIENT_JS = `(function () {
     });
   }
 
+  /** The one control that ends the session: post, then show the login card. */
+  function logout() {
+    var button = byId('logout');
+    button.disabled = true;
+    fetch('/api/logout', { method: 'POST' }).then(function () {
+      document.location.assign('/login');
+    }, function () {
+      document.location.assign('/login');
+    });
+  }
+
   byId('analyze').addEventListener('click', analyze);
   byId('message').addEventListener('input', updateMessageBadge);
   byId('create').addEventListener('click', function () { run('create'); });
   byId('dry-run').addEventListener('click', function () { run('dry-run'); });
   byId('session-check-run').addEventListener('click', runSessionCheck);
+  byId('logout').addEventListener('click', logout);
 
   updateMessageBadge();
   syncButtons();

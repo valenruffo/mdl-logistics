@@ -212,6 +212,7 @@ export const PAGE_HTML = `<!doctype html>
     </section>
 
     <footer><span id="rail-open">leyendo intentos…</span><span>v${APP_VERSION}</span></footer>
+    <button type="button" id="logout">Cerrar sesión</button>
   </aside>
 
   <main class="work">

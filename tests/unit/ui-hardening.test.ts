@@ -38,6 +38,7 @@ import {
 } from '../../src/ui/sessionCheck';
 import type { ActionDeps, UiExecutor } from '../../src/ui/actions';
 import { HAPPY_MESSAGE } from './fixtures';
+import { TEST_AUTH, authFetch, testContext } from './auth-fixtures';
 
 // ------------------------------------------------------------------ fixtures
 
@@ -181,15 +182,16 @@ test('a report full of recipient data contributes no text to /api/console, the p
     const started = await startUiServer({
       port: 0,
       deps: serverDeps(target, executor.executor, forbiddenRunner()),
+      auth: TEST_AUTH,
     });
 
     try {
-      const snapshotResponse = await fetch(`${started.url}/api/console`);
+      const snapshotResponse = await authFetch(`${started.url}/api/console`);
       assert.equal(snapshotResponse.status, 200);
       const snapshotText = await snapshotResponse.text();
 
-      const page = await fetch(`${started.url}/`);
-      const script = await fetch(`${started.url}/app.js`);
+      const page = await authFetch(`${started.url}/`);
+      const script = await authFetch(`${started.url}/app.js`);
       assert.equal(page.status, 200);
       assert.equal(script.status, 200);
       const pageText = await page.text();
@@ -253,6 +255,7 @@ test('a report full of recipient data contributes no text to /api/console, the p
             '/api/console',
             '',
             serverDeps(second, fakeExecutor().executor, forbiddenRunner()),
+            testContext(),
           );
           assert.equal(answer.status, 200);
           assert.doesNotMatch(answer.body, new RegExp(INVALID_REPORT_MARKER));
@@ -332,15 +335,16 @@ test('a check-history entry full of recipient data contributes no text to /api/c
     const started = await startUiServer({
       port: 0,
       deps: serverDeps(target, fakeExecutor().executor, runner),
+      auth: TEST_AUTH,
     });
 
     try {
-      const snapshotResponse = await fetch(`${started.url}/api/console`);
+      const snapshotResponse = await authFetch(`${started.url}/api/console`);
       assert.equal(snapshotResponse.status, 200);
       const snapshotText = await snapshotResponse.text();
 
-      const pageText = await (await fetch(`${started.url}/`)).text();
-      const scriptText = await (await fetch(`${started.url}/app.js`)).text();
+      const pageText = await (await authFetch(`${started.url}/`)).text();
+      const scriptText = await (await authFetch(`${started.url}/app.js`)).text();
 
       for (const [name, surface] of [
         ['/api/console', snapshotText],
@@ -378,7 +382,7 @@ test('a check-history entry full of recipient data contributes no text to /api/c
       assert.match(SESSION_CHECK_OUTPUT_NOTE, /historial/);
 
       // The POST route projects the check it just ran the same way...
-      const post = await fetch(`${started.url}/api/session-check`, { method: 'POST' });
+      const post = await authFetch(`${started.url}/api/session-check`, { method: 'POST' });
       assert.equal(post.status, 200);
       const postText = await post.text();
       assert.doesNotMatch(postText, new RegExp(RECIPIENT_MARKER), 'the just-run check is projected too');
@@ -413,6 +417,7 @@ test('an unparseable check history is reported as unparseable, by path, never an
       '/api/console',
       '',
       serverDeps(target, fakeExecutor().executor, forbiddenRunner()),
+      testContext(),
     );
     assert.equal(answer.status, 200);
     assert.doesNotMatch(answer.body, new RegExp(marker), 'the file bytes are never echoed');
@@ -446,16 +451,16 @@ test('a second browser request while one is running is a 409 that changes nothin
   };
 
   assert.equal(browserLock.free, true, 'the lock must be free before this test starts');
-  const started = await startUiServer({ port: 0, deps: serverDeps(target, executor.executor, runner) });
+  const started = await startUiServer({ port: 0, deps: serverDeps(target, executor.executor, runner), auth: TEST_AUTH });
 
   try {
-    const inFlight = fetch(`${started.url}/api/session-check`, { method: 'POST' });
+    const inFlight = authFetch(`${started.url}/api/session-check`, { method: 'POST' });
     await waitFor('the session check to start', () => runnerCalls === 1);
     assert.equal(browserLock.holder, 'session-check');
 
     // The same lock guards the shipment route, both modes.
     for (const mode of ['dry-run', 'create']) {
-      const refused = await fetch(`${started.url}/api/run`, {
+      const refused = await authFetch(`${started.url}/api/run`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ mode }),
@@ -470,7 +475,7 @@ test('a second browser request while one is running is a 409 that changes nothin
     }
 
     // A second check is refused too, and it does not start a second browser.
-    const secondCheck = await fetch(`${started.url}/api/session-check`, { method: 'POST' });
+    const secondCheck = await authFetch(`${started.url}/api/session-check`, { method: 'POST' });
     assert.equal(secondCheck.status, 409);
     assert.equal(((await secondCheck.json()) as { reason: string }).reason, LOCK_BUSY_MESSAGE);
     assert.equal(runnerCalls, 1, 'the refused request never reached the runner');
@@ -485,7 +490,7 @@ test('a second browser request while one is running is a 409 that changes nothin
     assert.equal(browserLock.free, true, 'a successful check releases the lock');
 
     // And the next request is served, so the process is not wedged.
-    const after = await fetch(`${started.url}/api/session-check`, { method: 'POST' });
+    const after = await authFetch(`${started.url}/api/session-check`, { method: 'POST' });
     assert.equal(after.status, 200);
   } finally {
     gate.resolve();
@@ -530,10 +535,10 @@ test('a throwing handler releases the lock, and so does an executor that throws 
     },
   };
 
-  const started = await startUiServer({ port: 0, deps: serverDeps(target, throwing, forbiddenRunner()) });
+  const started = await startUiServer({ port: 0, deps: serverDeps(target, throwing, forbiddenRunner()), auth: TEST_AUTH });
   try {
     const post = (): Promise<Response> =>
-      fetch(`${started.url}/api/run`, {
+      authFetch(`${started.url}/api/run`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ mode: 'create', message: HAPPY_MESSAGE, form }),

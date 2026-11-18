@@ -44,6 +44,7 @@ import {
   type SessionCheckFact,
 } from '../../src/ui/sessionCheck';
 import type { SessionCheckRunner } from '../../src/ui/sessionCheck';
+import { TEST_AUTH, authFetch, testContext } from './auth-fixtures';
 
 // ------------------------------------------------------------------ fixtures
 
@@ -339,11 +340,11 @@ test('no route answers with an artifact file, and no href points at one', async 
       },
     };
 
-    const started = await startUiServer({ port: 0, deps });
+    const started = await startUiServer({ port: 0, deps, auth: TEST_AUTH });
     try {
       for (const artifactPath of ARTIFACT_SHAPED_PATHS) {
         for (const method of ['GET', 'POST']) {
-          const response = await fetch(`${started.url}${artifactPath}`, method === 'GET' ? {} : { method });
+          const response = await authFetch(`${started.url}${artifactPath}`, method === 'GET' ? {} : { method });
           assert.equal(response.status, 404, `${method} ${artifactPath} answered ${response.status}`);
           const body = await response.text();
           assert.doesNotMatch(body, new RegExp(marker), `${method} ${artifactPath} must not serve the file`);
@@ -351,8 +352,8 @@ test('no route answers with an artifact file, and no href points at one', async 
         }
       }
 
-      const page = await fetch(`${started.url}/`);
-      const script = await fetch(`${started.url}/app.js`);
+      const page = await authFetch(`${started.url}/`);
+      const script = await authFetch(`${started.url}/app.js`);
       assert.equal(page.status, 200);
       assert.equal(script.status, 200);
 
@@ -376,8 +377,8 @@ test('no route answers with an artifact file, and no href points at one', async 
         assert.doesNotMatch(route.path, /artifact/i, `route ${route.path} must not serve artifacts`);
         assert.equal('prefix' in route, false, `route ${route.path} must not be a prefix`);
       }
-      assert.equal((await handleRequest('GET', '/artifacts/executor-fixture/trace.zip', '', deps)).status, 404);
-      assert.equal((await handleRequest('GET', '/artifacts/', '', deps)).status, 404);
+      assert.equal((await handleRequest('GET', '/artifacts/executor-fixture/trace.zip', '', deps, testContext())).status, 404);
+      assert.equal((await handleRequest('GET', '/artifacts/', '', deps, testContext())).status, 404);
     } finally {
       await started.close();
     }
