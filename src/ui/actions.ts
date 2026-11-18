@@ -44,15 +44,22 @@ import {
   type RunOutcomeRecord,
 } from '../cli/runRecord';
 import { CARRIER_NAME } from '../core/carrier';
+import { DEFAULT_CONFIG } from '../core/config';
 import { parseMessage } from '../core/parse-message';
 import { PROVINCE_OPTIONS } from '../core/provinces';
-import type { ParseWarning, ShipmentRequest } from '../core/types';
+import type { MessageModality, ParseWarning, ShipmentRequest } from '../core/types';
 import { approvalPayloadFromRequest } from '../executor/approval';
 import { labelUnpaidProblem, type CardReadback } from '../executor/envioNube';
 import { ExecutorError, UnknownOutcomeError, detailsOf, messageOf } from '../executor/errors';
 import type { CreateRunResult, DryRunResult, RunOptions } from '../executor/run';
 import type { ConsoleOverrides } from './console';
-import { formFieldsFromRequest, requestFromForm, type FormField, type FormIssue, type FormValues } from './form';
+import {
+  formFieldsForBothModalities,
+  requestFromForm,
+  type FormField,
+  type FormIssue,
+  type FormValues,
+} from './form';
 
 /** The executor surface the page needs. Injected, so tests never open a browser. */
 export interface UiExecutor {
@@ -137,7 +144,16 @@ export interface AnalyzeRejected {
 /** A parsed message: the prefilled, editable preview. */
 export interface AnalyzeParsed {
   status: 'parsed';
+  /** The modality the message declared (absence of the line = domicilio). */
+  modalidad: MessageModality;
+  /** The field list of the parsed modality, prefilled and editable. */
   fields: FormField[];
+  /**
+   * Both modality field lists, so the page's Modalidad control re-derives the
+   * visible field set without a new parse. Only data that genuinely exists is
+   * prefilled in the non-parsed list; the rest stays empty for the operator.
+   */
+  fieldsByModalidad: Record<MessageModality, FormField[]>;
   /** The panel's own province options, so the select can never offer a wrong one. */
   provinces: { code: string; name: string }[];
   warnings: WarningItem[];
@@ -167,7 +183,6 @@ function warningItem(warning: ParseWarning): WarningItem {
  */
 export function analyzeMessage(message: string): AnalyzeResponse {
   const parsed = parseMessage(message);
-
   if (!parsed.ok) {
     return {
       status: 'rejected',
@@ -186,9 +201,13 @@ export function analyzeMessage(message: string): AnalyzeResponse {
     };
   }
 
+  const fieldsByModalidad = formFieldsForBothModalities(parsed.value, DEFAULT_CONFIG);
+
   return {
     status: 'parsed',
-    fields: formFieldsFromRequest(parsed.value),
+    modalidad: parsed.value.modality,
+    fields: fieldsByModalidad[parsed.value.modality],
+    fieldsByModalidad,
     provinces: PROVINCE_OPTIONS.map((option) => ({ code: option.code, name: option.name })),
     warnings: parsed.warnings.map(warningItem),
     carrier: CARRIER_NAME,
@@ -212,7 +231,15 @@ export interface RunInput {
 }
 
 /** A refusal raised by a gate that prevents a duplicate shipment. */
-export type RefusalStage = 'prior-attempt';
+export type RefusalStage = 'prior-attempt' | 'sucursal-not-implemented';
+
+/**
+ * The exact inline wording shown when a sucursal run is attempted before the
+ * executor slice lands. The preview stays honest: parsing and editing work,
+ * the run does not pretend to.
+ */
+export const SUCURSAL_RUN_REFUSAL =
+  'la carga de envíos a sucursal todavía no está implementada en esta versión';
 
 export interface RefusedResponse {
   status: 'refused';
@@ -310,6 +337,12 @@ function recordNote(recordPath: string): string {
 export async function runAttempt(input: RunInput, deps: ActionDeps): Promise<RunResponse> {
   const built = requestFromForm(input.form);
   if (!built.ok) return { status: 'invalid-form', errors: built.errors };
+
+  // Sucursal runs are refused before anything else happens: no payload hash,
+  // no record, no browser. The executor slice lands after a DOM discovery pass.
+  if (built.value.modality === 'sucursal') {
+    return { status: 'refused', stage: 'sucursal-not-implemented', reason: SUCURSAL_RUN_REFUSAL, details: [] };
+  }
 
   const request: ShipmentRequest = built.value;
   // Integrity only: the executor recomputes this from the panel readback, so a

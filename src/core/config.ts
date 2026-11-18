@@ -23,7 +23,18 @@ export interface PackageDefaults {
 
 /** Validated project configuration. */
 export interface ProjectConfig {
+  /** Box defaults shared by both modalities: dimensions in cm, weight in g. */
   package: PackageDefaults;
+  /**
+   * Sucursal-only declared policy. The declared value is **required-with-default**
+   * for sucursal: it is prefilled from here and shown editable in the preview
+   * (never silently applied without being visible). Domicilio keeps its optional,
+   * empty declared value (`package.declaredValueArs`).
+   */
+  sucursal: {
+    /** The standing declared amount, in ARS. */
+    declaredValueArs: number;
+  };
 }
 
 /** Raised when the declared configuration cannot be used to fill the panel. */
@@ -104,11 +115,38 @@ export function validateConfig(candidate: unknown): ProjectConfig {
 
   if (issues.length > 0) throw new ConfigError(issues);
 
+  // Sucursal's declared value is required-with-default: a config without it is
+  // an incomplete declaration, not one to fill with a silent fallback.
+  const rawSucursal = root['sucursal'];
+  const sucursalSource = isRecord(rawSucursal) ? rawSucursal : null;
+  let sucursalDeclaredValueArs: number | undefined;
+  if (sucursalSource === null) {
+    issues.push('sucursal must be an object with declaredValueArs (the standing declared amount, in ARS)');
+  } else {
+    const rawSucursalDeclaredValue = sucursalSource['declaredValueArs'];
+    if (
+      typeof rawSucursalDeclaredValue !== 'number' ||
+      !Number.isFinite(rawSucursalDeclaredValue) ||
+      rawSucursalDeclaredValue < 0
+    ) {
+      issues.push(
+        `sucursal.declaredValueArs must be a non-negative finite amount in ARS (received ${JSON.stringify(rawSucursalDeclaredValue) ?? 'undefined'})`,
+      );
+    } else {
+      sucursalDeclaredValueArs = rawSucursalDeclaredValue;
+    }
+  }
+
+  if (issues.length > 0) throw new ConfigError(issues);
+
   const [heightCm, widthCm, depthCm, weightG] = measures as [number, number, number, number];
   const packageDefaults: PackageDefaults = { heightCm, widthCm, depthCm, weightG };
   if (declaredValueArs !== undefined) packageDefaults.declaredValueArs = declaredValueArs;
 
-  return { package: packageDefaults };
+  return {
+    package: packageDefaults,
+    sucursal: { declaredValueArs: sucursalDeclaredValueArs as number },
+  };
 }
 
 /**
@@ -122,4 +160,7 @@ export function validateConfig(candidate: unknown): ProjectConfig {
  */
 export const DEFAULT_CONFIG: ProjectConfig = validateConfig({
   package: { heightCm: 20, widthCm: 25, depthCm: 10, weightG: 700 },
+  // The operator's standing declared value for sucursal shipments, in ARS.
+  // Prefilled and shown editable in the preview; never applied silently.
+  sucursal: { declaredValueArs: 100000 },
 });

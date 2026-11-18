@@ -20,6 +20,15 @@ export const MESSAGE_LABELS = {
     recipient: 'Datos del destinatario',
   },
   fields: {
+    /** Format-version discriminator; its absence means the old (v1) format. */
+    modalidad: 'Modalidad',
+    /** Sucursal-only fields. */
+    sucursal: 'Sucursal (nombre)',
+    nombre: 'Nombre',
+    apellido: 'Apellido',
+    email: 'Email',
+    telefono: 'Teléfono',
+    /** Domicilio-only fields. */
     province: 'Provincia',
     zipCode: 'Código postal',
     city: 'Ciudad',

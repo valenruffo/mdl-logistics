@@ -153,6 +153,13 @@ export const PAGE_HTML = `<!doctype html>
   .grid .wide { grid-column:1/-1; }
   .group { grid-column:1/-1; font-size:11px; text-transform:uppercase; letter-spacing:.09em; color:var(--muted); font-weight:600; margin:6px 0 -2px; }
 
+  /* The Modalidad segmented control: one decision, two equal options. */
+  .segmented { display:flex; gap:10px; flex-wrap:wrap; }
+  .segmented label { display:inline-flex; align-items:center; gap:8px; border:1px solid var(--line);
+    background:var(--field); border-radius:8px; padding:8px 14px; cursor:pointer; font-size:13.5px; }
+  .segmented input { width:auto; margin:0; accent-color:var(--accent); cursor:pointer; }
+  .segmented label:hover { border-color:var(--ink); }
+
   .quote { display:flex; gap:10px; align-items:center; font-size:13.5px; color:var(--ok-text); margin-top:18px; padding-top:16px; border-top:1px solid var(--line); }
   .actions { display:flex; gap:10px; align-items:center; margin-top:18px; flex-wrap:wrap; }
   button.primary, button.ghost { font:600 14px/1 var(--sans); border-radius:8px; padding:11px 18px; cursor:pointer; border:1px solid transparent; }

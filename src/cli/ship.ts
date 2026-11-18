@@ -160,6 +160,17 @@ async function main(): Promise<number> {
   }
 
   const request = parsed.value;
+
+  // The CLI drives the domicilio journey only. A sucursal message stops here,
+  // before anything is hashed: the sucursal executor comes after a DOM
+  // discovery pass, and building a domicilio payload from sucursal data would
+  // be exactly the invented data R12 forbids.
+  if (request.modality === 'sucursal') {
+    console.error('\nREFUSED: este mensaje es de envío a sucursal y la carga a sucursal todavía no está implementada en esta versión');
+    console.error('  nothing was hashed, the panel was not opened and nothing was created');
+    return 2;
+  }
+
   const payload = approvalPayloadFromRequest(request, CARRIER_NAME);
   const approvalHash = computeApprovalHash(request);
   const messageHash = messageFingerprint(messageText);

@@ -192,14 +192,19 @@ test('a message the parser rejects renders every reason and leaves nothing actio
     assert.match(item.reason, /Código postal/);
   }
 
-  assert.equal(analyzed.invalid.length, 1);
-  const [invalid] = analyzed.invalid;
+  assert.equal(analyzed.invalid.length, 2);
+  // `Teléfono` is now a known label — of the sucursal format — so a domicilio
+  // message carrying it is a named rejection, not an unknown label (R12).
+  const telefono = analyzed.invalid.find((item) => item.field === 'telefono');
+  assert.ok(telefono, 'the sucursal-only label is rejected with its own reason');
+  assert.match(telefono.reason, /sucursal format/);
+
+  const invalid = analyzed.invalid.find((item) => item.field === 'province');
   assert.ok(invalid);
-  assert.equal(invalid.field, 'province');
   assert.match(invalid.reason, /ambiguous/i, 'the reason is the parser\'s own, verbatim');
   assert.match(invalid.value, /Bs As/);
 
-  assert.deepEqual(analyzed.unknownLabels, ['Teléfono']);
+  assert.deepEqual(analyzed.unknownLabels, []);
 
   // Nothing to approve, nothing to run: the rejection response has no form.
   assert.equal('fields' in analyzed, false);
@@ -213,6 +218,7 @@ test('a parsed message prefills every panel field and marks the derived ones', (
 
   const keys = analyzed.fields.map((field) => field.key);
   assert.deepEqual(keys, [
+    'modalidad',
     'zipCode',
     'province',
     'city',

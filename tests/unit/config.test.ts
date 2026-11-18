@@ -22,6 +22,7 @@ test('unit suffixes are part of the field names, so grams cannot be read as kilo
 test('a valid override is accepted and normalized to the declared unit names', () => {
   const config = validateConfig({
     package: { heightCm: 30, widthCm: 20, depthCm: 10, weightG: 750, declaredValueArs: 12500 },
+    sucursal: { declaredValueArs: 100000 },
   });
 
   assert.deepEqual(config.package, {
@@ -38,6 +39,7 @@ test('a zero, negative or non-finite measure is rejected with every issue listed
   try {
     validateConfig({
       package: { heightCm: 0, widthCm: -5, depthCm: '10', weightG: Number.NaN },
+      sucursal: { declaredValueArs: 100000 },
     });
   } catch (caught) {
     error = caught;
@@ -53,8 +55,10 @@ test('a zero, negative or non-finite measure is rejected with every issue listed
 
 test('declared value is optional but must be non-negative when present', () => {
   assert.equal(
-    validateConfig({ package: { heightCm: 10, widthCm: 10, depthCm: 10, weightG: 100 } }).package
-      .declaredValueArs,
+    validateConfig({
+      package: { heightCm: 10, widthCm: 10, depthCm: 10, weightG: 100 },
+      sucursal: { declaredValueArs: 100000 },
+    }).package.declaredValueArs,
     undefined,
   );
 
@@ -62,6 +66,7 @@ test('declared value is optional but must be non-negative when present', () => {
     () =>
       validateConfig({
         package: { heightCm: 10, widthCm: 10, depthCm: 10, weightG: 100, declaredValueArs: -1 },
+        sucursal: { declaredValueArs: 100000 },
       }),
     ConfigError,
   );
@@ -75,7 +80,50 @@ test('a config without a package block is rejected', () => {
 test('unknown extra fields are dropped instead of leaking into the payload', () => {
   const config = validateConfig({
     package: { heightCm: 10, widthCm: 10, depthCm: 10, weightG: 100, weightKg: 1 },
+    sucursal: { declaredValueArs: 100000 },
   });
 
   assert.deepEqual(Object.keys(config.package).sort(), ['depthCm', 'heightCm', 'weightG', 'widthCm']);
+});
+
+// ------------------------------------------------- sucursal's declared policy
+
+test('the sucursal default declared value is the operator\'s standing amount, visible in config', () => {
+  assert.equal(DEFAULT_CONFIG.sucursal.declaredValueArs, 100000);
+  assert.equal(typeof DEFAULT_CONFIG.sucursal.declaredValueArs, 'number');
+  // Domicilio keeps its optional, empty declared value.
+  assert.equal(DEFAULT_CONFIG.package.declaredValueArs, undefined);
+});
+
+test('a config without the sucursal block is rejected: the default is declared, never implied', () => {
+  assert.throws(
+    () => validateConfig({ package: { heightCm: 10, widthCm: 10, depthCm: 10, weightG: 100 } }),
+    ConfigError,
+  );
+  assert.throws(
+    () => validateConfig({ package: { heightCm: 10, widthCm: 10, depthCm: 10, weightG: 100 }, sucursal: {} }),
+    ConfigError,
+  );
+});
+
+test('the sucursal declared value must be a non-negative finite amount in ARS', () => {
+  for (const bad of [-1, '100000', Number.NaN, Number.POSITIVE_INFINITY, null]) {
+    assert.throws(
+      () =>
+        validateConfig({
+          package: { heightCm: 10, widthCm: 10, depthCm: 10, weightG: 100 },
+          sucursal: { declaredValueArs: bad as never },
+        }),
+      ConfigError,
+      `expected ${String(bad)} to be rejected`,
+    );
+  }
+
+  assert.equal(
+    validateConfig({
+      package: { heightCm: 10, widthCm: 10, depthCm: 10, weightG: 100 },
+      sucursal: { declaredValueArs: 0 },
+    }).sucursal.declaredValueArs,
+    0,
+  );
 });

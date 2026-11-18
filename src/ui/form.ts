@@ -5,8 +5,7 @@
  * that will be typed, may edit any of them, and exactly the values that are on
  * screen are what `runAttempt` writes to the panel. So this is a *data* model, not
  * markup: the page renders whatever `formFieldsFromRequest` returns, and every
- * run direction rebuilds a `ShipmentRequest` from the posted values with
- * `requestFromForm`.
+ * run direction rebuilds a request from the posted values with `requestFromForm`.
  *
  * Two rules make the round trip honest:
  *
@@ -15,19 +14,35 @@
  *   `address.address` and `customer.name` + `customer.lastName` are panel fields.
  * - Nothing is defaulted here. A missing required value is an error with a
  *   reason; the only values that exist without the operator typing them are the
- *   package defaults the project declares (S7), which are shown in the form.
+ *   package defaults the project declares (S7) and — for sucursal only — the
+ *   declared value (required-with-default), which is prefilled and shown
+ *   editable, never applied silently.
  *
  * `Provincia` is the panel's own `<select>`: the form carries the option *name*
  * and `resolveProvince` maps it back to the letter code the panel writes, so the
  * alias table (and its ambiguity refusal) is reused instead of duplicated.
+ *
+ * The form is **modality-aware**: `Modalidad` is the first field (a segmented
+ * control on the page) and switching it re-derives the visible field set —
+ * domicilio shows the address group, sucursal shows `Sucursal` + postal code and
+ * hides the address group. `formFieldsForBothModalities` hands the page both
+ * sets so the switch needs no new server round trip.
  */
-import type { PackageDefaults } from '../core/config';
+import { DEFAULT_CONFIG, type PackageDefaults, type ProjectConfig } from '../core/config';
 import { POSTAL_CODE_HINT, isPostalCode, normalizePostalCode } from '../core/postal-code';
 import { resolveProvince } from '../core/provinces';
-import type { Derivation, PanelAnchor, ShipmentRequest } from '../core/types';
+import type {
+  AnyShipmentRequest,
+  Derivation,
+  MessageModality,
+  PanelAnchor,
+  ShipmentRequest,
+  SucursalShipmentRequest,
+} from '../core/types';
 
 /** The editable fields, in the order the page shows them. */
 export type FormKey =
+  | 'modalidad'
   | 'zipCode'
   | 'province'
   | 'city'
@@ -35,8 +50,11 @@ export type FormKey =
   | 'number'
   | 'complement'
   | 'neighborhood'
+  | 'sucursal'
   | 'name'
   | 'lastName'
+  | 'email'
+  | 'telefono'
   | 'height'
   | 'width'
   | 'depth'
@@ -44,23 +62,31 @@ export type FormKey =
   | 'declaredValue';
 
 /** How the page must render one field. */
-export type FormKind = 'text' | 'province' | 'measure';
+export type FormKind = 'text' | 'province' | 'measure' | 'modalidad';
 
 /**
- * The three groups the artboard draws, plus the optional declaration.
+ * The groups the artboard draws, plus the optional declaration.
  *
  * Grouping is data, not markup: the page renders whatever groups the form model
  * declares, so a field can be moved between groups without touching `client.ts`.
  */
-export type FormGroup = 'destino' | 'destinatario' | 'paquete' | 'declaracion';
+export type FormGroup = 'modalidad' | 'destino' | 'destinatario' | 'paquete' | 'declaracion';
 
 /** The heading each group prints, in the order the page shows them. */
 export const FORM_GROUP_LABELS: Readonly<Record<FormGroup, string>> = {
+  modalidad: 'Modalidad de envío',
   destino: 'Destino',
   destinatario: 'Destinatario',
   paquete: 'Paquete · valores por defecto',
   declaracion: 'Monto declarado (opcional)',
 };
+
+/**
+ * Placeholder for the sucursal field's panel anchor: the real anchors for the
+ * sucursal dropdown are decided by the executor slice, after a DOM discovery
+ * pass. The form never claims an anchor it has not observed.
+ */
+export const SUCURSAL_ANCHOR_PENDING = '(pendiente de descubrir en el panel)';
 
 interface FormSpec {
   key: FormKey;
@@ -72,23 +98,39 @@ interface FormSpec {
   /** Unit shown next to the input. `''` for text fields. */
   unit: string;
   kind: FormKind;
-  required: boolean;
+  /** Whether the field is required, per modality. */
+  requiredByModality: Record<MessageModality, boolean>;
+  /** The modalities whose form carries this field at all. */
+  modalities: readonly MessageModality[];
   group: FormGroup;
   /** True when the field spans both columns of the grid. */
   wide: boolean;
   help: string;
 }
 
+const BOTH_MODALITIES: readonly MessageModality[] = ['domicilio', 'sucursal'];
+const DOMICILIO_ONLY: readonly MessageModality[] = ['domicilio'];
+const SUCURSAL_ONLY: readonly MessageModality[] = ['sucursal'];
+
 /**
  * Order matters: it is the reading order of the preview, and it follows the
- * artboard (`04-mesa-con-rail.html`) field for field: the postal code, the
- * province, the city, the neighbourhood, the street, the number, then the
- * optional apartment.
- * `required` mirrors the panel where it is known (`Apellido` and `Departamento`
- * are marked optional there; `Barrio` carries no marker, so it is treated as
- * required — plan §4c).
+ * artboard (`04-mesa-con-rail.html`) field for field. `Modalidad` comes first:
+ * switching it re-derives which of the two lists below is on screen.
  */
 const FORM_SPECS: readonly FormSpec[] = [
+  {
+    key: 'modalidad',
+    label: 'Modalidad',
+    panelField: '(decisión de formato: domicilio | sucursal)',
+    anchor: null,
+    unit: '',
+    kind: 'modalidad',
+    requiredByModality: { domicilio: true, sucursal: true },
+    modalities: BOTH_MODALITIES,
+    group: 'modalidad',
+    wide: true,
+    help: 'define qué campos se muestran; los mensajes viejos sin Modalidad son domicilio',
+  },
   {
     key: 'zipCode',
     label: 'Código postal',
@@ -96,7 +138,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: 'zipCode',
     unit: '',
     kind: 'text',
-    required: true,
+    requiredByModality: { domicilio: true, sucursal: true },
+    modalities: BOTH_MODALITIES,
     group: 'destino',
     wide: false,
     help: '4 dígitos (1901) u 8 caracteres CPA (B1900ABC)',
@@ -108,7 +151,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: 'address.province',
     unit: '',
     kind: 'province',
-    required: true,
+    requiredByModality: { domicilio: true, sucursal: false },
+    modalities: DOMICILIO_ONLY,
     group: 'destino',
     wide: false,
     help: 'se escribe por código y se relee por nombre',
@@ -120,7 +164,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: 'address.city',
     unit: '',
     kind: 'text',
-    required: true,
+    requiredByModality: { domicilio: true, sucursal: false },
+    modalities: DOMICILIO_ONLY,
     group: 'destino',
     wide: false,
     help: 'texto libre en el panel',
@@ -132,7 +177,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: 'address.neighborhood',
     unit: '',
     kind: 'text',
-    required: true,
+    requiredByModality: { domicilio: true, sucursal: false },
+    modalities: DOMICILIO_ONLY,
     group: 'destino',
     wide: false,
     help: 'el panel no lo marca opcional',
@@ -144,7 +190,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: 'address.address',
     unit: '',
     kind: 'text',
-    required: true,
+    requiredByModality: { domicilio: true, sucursal: false },
+    modalities: DOMICILIO_ONLY,
     group: 'destino',
     wide: false,
     help: '',
@@ -156,7 +203,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: 'address.number',
     unit: '',
     kind: 'text',
-    required: true,
+    requiredByModality: { domicilio: true, sucursal: false },
+    modalities: DOMICILIO_ONLY,
     group: 'destino',
     wide: false,
     help: 'campo separado de la calle',
@@ -168,10 +216,24 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: 'address.complement',
     unit: '',
     kind: 'text',
-    required: false,
+    requiredByModality: { domicilio: false, sucursal: false },
+    modalities: DOMICILIO_ONLY,
     group: 'destino',
     wide: true,
     help: 'opcional en el panel',
+  },
+  {
+    key: 'sucursal',
+    label: 'Sucursal',
+    panelField: SUCURSAL_ANCHOR_PENDING,
+    anchor: null,
+    unit: '',
+    kind: 'text',
+    requiredByModality: { domicilio: false, sucursal: true },
+    modalities: SUCURSAL_ONLY,
+    group: 'destino',
+    wide: true,
+    help: 'texto libre; se valida contra el dropdown del panel en una etapa posterior',
   },
   {
     key: 'name',
@@ -180,7 +242,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: 'customer.name',
     unit: '',
     kind: 'text',
-    required: true,
+    requiredByModality: { domicilio: true, sucursal: true },
+    modalities: BOTH_MODALITIES,
     group: 'destinatario',
     wide: false,
     help: '',
@@ -192,7 +255,34 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: 'customer.lastName',
     unit: '',
     kind: 'text',
-    required: false,
+    requiredByModality: { domicilio: false, sucursal: false },
+    modalities: BOTH_MODALITIES,
+    group: 'destinatario',
+    wide: false,
+    help: 'opcional en el panel',
+  },
+  {
+    key: 'email',
+    label: 'Email',
+    panelField: 'customer.email',
+    anchor: null,
+    unit: '',
+    kind: 'text',
+    requiredByModality: { domicilio: false, sucursal: false },
+    modalities: SUCURSAL_ONLY,
+    group: 'destinatario',
+    wide: false,
+    help: 'opcional en el panel',
+  },
+  {
+    key: 'telefono',
+    label: 'Teléfono',
+    panelField: 'customer.phoneNumber',
+    anchor: null,
+    unit: '',
+    kind: 'text',
+    requiredByModality: { domicilio: false, sucursal: false },
+    modalities: SUCURSAL_ONLY,
     group: 'destinatario',
     wide: false,
     help: 'opcional en el panel',
@@ -204,7 +294,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: null,
     unit: 'cm',
     kind: 'measure',
-    required: true,
+    requiredByModality: { domicilio: true, sucursal: true },
+    modalities: BOTH_MODALITIES,
     group: 'paquete',
     wide: false,
     help: 'valor declarado por el proyecto (S7)',
@@ -216,7 +307,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: null,
     unit: 'cm',
     kind: 'measure',
-    required: true,
+    requiredByModality: { domicilio: true, sucursal: true },
+    modalities: BOTH_MODALITIES,
     group: 'paquete',
     wide: false,
     help: 'valor declarado por el proyecto (S7)',
@@ -228,7 +320,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: null,
     unit: 'cm',
     kind: 'measure',
-    required: true,
+    requiredByModality: { domicilio: true, sucursal: true },
+    modalities: BOTH_MODALITIES,
     group: 'paquete',
     wide: false,
     help: 'valor declarado por el proyecto (S7)',
@@ -240,7 +333,8 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: null,
     unit: 'g',
     kind: 'measure',
-    required: true,
+    requiredByModality: { domicilio: true, sucursal: true },
+    modalities: BOTH_MODALITIES,
     group: 'paquete',
     wide: false,
     help: 'el panel lee gramos, no kilos',
@@ -252,12 +346,53 @@ const FORM_SPECS: readonly FormSpec[] = [
     anchor: null,
     unit: '$',
     kind: 'measure',
-    required: false,
+    requiredByModality: { domicilio: false, sucursal: true },
+    modalities: BOTH_MODALITIES,
     group: 'declaracion',
     wide: true,
-    help: 'opcional en el panel',
+    help: 'opcional en el panel para domicilio; para sucursal lo prellena el valor del proyecto y se muestra editable',
   },
 ];
+
+/** The reading order of the domicilio form. */
+const DOMICILIO_FIELD_ORDER: readonly FormKey[] = [
+  'modalidad',
+  'zipCode',
+  'province',
+  'city',
+  'neighborhood',
+  'address',
+  'number',
+  'complement',
+  'name',
+  'lastName',
+  'height',
+  'width',
+  'depth',
+  'weight',
+  'declaredValue',
+];
+
+/** The reading order of the sucursal form: no address group, sucursal + CP instead. */
+const SUCURSAL_FIELD_ORDER: readonly FormKey[] = [
+  'modalidad',
+  'zipCode',
+  'sucursal',
+  'name',
+  'lastName',
+  'email',
+  'telefono',
+  'height',
+  'width',
+  'depth',
+  'weight',
+  'declaredValue',
+];
+
+const FIELD_ORDER: Readonly<Record<MessageModality, readonly FormKey[]>> = {
+  domicilio: DOMICILIO_FIELD_ORDER,
+  sucursal: SUCURSAL_FIELD_ORDER,
+};
 
 /** One row of the form, as the page receives it. */
 export interface FormField {
@@ -288,7 +423,7 @@ export interface FormIssue {
 }
 
 export type FormBuildResult =
-  | { ok: true; value: ShipmentRequest; values: Record<FormKey, string> }
+  | { ok: true; value: AnyShipmentRequest; values: Record<FormKey, string> }
   | { ok: false; errors: FormIssue[] };
 
 const SPEC_BY_KEY = new Map<FormKey, FormSpec>(FORM_SPECS.map((spec) => [spec.key, spec]));
@@ -314,39 +449,114 @@ function text(value: number | undefined): string {
   return value === undefined ? '' : String(value);
 }
 
-/** Prefills the editable form from the parsed request (S3, S7). */
-export function formFieldsFromRequest(request: ShipmentRequest): FormField[] {
-  const values: Record<FormKey, string> = {
+/** The raw text values of one modality's form, prefilled from a parsed request. */
+function valuesForModalidad(
+  modality: MessageModality,
+  request: AnyShipmentRequest,
+  config: ProjectConfig,
+): Record<FormKey, string> {
+  const box = request.box;
+  if (modality === 'sucursal') {
+    const sucursal = request.modality === 'sucursal' ? request : null;
+    return {
+      modalidad: 'sucursal',
+      zipCode: request.zipCode,
+      province: '',
+      city: '',
+      address: '',
+      number: '',
+      complement: '',
+      neighborhood: '',
+      // Never invented: a domicilio parse carries no sucursal data, so the
+      // operator fills it; only the config's own default is prefilled.
+      sucursal: sucursal?.sucursal ?? '',
+      name: request.customer.name,
+      lastName: request.customer.lastName ?? '',
+      email: sucursal?.customer.email ?? '',
+      telefono: sucursal?.customer.phone ?? '',
+      height: text(box.heightCm),
+      width: text(box.widthCm),
+      depth: text(box.depthCm),
+      weight: text(box.weightG),
+      // Required-with-default for sucursal: prefilled from config, visible and
+      // editable in the preview, never silent.
+      declaredValue: text(config.sucursal.declaredValueArs),
+    };
+  }
+  const domicilio = request.modality === 'domicilio' ? request : null;
+  return {
+    modalidad: 'domicilio',
     zipCode: request.zipCode,
-    province: request.address.province.name,
-    city: request.address.city,
-    address: request.address.address,
-    number: request.address.number,
-    complement: request.address.complement ?? '',
-    neighborhood: request.address.neighborhood,
+    province: domicilio?.address.province.name ?? '',
+    city: domicilio?.address.city ?? '',
+    address: domicilio?.address.address ?? '',
+    number: domicilio?.address.number ?? '',
+    complement: domicilio?.address.complement ?? '',
+    neighborhood: domicilio?.address.neighborhood ?? '',
+    sucursal: '',
     name: request.customer.name,
     lastName: request.customer.lastName ?? '',
-    height: text(request.box.heightCm),
-    width: text(request.box.widthCm),
-    depth: text(request.box.depthCm),
-    weight: text(request.box.weightG),
-    declaredValue: text(request.box.declaredValueArs),
+    email: '',
+    telefono: '',
+    height: text(box.heightCm),
+    width: text(box.widthCm),
+    depth: text(box.depthCm),
+    weight: text(box.weightG),
+    // Domicilio keeps its optional, empty declared value.
+    declaredValue: domicilio ? text(domicilio.box.declaredValueArs) : '',
   };
+}
 
-  return FORM_SPECS.map((spec) => ({
-    key: spec.key,
-    label: spec.label,
-    panelField: spec.panelField,
-    unit: spec.unit,
-    kind: spec.kind,
-    required: spec.required,
-    group: spec.group,
-    groupLabel: FORM_GROUP_LABELS[spec.group],
-    wide: spec.wide,
-    help: spec.help,
-    value: values[spec.key],
-    derived: request.derived.filter((derivation) => derivationAnchorField(derivation) === spec.key),
-  }));
+function fieldsForModalidad(
+  modality: MessageModality,
+  values: Record<FormKey, string>,
+  derivations: readonly Derivation[],
+): FormField[] {
+  return FIELD_ORDER[modality].map((key) => {
+    const spec = specOf(key);
+    return {
+      key: spec.key,
+      label: spec.label,
+      panelField: spec.panelField,
+      unit: spec.unit,
+      kind: spec.kind,
+      required: spec.requiredByModality[modality],
+      group: spec.group,
+      groupLabel: FORM_GROUP_LABELS[spec.group],
+      wide: spec.wide,
+      help: spec.help,
+      value: values[spec.key],
+      derived: derivations.filter((derivation) => derivationAnchorField(derivation) === spec.key),
+    };
+  });
+}
+
+/** Prefills the editable form from the parsed request, for its modality (S3, S7). */
+export function formFieldsFromRequest(request: AnyShipmentRequest): FormField[] {
+  return fieldsForModalidad(request.modality, valuesForModalidad(request.modality, request, DEFAULT_CONFIG), request.derived);
+}
+
+/**
+ * Both modality forms, prefilled from one parsed request.
+ *
+ * The page holds both lists so switching the `Modalidad` control re-derives the
+ * visible field set without a new parse. Only data that genuinely exists is
+ * prefilled: a domicilio parse carries no sucursal data (the sucursal field
+ * stays empty for the operator), and a sucursal parse carries no domicilio
+ * address data (the address group stays empty). The declared value takes the
+ * declared policy of each modality: optional and empty for domicilio, the
+ * project's required-with-default for sucursal.
+ */
+export function formFieldsForBothModalities(
+  request: AnyShipmentRequest,
+  config: ProjectConfig = DEFAULT_CONFIG,
+): Record<MessageModality, FormField[]> {
+  const domicilioValues = valuesForModalidad('domicilio', request, config);
+  const sucursalValues = valuesForModalidad('sucursal', request, config);
+  return {
+    domicilio: fieldsForModalidad('domicilio', domicilioValues, request.modality === 'domicilio' ? request.derived : []),
+    sucursal: fieldsForModalidad('sucursal', sucursalValues, request.modality === 'sucursal' ? request.derived : []),
+  };
 }
 
 /** The raw values of a rendered form, so a page can post them back unchanged. */
@@ -378,13 +588,33 @@ const MEASURE_PATTERN = /^\d+(?:\.\d+)?$/;
  * a refusal, never a default: a blank required field, an unknown province, an
  * unusable postal code or a non-positive measure rejects the whole form with
  * every issue named at once.
+ *
+ * The modality decides which required set applies. A posted form without a
+ * readable `Modalidad` is treated as the old format (domicilio) — the same
+ * format-version rule the parser applies to the message itself.
  */
 export function requestFromForm(values: FormValues): FormBuildResult {
+  const modalidad = collapse(readValue(values, 'modalidad'));
+  if (modalidad === 'sucursal') return sucursalRequestFromForm(values);
+  if (modalidad === '' || modalidad === 'domicilio') return domicilioRequestFromForm(values);
+  return {
+    ok: false,
+    errors: [
+      {
+        field: 'modalidad',
+        message: `«Modalidad» debe ser «domicilio» o «sucursal» (recibido «${modalidad}»)`,
+      },
+    ],
+  };
+}
+
+function domicilioRequestFromForm(values: FormValues): FormBuildResult {
   const errors: FormIssue[] = [];
+  const requiredOf = (key: FormKey): boolean => specOf(key).requiredByModality['domicilio'];
 
   const textField = (key: FormKey): string => {
     const value = collapse(readValue(values, key));
-    if (value === '' && specOf(key).required) {
+    if (value === '' && requiredOf(key)) {
       errors.push({ field: key, message: `«${specOf(key).label}» es obligatorio` });
     }
     return value;
@@ -416,7 +646,7 @@ export function requestFromForm(values: FormValues): FormBuildResult {
     const spec = specOf(key);
     const raw = collapse(readValue(values, key));
     if (raw === '') {
-      if (spec.required) {
+      if (requiredOf(key)) {
         errors.push({ field: key, message: `«${spec.label}» es obligatorio (en ${spec.unit})` });
       }
       return null;
@@ -470,6 +700,7 @@ export function requestFromForm(values: FormValues): FormBuildResult {
   if (declaredValueArs !== undefined) box.declaredValueArs = declaredValueArs;
 
   const value: ShipmentRequest = {
+    modality: 'domicilio',
     zipCode,
     address: {
       province: { code: province.value.code, name: province.value.name },
@@ -485,6 +716,106 @@ export function requestFromForm(values: FormValues): FormBuildResult {
      * Nothing is derived any more: every value here was on screen and editable.
      * Derivations are a property of the *parse*, not of the approved payload.
      */
+    derived: [],
+  };
+
+  return { ok: true, value, values: formValuesFromFields(formFieldsFromRequest(value)) };
+}
+
+function sucursalRequestFromForm(values: FormValues): FormBuildResult {
+  const errors: FormIssue[] = [];
+  const requiredOf = (key: FormKey): boolean => specOf(key).requiredByModality['sucursal'];
+
+  const textField = (key: FormKey): string => {
+    const value = collapse(readValue(values, key));
+    if (value === '' && requiredOf(key)) {
+      errors.push({ field: key, message: `«${specOf(key).label}» es obligatorio` });
+    }
+    return value;
+  };
+
+  const zipCode = normalizePostalCode(textField('zipCode'));
+  if (zipCode !== '' && !isPostalCode(zipCode)) {
+    errors.push({
+      field: 'zipCode',
+      message: `código postal «${zipCode}» no es válido: ${POSTAL_CODE_HINT}`,
+    });
+  }
+
+  // Free text, like the parser: trim + collapse whitespace, nothing else.
+  const sucursal = textField('sucursal');
+  const name = textField('name');
+  const lastName = textField('lastName');
+  const email = textField('email');
+  const telefono = textField('telefono');
+
+  const measure = (key: FormKey): number | null => {
+    const spec = specOf(key);
+    const raw = collapse(readValue(values, key));
+    if (raw === '') {
+      if (requiredOf(key)) {
+        errors.push({ field: key, message: `«${spec.label}» es obligatorio (en ${spec.unit})` });
+      }
+      return null;
+    }
+    if (!MEASURE_PATTERN.test(raw) || Number(raw) <= 0) {
+      errors.push({
+        field: key,
+        message: `«${spec.label}» debe ser un número positivo en ${spec.unit} (recibido «${raw}»)`,
+      });
+      return null;
+    }
+    return Number(raw);
+  };
+
+  const heightCm = measure('height');
+  const widthCm = measure('width');
+  const depthCm = measure('depth');
+  const weightG = measure('weight');
+
+  // Required-with-default for sucursal: the form prefills it and shows it
+  // editable; a cleared value is a refusal, never a silent omission.
+  const declaredRaw = collapse(readValue(values, 'declaredValue'));
+  let declaredValueArs: number | null = null;
+  if (declaredRaw === '') {
+    errors.push({
+      field: 'declaredValue',
+      message: '«Monto declarado» es obligatorio para sucursal: viene prellenado con el valor del proyecto',
+    });
+  } else if (!MEASURE_PATTERN.test(declaredRaw)) {
+    errors.push({
+      field: 'declaredValue',
+      message: `«Monto declarado» debe ser un número en $ (recibido «${declaredRaw}»)`,
+    });
+  } else {
+    declaredValueArs = Number(declaredRaw);
+  }
+
+  if (errors.length > 0) return { ok: false, errors };
+  if (
+    heightCm === null ||
+    widthCm === null ||
+    depthCm === null ||
+    weightG === null ||
+    declaredValueArs === null
+  ) {
+    return {
+      ok: false,
+      errors: [{ field: '*', message: 'las medidas del paquete son obligatorias' }],
+    };
+  }
+
+  const value: SucursalShipmentRequest = {
+    modality: 'sucursal',
+    zipCode,
+    sucursal,
+    customer: {
+      name,
+      lastName: lastName === '' ? null : lastName,
+      email: email === '' ? null : email,
+      phone: telefono === '' ? null : telefono,
+    },
+    box: { heightCm, widthCm, depthCm, weightG, declaredValueArs: declaredValueArs },
     derived: [],
   };
 

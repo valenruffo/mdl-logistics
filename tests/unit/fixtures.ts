@@ -60,3 +60,44 @@ export const WHATSAPP_MESSAGE = [
   '*Datos del destinatario*',
   '*Nombre completo*: juan perez',
 ].join('\n');
+
+/**
+ * The new (v2) domicilio format: the same v1 message with the `Modalidad` line
+ * the updated client form now emits.
+ */
+export const MODALITY_DOMICILE_MESSAGE = [
+  '*MDL - Datos de envío*',
+  '',
+  'Modalidad: domicilio',
+  '',
+  '*Destino*',
+  '*Código postal*: 1901',
+  '*Provincia*: Ciudad Autónoma de Buenos Aires (CABA)',
+  '*Ciudad*: Villa Ejemplo',
+  '*Calle*: Calle Falsa',
+  '*Número*: 742',
+  '*Departamento*: 2b',
+  '*Barrio*: Villa Ejemplo',
+  '',
+  '*Datos del destinatario*',
+  '*Nombre completo*: juan perez',
+].join('\n');
+
+/**
+ * The frozen sucursal format: `Nombre`/`Apellido` separated, `Email` and
+ * `Teléfono` optional, no destination address group. Every value is fictional
+ * (R11).
+ */
+export const SUCURSAL_MESSAGE = [
+  '*MDL - Datos de envío*',
+  '',
+  'Modalidad: sucursal',
+  'Sucursal (nombre): Sucursal Villa Ejemplo - Av. Falsa 123',
+  '*Código postal*: 1419',
+  '',
+  '*Datos del destinatario*',
+  '*Nombre*: Juan',
+  '*Apellido*: Pérez',
+  '*Email*: juan@ejemplo.com',
+  '*Teléfono*: 1122334455',
+].join('\n');

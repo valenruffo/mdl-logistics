@@ -29,6 +29,8 @@ export const CLIENT_JS = `(function () {
   var state = {
     message: '',
     analyzed: false,
+    modalidad: null,
+    fieldsByModalidad: null,
     provinces: [],
     busy: false,
     consoleBusy: false
@@ -169,7 +171,25 @@ export const CLIENT_JS = `(function () {
 
   function controlFor(field) {
     var control;
-    if (field.kind === 'province') {
+    if (field.kind === 'modalidad') {
+      // The segmented control: two radios, one per modality. Switching one
+      // re-derives the visible field set (see switchModalidad).
+      control = document.createElement('span');
+      control.className = 'segmented';
+      ['domicilio', 'sucursal'].forEach(function (option) {
+        var optionLabel = document.createElement('label');
+        var input = document.createElement('input');
+        input.type = 'radio';
+        input.name = 'modalidad';
+        input.value = option;
+        input.checked = field.value === option;
+        input.setAttribute('data-key', 'modalidad');
+        input.addEventListener('change', function () { switchModalidad(option); });
+        optionLabel.appendChild(input);
+        optionLabel.appendChild(make('span', null, option));
+        control.appendChild(optionLabel);
+      });
+    } else if (field.kind === 'province') {
       control = document.createElement('select');
       var blank = document.createElement('option');
       blank.value = '';
@@ -189,8 +209,12 @@ export const CLIENT_JS = `(function () {
       if (field.kind === 'measure') control.setAttribute('inputmode', 'decimal');
       control.value = field.value;
     }
-    control.id = 'field-' + field.key;
-    control.setAttribute('data-key', field.key);
+    if (field.kind !== 'modalidad') {
+      // The radio pair carries its own data-key and per-option labels; a single
+      // id here would be duplicated across the two inputs.
+      control.id = 'field-' + field.key;
+      control.setAttribute('data-key', field.key);
+    }
     return control;
   }
 
@@ -235,10 +259,35 @@ export const CLIENT_JS = `(function () {
     });
   }
 
+  /**
+   * Re-derives the visible field set when the operator switches the Modalidad
+   * control: domicilio shows the address group, sucursal shows Sucursal + CP
+   * and hides it. Values the operator already has on screen for shared keys
+   * (postal code, recipient, package) carry over; mode-specific keys take the
+   * target list's own prefill — the sucursal field stays empty (nothing is
+   * invented), and each modality keeps its own declared-value policy.
+   */
+  var SHARED_FIELD_KEYS = ['zipCode', 'name', 'lastName', 'height', 'width', 'depth', 'weight'];
+
+  function switchModalidad(next) {
+    if (!state.fieldsByModalidad || (next !== 'domicilio' && next !== 'sucursal')) return;
+    if (next === state.modalidad) return;
+    var current = collect();
+    state.modalidad = next;
+    renderFields(state.fieldsByModalidad[next].map(function (field) {
+      if (SHARED_FIELD_KEYS.indexOf(field.key) !== -1 && typeof current[field.key] === 'string') {
+        field.value = current[field.key];
+      }
+      return field;
+    }));
+  }
+
   function collect() {
     var values = {};
     var nodes = byId('shipment-form').querySelectorAll('[data-key]');
     for (var index = 0; index < nodes.length; index += 1) {
+      // The Modalidad control is a radio pair: only the checked one counts.
+      if (nodes[index].type === 'radio' && !nodes[index].checked) continue;
       values[nodes[index].getAttribute('data-key')] = nodes[index].value;
     }
     return values;
@@ -293,6 +342,8 @@ export const CLIENT_JS = `(function () {
 
   function renderRejection(data) {
     state.analyzed = false;
+    state.modalidad = null;
+    state.fieldsByModalidad = null;
     state.provinces = [];
     syncButtons();
     clear(byId('shipment-form'));
@@ -327,6 +378,8 @@ export const CLIENT_JS = `(function () {
 
   function renderParsed(data) {
     state.analyzed = true;
+    state.modalidad = data.modalidad;
+    state.fieldsByModalidad = data.fieldsByModalidad;
     state.provinces = data.provinces;
 
     var warnings = byId('warnings');
