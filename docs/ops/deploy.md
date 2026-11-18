@@ -75,6 +75,26 @@ The layout is expected, not exceptional. `session-check` exits 1, or a run stops
 
 Artifacts (traces, screenshots, run-records) live in a named volume and survive a rebuild. The session file lives outside the image and outside the repo, so a rebuild never invalidates it.
 
+Every redeploy leaves the previous image dangling and grows the build cache. The standing procedure is: build, recreate, **prune what the build replaced**, then report the disk.
+
+```bash
+docker compose --env-file server.env build
+docker compose --env-file server.env up -d --force-recreate
+docker image prune -f                      # removes the replaced mdl image (dangling)
+docker builder prune -f --filter until=168h # trims the build cache, keeps the last week
+```
+
+Do not use `docker image prune -a` or `docker system prune -a` on this host: it also removes images that belong to other services that happen to be stopped at that moment.
+
+**Report the disk after every deploy**, so growth is visible instead of surprising:
+
+```bash
+df -h / | tail -1
+docker system df
+```
+
+The first line gives total, used and free; the second gives how much of that is Docker layers and cache, and how much is reclaimable.
+
 ## Known limits
 
 - The image has **not** been built or run yet: no Docker engine existed on the operator's machine. First build happens on the VPS, and the Chromium path inside the image must be confirmed there.

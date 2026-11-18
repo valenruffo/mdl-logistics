@@ -66,19 +66,54 @@ export const PAGE_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>MDL Logistics — enviar un pedido</title>
+<script>
+/* The saved theme is applied before the first paint, so a page opened in dark
+   never flashes light. The key is the same one the script below writes. */
+(function () {
+  'use strict';
+  try {
+    var saved = localStorage.getItem('mdl-theme');
+    if (saved === 'light' || saved === 'dark') document.documentElement.setAttribute('data-theme', saved);
+  } catch (ignored) {}
+})();
+</script>
 <style>
   :root {
-    --bg:#f6f5f2; --surface:#fff; --ink:#15181d; --muted:#5b6270; --line:#e4e1da;
+    color-scheme: light;
+    --bg:#f6f5f2; --surface:#fff; --ink:#15181d; --muted:#5b6270; --line:#e4e1da; --field:#fdfcfa;
     --rail:#1a1d22; --rail-ink:#e7e5e0; --rail-muted:#8f96a2; --rail-line:#2a3038;
-    --accent:#1f5c4a; --accent-ink:#fff; --ok:#2f8a68; --warn:#c9963c; --bad:#c9614f;
+    --rail-edge:#6b7484; --rail-hover:#22272e; --rail-focus:#66c2a4;
+    --rail-ok:#5fbf9a; --rail-warn:#e0b862; --rail-bad:#f0907d;
+    --accent:#1f5c4a; --accent-ink:#fff; --accent-off:#e9e7e2;
+    --ok:#2f8a68; --warn:#c9963c; --bad:#c9614f;
+    --ok-text:#1f6b4f; --warn-text:#7a5a12; --bad-text:#a23325;
+    --focus:#1f5c4a;
     --sans:-apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
     --mono:ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  /* Dark, chosen by hand: the rail's palette carried over the work column. */
+  html[data-theme="dark"] {
+    color-scheme: dark;
+    --bg:#0e1116; --surface:#151a21; --ink:#dfe3e9; --muted:#8b93a1; --line:#252c36; --field:#11161c;
+    --accent-off:#1f252d; --focus:#5fbfa0;
+    --ok-text:#5fbf9a; --warn-text:#e0b862; --bad-text:#f0907d;
+  }
+  /* Dark because the system says so. The same values as the block above; it is
+     skipped when the operator stored a choice, and never when the choice is dark. */
+  @media (prefers-color-scheme: dark) {
+    html:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg:#0e1116; --surface:#151a21; --ink:#dfe3e9; --muted:#8b93a1; --line:#252c36; --field:#11161c;
+      --accent-off:#1f252d; --focus:#5fbfa0;
+      --ok-text:#5fbf9a; --warn-text:#e0b862; --bad-text:#f0907d;
+    }
   }
   * { box-sizing:border-box; }
   [hidden] { display:none !important; }
   body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 var(--sans); }
-  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:4px; }
+  :focus-visible { outline:2px solid var(--focus); outline-offset:2px; border-radius:4px; }
   .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden;
              clip:rect(0 0 0 0); white-space:nowrap; border:0; }
   .app { display:grid; grid-template-columns:224px 1fr; min-height:100vh; }
@@ -97,16 +132,25 @@ export const PAGE_HTML = `<!doctype html>
   .rail details { margin-top:8px; }
   .rail summary { color:var(--rail-muted); font-size:11.5px; cursor:pointer; }
   .rail ul.issues { margin:6px 0 0; padding-left:1rem; font-size:11.5px; }
+  .rail footer { margin-top:auto; font-size:11px; color:var(--rail-muted); display:flex; justify-content:space-between; gap:8px; }
+  .rail button.rail-toggle { width:auto; align-self:flex-start; margin-top:0; padding:6px 10px; font-size:11px; }
   .runs { list-style:none; margin:0; padding:0; }
   .runs li { padding:6px 0; border-bottom:1px solid var(--rail-line); line-height:1.3; }
   .runs li:last-child { border-bottom:0; }
   .runs .id { font-variant-numeric:tabular-nums; }
   .runs .meta { font-size:11px; }
+
+  /* The rail's blocks sit on the dark surface: they are not cards, so they get
+     no fill, no border, no radius and no shadow. The section rule below belongs
+     to the work column only. */
+  .rail section { background:none; border:0; border-radius:0; box-shadow:none; padding:0; margin:0; }
+
   .rail button { width:100%; font:600 12px/1 var(--sans); color:var(--rail-ink); background:transparent;
-                 border:1px solid var(--rail-line); border-radius:6px; padding:8px; cursor:pointer; margin-top:10px; }
-  .rail button:hover { background:#22272e; }
-  .rail button:disabled { opacity:.55; cursor:not-allowed; }
-  .rail footer { margin-top:auto; font-size:11px; color:var(--rail-muted); display:flex; justify-content:space-between; gap:8px; }
+                 border:1px solid var(--rail-edge); border-radius:6px; padding:8px; cursor:pointer; margin-top:10px; }
+  .rail button:hover { background:var(--rail-hover); border-color:var(--rail-ink); }
+  .rail button:disabled { color:var(--rail-muted); border-color:var(--rail-line); cursor:not-allowed; }
+  .rail button:disabled:hover { background:transparent; border-color:var(--rail-line); }
+  .rail :focus-visible { outline-color:var(--rail-focus); }
 
   /* work */
   .work { padding:36px 40px 64px; }
@@ -114,34 +158,41 @@ export const PAGE_HTML = `<!doctype html>
   h1 { font-size:28px; line-height:1.2; letter-spacing:-.02em; margin:0 0 6px; }
   .sub { color:var(--muted); margin:0 0 26px; }
 
-  section { background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:22px; }
-  section + section { margin-top:18px; }
+  .work section { background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:22px; }
+  .work section + section { margin-top:18px; }
   .sec-head { display:flex; align-items:baseline; gap:10px; margin-bottom:16px; }
   h2.sec { font-size:11px; text-transform:uppercase; letter-spacing:.1em; color:var(--muted); margin:0; font-weight:600; }
   .badge { font-size:11.5px; color:var(--muted); border:1px solid var(--line); border-radius:99px; padding:2px 8px; }
 
   .field-label { display:block; font-size:12.5px; color:var(--muted); margin-bottom:5px; }
-  textarea, input, select { width:100%; font:14px/1.5 var(--sans); color:var(--ink); background:#fdfcfa;
+  textarea, input, select { width:100%; font:14px/1.5 var(--sans); color:var(--ink); background:var(--field);
     border:1px solid var(--line); border-radius:8px; padding:9px 11px; }
+  ::placeholder { color:var(--muted); opacity:1; }
   textarea { min-height:132px; font-family:var(--mono); font-size:13px; resize:vertical; }
   .hint { font-size:12.5px; color:var(--muted); margin:7px 0 0; }
   .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px 18px; }
   .grid .wide { grid-column:1/-1; }
   .group { grid-column:1/-1; font-size:11px; text-transform:uppercase; letter-spacing:.09em; color:var(--muted); font-weight:600; margin:6px 0 -2px; }
 
-  .quote { display:flex; gap:10px; align-items:center; font-size:13.5px; color:var(--ok); margin-top:18px; padding-top:16px; border-top:1px solid var(--line); }
+  .quote { display:flex; gap:10px; align-items:center; font-size:13.5px; color:var(--ok-text); margin-top:18px; padding-top:16px; border-top:1px solid var(--line); }
   .actions { display:flex; gap:10px; align-items:center; margin-top:18px; flex-wrap:wrap; }
   button.primary, button.ghost { font:600 14px/1 var(--sans); border-radius:8px; padding:11px 18px; cursor:pointer; border:1px solid transparent; }
   button.primary { background:var(--accent); color:var(--accent-ink); }
   button.ghost { background:transparent; color:var(--ink); border-color:var(--line); }
-  button.primary:disabled, button.ghost:disabled { opacity:.5; cursor:not-allowed; }
+  /* A disabled control is dimmer, never unreadable: the label keeps its 4.5:1
+     instead of being faded with an opacity on the whole button. */
+  button.primary:disabled { background:var(--accent-off); color:var(--muted); border-color:var(--accent-off); cursor:not-allowed; }
+  button.ghost:disabled { background:transparent; color:var(--muted); border-color:var(--line); cursor:not-allowed; }
   .note { font-size:12.5px; color:var(--muted); }
 
   ul.issues { margin:6px 0 0; padding-left:1.1rem; font-size:13.5px; }
   ul.issues li { margin:2px 0; }
-  .bad { color:var(--bad); } .ok { color:var(--ok); } .warn { color:var(--warn); }
+  /* Text colours are the ones that clear 4.5:1 on their own surface; the dot
+     palette above stays for the dots, which always carry a word next to them. */
+  .bad { color:var(--bad-text); } .ok { color:var(--ok-text); } .warn { color:var(--warn-text); }
+  .rail .bad { color:var(--rail-bad); } .rail .ok { color:var(--rail-ok); } .rail .warn { color:var(--rail-warn); }
   .mono { font-family:var(--mono); font-size:12px; word-break:break-all; }
-  .field-note { font-size:11.5px; color:var(--warn); margin:4px 0 0; }
+  .field-note { font-size:11.5px; color:var(--warn-text); margin:4px 0 0; }
   .field-wrap { display:block; }
   .inline-status { min-height:1.2rem; font-size:13px; color:var(--muted); margin:12px 0 0; }
   .inline-result { margin-top:16px; padding-top:14px; border-top:1px solid var(--line); font-size:13.5px; }
@@ -159,6 +210,7 @@ export const PAGE_HTML = `<!doctype html>
 
   <aside class="rail" aria-label="Estado del agente">
     <div class="brand">MDL Logistics</div>
+    <button type="button" id="theme-toggle" class="rail-toggle" aria-pressed="false">Tema: sistema</button>
 
     <section aria-labelledby="rail-session-heading">
       <h2 id="rail-session-heading">Sesión</h2>

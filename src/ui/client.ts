@@ -15,13 +15,16 @@
  *   is written with `textContent`/`createElement`: pasted data, panel text, file
  *   names and record fields are never interpreted as HTML.
  * - **The rail is read-only** except for its own `Verificar ahora` button, which
- *   is the one control that opens a browser, and `Cerrar sesión`, which posts the
- *   logout and returns to the login card.
+ *   is the one control that opens a browser, `Cerrar sesión`, which posts the
+ *   logout and returns to the login card, and the theme toggle, which is the one
+ *   control that writes anything locally (the theme key, never a datum).
  * - **An expired session is not an error dialog.** A `401` from any call sends the
  *   browser to `/login`: the operator sees the card, not a JSON reason in the rail.
  */
 export const CLIENT_JS = `(function () {
   'use strict';
+
+  var THEME_KEY = 'mdl-theme';
 
   var state = {
     message: '',
@@ -674,6 +677,65 @@ export const CLIENT_JS = `(function () {
     }, function () {
       document.location.assign('/login');
     });
+  }
+
+  // ------------------------------------------------------------------ the theme
+  //
+  // The page follows the system until the operator picks a theme. The pick is
+  // kept under THEME_KEY and wins over the system on the next load; the head of
+  // the page reads the very same key before the first paint, so nothing flashes.
+
+  function savedTheme() {
+    try {
+      var value = localStorage.getItem(THEME_KEY);
+      return value === 'light' || value === 'dark' ? value : null;
+    } catch (ignored) {
+      return null;
+    }
+  }
+
+  function systemTheme() {
+    if (typeof matchMedia !== 'function') return 'light';
+    return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+
+  function effectiveTheme() {
+    var saved = savedTheme();
+    return saved === null ? systemTheme() : saved;
+  }
+
+  /** Write the theme on the root element and keep the toggle's label honest. */
+  function applyTheme(saved) {
+    if (saved === null) document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', saved);
+
+    var shown = saved === null ? systemTheme() : saved;
+    var button = byId('theme-toggle');
+    if (!button) return;
+    button.textContent = shown === 'dark' ? 'Tema: oscuro' : 'Tema: claro';
+    button.setAttribute('aria-pressed', shown === 'dark' ? 'true' : 'false');
+  }
+
+  function toggleTheme() {
+    var next = effectiveTheme() === 'dark' ? 'light' : 'dark';
+    try {
+      localStorage.setItem(THEME_KEY, next);
+    } catch (ignored) {}
+    applyTheme(next);
+  }
+
+  var themeToggle = byId('theme-toggle');
+  if (themeToggle) themeToggle.addEventListener('click', toggleTheme);
+  applyTheme(savedTheme());
+
+  // While no choice is stored, a system change is followed without a reload.
+  if (typeof matchMedia === 'function') {
+    var darkQuery = matchMedia('(prefers-color-scheme: dark)');
+    var onSystemThemeChange = function () {
+      if (savedTheme() === null) applyTheme(null);
+    };
+    if (typeof darkQuery.addEventListener === 'function') darkQuery.addEventListener('change', onSystemThemeChange);
+    else if (typeof darkQuery.addListener === 'function') darkQuery.addListener(onSystemThemeChange);
   }
 
   byId('analyze').addEventListener('click', analyze);
