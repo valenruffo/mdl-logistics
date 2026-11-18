@@ -6,11 +6,12 @@
  * single centred work column on the right holding the whole shipment flow.
  *
  * - **The rail** is fed only by `GET /api/console`: the session as the last
- *   recorded check saw it, the newest run records, the newest failing report, the
- *   artifacts on disk and the count of open attempts. Every one of those is
- *   closed-vocabulary data — a level, a timestamp, a path, an identifier, a size.
- *   No report text, no check output, no recipient data. The rails dots always
- *   carry a word next to them, so no state is conveyed by colour alone.
+ *   recorded check saw it (plus the panel cookie's expiry), the newest run
+ *   records, the newest failing report and the count of open attempts. Every one
+ *   of those is closed-vocabulary data — a level, a timestamp, a count, an
+ *   identifier, a number of days. No report text, no check output, no recipient
+ *   data, no cookie value. The rail's dots always carry a word next to them, so no
+ *   state is conveyed by colour alone.
  * - **The work column** is paste → `Analizar` → edit → `Crear envío`, plus the
  *   `Probar en seco` path that touches nothing. There is no approval hash and no
  *   typed token: creating a shipment costs nothing, so it needs no ceremony
@@ -21,37 +22,14 @@
  * `/api/console` or from an analyze/run response, and the client writes all of it
  * with `textContent`. Nothing on this page is written by a model.
  *
- * Also declared here, so a test can assert the page shows exactly these words:
- * the artifact-retrieval instruction, the on-disk note about failing reports, and
- * the on-disk note about the session-check output.
+ * The rail says only what an operator reads at a glance: the session's word and
+ * when it was last verified (plus the panel cookie's expiry), the last five runs,
+ * the error word and, when there is one, the failing check with its time. It
+ * explains nothing: process facts, artifact listings and the on-disk notes live in
+ * the request docs, not here.
  */
 
 import { CARRIER_NAME } from '../core/carrier';
-
-/**
- * The one instruction for getting at the artifact files. The rail lists them and
- * never serves them: they hold recipient personal data and panel-session material,
- * so they leave the box over SSH, not over the web server that can create
- * shipments. Exported so a test can assert the page shows exactly this.
- */
-export const ARTIFACT_RETRIEVAL_INSTRUCTION =
-  'Los artefactos quedan en el volumen montado y se retiran por SSH desde el equipo del operador, por ejemplo con docker compose cp mdl-logistics:/app/artifacts ./artifacts, o leyendo directo la ruta del volumen (/app/artifacts en el contenedor).';
-
-/**
- * The one sentence about the failing report. Same rule as the artifacts above:
- * the rail shows structural facts, the file stays on disk, and the operator reads
- * it over SSH because it may name the recipient.
- */
-export const REPORT_ON_DISK_NOTE =
-  'El informe completo queda en disco, en la ruta que se muestra arriba, y se retira por SSH desde el equipo del operador (docker compose cp, o directo la ruta del volumen). Esta página no copia ni muestra su texto porque el informe puede contener datos del destinatario: nombre, dirección y teléfono.';
-
-/**
- * The one sentence about the session-check history. The check prints what it saw
- * on the panel, which can name the recipient, so the rail shows only its four
- * closed facts (result, exit code, when, how long) and the file leaves over SSH.
- */
-export const SESSION_CHECK_OUTPUT_NOTE =
-  'La salida completa de cada chequeo queda en disco, en el historial que se nombra arriba, y se retira por SSH desde el equipo del operador (docker compose cp, o directo la ruta del volumen). Esta página no copia ni muestra su texto, porque la salida es lo que el chequeo imprimió al leer el panel y puede nombrar al destinatario: de cada chequeo se muestran solo el resultado, el código de salida, la fecha y la duración.';
 
 /**
  * What the rail's footer shows on the right. The artboard prints a commit hash
@@ -120,6 +98,8 @@ export const PAGE_HTML = `<!doctype html>
 
   /* compact rail */
   .rail { background:var(--rail); color:var(--rail-ink); padding:16px 14px; display:flex; flex-direction:column; gap:18px; font-size:13px; }
+  /* The brand and the theme toggle share one discreet line. */
+  .rail-head { display:flex; align-items:baseline; justify-content:space-between; gap:8px; }
   .rail .brand { font-weight:650; font-size:14px; letter-spacing:-.01em; }
   .rail h2 { font-size:10px; text-transform:uppercase; letter-spacing:.11em; color:var(--rail-muted); margin:0 0 6px; font-weight:600; }
   .state { display:flex; gap:7px; align-items:flex-start; line-height:1.35; }
@@ -127,18 +107,17 @@ export const PAGE_HTML = `<!doctype html>
   .b { width:7px; height:7px; border-radius:50%; background:var(--rail-muted); flex:none; margin-top:6px; }
   .b.ok { background:var(--ok); } .b.warn { background:var(--warn); } .b.bad { background:var(--bad); }
   .rail .meta { color:var(--rail-muted); font-size:11.5px; display:block; margin-top:1px; }
-  .rail .note { color:var(--rail-muted); font-size:11px; margin:6px 0 0; }
   .rail .rail-line { color:var(--rail-muted); font-size:11.5px; margin:8px 0 0; }
-  .rail details { margin-top:8px; }
-  .rail summary { color:var(--rail-muted); font-size:11.5px; cursor:pointer; }
-  .rail ul.issues { margin:6px 0 0; padding-left:1rem; font-size:11.5px; }
+  .rail .inline-status { color:var(--rail-muted); font-size:11.5px; }
   .rail footer { margin-top:auto; font-size:11px; color:var(--rail-muted); display:flex; justify-content:space-between; gap:8px; }
-  .rail button.rail-toggle { width:auto; align-self:flex-start; margin-top:0; padding:6px 10px; font-size:11px; }
+  /* Small and quiet: one line in the corner, not a control that competes. */
+  .rail button.rail-toggle { width:auto; align-self:center; margin-top:0; padding:2px 6px; font-size:10.5px;
+                             border-color:transparent; color:var(--rail-muted); font-weight:500; }
+  .rail button.rail-toggle:hover { color:var(--rail-ink); }
   .runs { list-style:none; margin:0; padding:0; }
-  .runs li { padding:6px 0; border-bottom:1px solid var(--rail-line); line-height:1.3; }
+  .runs li { padding:6px 0; border-bottom:1px solid var(--rail-line); line-height:1.3; font-variant-numeric:tabular-nums; }
   .runs li:last-child { border-bottom:0; }
-  .runs .id { font-variant-numeric:tabular-nums; }
-  .runs .meta { font-size:11px; }
+  .runs .meta { font-size:11px; display:inline; }
 
   /* The rail's blocks sit on the dark surface: they are not cards, so they get
      no fill, no border, no radius and no shadow. The section rule below belongs
@@ -209,26 +188,20 @@ export const PAGE_HTML = `<!doctype html>
 <div class="app">
 
   <aside class="rail" aria-label="Estado del agente">
-    <div class="brand">MDL Logistics</div>
-    <button type="button" id="theme-toggle" class="rail-toggle" aria-pressed="false">Tema: sistema</button>
+    <div class="rail-head">
+      <span class="brand">MDL Logistics</span>
+      <button type="button" id="theme-toggle" class="rail-toggle" aria-pressed="false">Tema: sistema</button>
+    </div>
 
     <section aria-labelledby="rail-session-heading">
       <h2 id="rail-session-heading">Sesión</h2>
       <div class="state" id="rail-session-state">
         <span class="b" aria-hidden="true"></span>
-        <span id="rail-session-text">Leyendo el estado…<span class="meta">desde GET /api/console</span></span>
+        <span id="rail-session-text">Leyendo el estado…</span>
       </div>
-      <p class="rail-line" id="rail-health"></p>
+      <p class="rail-line" id="rail-expiry"></p>
       <button type="button" id="session-check-run">Verificar ahora</button>
       <p class="inline-status" id="session-check-status" role="status" aria-live="polite"></p>
-      <details>
-        <summary>Runtime del proceso</summary>
-        <div id="rail-runtime"></div>
-      </details>
-      <details>
-        <summary>De dónde sale cada dato</summary>
-        <p class="note">${SESSION_CHECK_OUTPUT_NOTE}</p>
-      </details>
     </section>
 
     <section aria-labelledby="rail-runs-heading">
@@ -246,21 +219,6 @@ export const PAGE_HTML = `<!doctype html>
       </div>
       <div id="rail-errors-detail"></div>
       <div id="rail-warnings"></div>
-      <details>
-        <summary>El informe completo, en disco</summary>
-        <p class="note">${REPORT_ON_DISK_NOTE}</p>
-      </details>
-    </section>
-
-    <section aria-labelledby="rail-artifacts-heading">
-      <h2 id="rail-artifacts-heading">Artefactos</h2>
-      <ul class="runs" id="rail-artifacts-list">
-        <li><span class="meta">leyendo el volumen…</span></li>
-      </ul>
-      <details>
-        <summary>Cómo se retiran</summary>
-        <p class="note">${ARTIFACT_RETRIEVAL_INSTRUCTION}</p>
-      </details>
     </section>
 
     <footer><span id="rail-open">leyendo intentos…</span><span>v${APP_VERSION}</span></footer>

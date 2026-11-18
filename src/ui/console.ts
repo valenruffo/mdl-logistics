@@ -1,6 +1,5 @@
 /**
- * The maintenance console's readers: runtime, session, runs, artifacts, errors
- * and the derived health line.
+ * The maintenance console's readers: runtime, session, runs, artifacts and errors.
  *
  * Three rules shape this module:
  *
@@ -20,17 +19,20 @@
  *    check prints what it saw on the panel. There is no model in this path and
  *    no free-text summary of anything.
  * 3. **No secret is read.** The session file and the Chromium profile are only
- *    `stat`ed (size and mtime); their contents are a credential (R15). The store
- *    origin is shown as a host, and it cannot carry userinfo because
- *    `resolveStoreOrigin()` refuses it.
+ *    `stat`ed (size and mtime) — with one exception, `readSessionExpiry()`: it
+ *    opens the storageState file to read the `expires` number of the
+ *    `admn_session` entry and nothing else, because when the panel session dies
+ *    is an operator fact and not a credential. No cookie value, no other cookie,
+ *    no `origins` entry, and no byte of the file is ever logged, rendered or
+ *    serialised. The store origin is shown as a host, and it cannot carry
+ *    userinfo because `resolveStoreOrigin()` refuses it.
  *
  * Run records are read here with a tolerant reader instead of
  * `loadRunRecords()`, which is deliberately fail-closed for the *gate*: the gate
  * must refuse to run on an unreadable record, while the console must show it.
  */
-import { accessSync, constants, statSync } from 'node:fs';
-import { mkdir, readdir, readFile } from 'node:fs/promises';
-
+import { statSync } from 'node:fs';
+import { readdir, readFile } from 'node:fs/promises';
 import { humanResolutionHint } from '../cli/gates';
 import { readEnv, readEnvBool } from '../executor/env';
 import { messageOf } from '../executor/errors';
@@ -62,8 +64,6 @@ export const CONSOLE_MAX_RUNS = 100;
 export const REPORT_FILE_NAMES: readonly string[] = ['dry-run.json', 'create-run.json', 'failure.json'];
 
 // ------------------------------------------------------------------- shapes
-
-export type Level = 'ok' | 'warn' | 'bad';
 
 /** Something the page could not read. Rendered as a visible warning. */
 export interface Warning {
@@ -291,8 +291,9 @@ export interface SessionFileRead {
 }
 
 /**
- * `stat` only. The file's *contents* are the store session and are never read,
- * parsed, logged or rendered.
+ * `stat` only. The file's *contents* are the store session: apart from the one
+ * `expires` number `readSessionExpiry()` takes, no field is read, parsed, logged
+ * or rendered.
  */
 function readSessionFile(layer: SessionLayer): SessionFileRead {
   const problems: string[] = [];
@@ -333,6 +334,94 @@ function readSessionFile(layer: SessionLayer): SessionFileRead {
   return file;
 }
 
+/** The store's admin session cookie. Only its `expires` is ever read. */
+export const SESSION_COOKIE_NAME = 'admn_session';
+
+/** From how many days left the rail marks the expiry, so the operator acts early. */
+export const EXPIRY_SOON_DAYS = 3;
+
+const DAY_MS = 86_400_000;
+
+/**
+ * When the panel session dies, as the rail says it: an instant and a day count.
+ *
+ * `daysRemaining` is `null` whenever the answer is not known — no storageState
+ * file, no such cookie, or a cookie with no expiry (a session cookie, `-1`) —
+ * so the page can say `vence: desconocido` instead of inventing a date.
+ */
+export interface SessionExpiry {
+  /** The cookie's own expiry, ISO-8601 UTC, or `null` when unknown. */
+  expiresAt: string | null;
+  /** Whole days left, floored at zero. `null` when unknown. */
+  daysRemaining: number | null;
+  /** True when `daysRemaining` is `EXPIRY_SOON_DAYS` or less: the rail marks it. */
+  soon: boolean;
+}
+
+const UNKNOWN_EXPIRY: SessionExpiry = { expiresAt: null, daysRemaining: null, soon: false };
+
+/**
+ * The expiry of `admn_session`, out of a parsed storageState `cookies` array.
+ *
+ * Playwright writes `expires` as **seconds** since the epoch and `-1` for a
+ * cookie that dies with the browser. Anything that is not a positive finite
+ * number is not an expiry, so it is reported as unknown rather than guessed.
+ * The cookie's `value` is not even looked at, which is what keeps this safe.
+ */
+export function expiryOfCookies(cookies: unknown, now: number): SessionExpiry {
+  if (!Array.isArray(cookies)) return UNKNOWN_EXPIRY;
+
+  for (const item of cookies) {
+    if (!isRecord(item) || item['name'] !== SESSION_COOKIE_NAME) continue;
+
+    const expires = item['expires'];
+    if (typeof expires !== 'number' || !Number.isFinite(expires) || expires <= 0) return UNKNOWN_EXPIRY;
+
+    const expiresAtMs = expires * 1_000;
+    const daysRemaining = Math.max(0, Math.floor((expiresAtMs - now) / DAY_MS));
+    return {
+      expiresAt: new Date(expiresAtMs).toISOString(),
+      daysRemaining,
+      soon: daysRemaining <= EXPIRY_SOON_DAYS,
+    };
+  }
+
+  return UNKNOWN_EXPIRY;
+}
+
+/**
+ * Reads the storageState file for **one field of one cookie**: the `expires` of
+ * `admn_session`.
+ *
+ * Why this is not a credential read: `expires` is the instant the panel stops
+ * accepting the session. No value, no other cookie and no `origins` entry is
+ * touched, and the only thing that leaves this function is that instant and a
+ * day count. A file that is missing, unreadable or not JSON is `desconocido`,
+ * and the parse failure is never quoted back — `JSON.parse` prints the bytes it
+ * choked on, and those bytes are the session.
+ *
+ * The profile mode has no readable cookie: Chromium keeps it inside its own
+ * encrypted store, so the answer there is `desconocido` too.
+ */
+async function readSessionExpiry(layer: SessionLayer, now: number): Promise<SessionExpiry> {
+  if (layer.mode !== 'storage-state' || layer.path === null) return UNKNOWN_EXPIRY;
+
+  let text: string;
+  try {
+    text = await readFile(layer.path, { encoding: 'utf8' });
+  } catch {
+    return UNKNOWN_EXPIRY;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (!isRecord(parsed)) return UNKNOWN_EXPIRY;
+    return expiryOfCookies(parsed['cookies'], now);
+  } catch {
+    return UNKNOWN_EXPIRY;
+  }
+}
+
 /**
  * The check history as the HTTP surface may describe it: where it lives, and
  * whether the file could be used at all.
@@ -356,6 +445,8 @@ export interface SessionSection {
   limit: number;
   /** Where the checks — and the full output — are on disk. */
   history: SessionCheckHistoryFact;
+  /** When the panel cookie dies; `null` fields when it cannot be known. */
+  expiry: SessionExpiry;
   warnings: Warning[];
 }
 
@@ -383,6 +474,7 @@ async function readSessionSection(deps: ConsoleDeps, layer: SessionLayer): Promi
     lastCheck: checks[0] ?? null,
     limit: SESSION_CHECK_HISTORY_LIMIT,
     history: { path: deps.sessionCheckHistoryPath, unparseable: history.unparseable },
+    expiry: await readSessionExpiry(layer, Date.now()),
     warnings,
   };
 }
@@ -1087,149 +1179,11 @@ async function readErrors(deps: ConsoleDeps): Promise<ErrorsSection> {
   return { latest: failures[0] ?? null, warnings };
 }
 
-// ------------------------------------------------------------------- health
-
-export interface HealthFact {
-  key: string;
-  label: string;
-  level: Level;
-  detail: string;
-}
-
-export interface HealthLine {
-  level: Level;
-  canWork: boolean;
-  /** One line. Derived from `facts`, never written by hand. */
-  line: string;
-  facts: HealthFact[];
-}
-
-export interface HealthInput {
-  lastCheck: SessionCheckFact | null;
-  unresolvedRunIds: readonly string[];
-  artifactsWritable: boolean;
-  artifactsProblem: string | null;
-  artifactsDir: string;
-}
-
-function exitText(entry: SessionCheckFact): string {
-  return entry.exitCode === null ? 'sin código de salida' : `código ${entry.exitCode}`;
-}
-
-/**
- * The health line. Three facts, each derived: the session as the **last recorded
- * check** saw it, whether any run record is still unresolved (that is what blocks
- * the create path), and whether the artifacts directory can be written.
- *
- * "Able to work" requires all three to be ok. A session nobody has checked yet is
- * a `warn`, not a `yes`: this line never claims what it has not read.
- */
-export function deriveHealth(input: HealthInput): HealthLine {
-  const sessionFact: HealthFact =
-    input.lastCheck === null
-      ? {
-          key: 'session',
-          label: 'sesión',
-          level: 'warn',
-          detail: 'no hay ningún chequeo de sesión registrado: el estado de la sesión no se puede leer',
-        }
-      : input.lastCheck.result === 'usable'
-        ? {
-            key: 'session',
-            label: 'sesión',
-            level: 'ok',
-            detail: `el chequeo del ${input.lastCheck.runAt} (${exitText(input.lastCheck)}) la dio por utilizable`,
-          }
-        : {
-            key: 'session',
-            label: 'sesión',
-            level: 'bad',
-            // Closed facts only: the detail names the result and the exit code.
-            // The check's own message is on disk, not in this line.
-            detail: `el chequeo del ${input.lastCheck.runAt} terminó con ${exitText(input.lastCheck)} (${input.lastCheck.result})`,
-          };
-
-  const attemptFact: HealthFact =
-    input.unresolvedRunIds.length === 0
-      ? {
-          key: 'attempts',
-          label: 'intentos abiertos',
-          level: 'ok',
-          detail: 'ningún registro de ejecución quedó sin desenlace',
-        }
-      : {
-          key: 'attempts',
-          label: 'intentos abiertos',
-          level: 'bad',
-          detail: `${input.unresolvedRunIds.length} registro(s) sin desenlace bloquean la creación: ${input.unresolvedRunIds.join(', ')}`,
-        };
-
-  const artifactFact: HealthFact = input.artifactsWritable
-    ? {
-        key: 'artifacts',
-        label: 'artefactos',
-        level: 'ok',
-        detail: `se puede escribir en ${input.artifactsDir}`,
-      }
-    : {
-        key: 'artifacts',
-        label: 'artefactos',
-        level: 'bad',
-        detail: input.artifactsProblem ?? `${input.artifactsDir} no se puede escribir`,
-      };
-
-  const facts = [sessionFact, attemptFact, artifactFact];
-  const bad = facts.filter((fact) => fact.level === 'bad');
-  const warn = facts.filter((fact) => fact.level === 'warn');
-  const level: Level = bad.length > 0 ? 'bad' : warn.length > 0 ? 'warn' : 'ok';
-
-  const line =
-    level === 'ok'
-      ? 'Sí: la sesión está utilizable, ningún intento quedó abierto y los artefactos se pueden escribir.'
-      : level === 'bad'
-        ? `No: ${bad.map((fact) => `${fact.label} — ${fact.detail}`).join('; ')}`
-        : `No se puede afirmar que el agente pueda trabajar: ${warn.map((fact) => `${fact.label} — ${fact.detail}`).join('; ')}`;
-
-  return { level, canWork: level === 'ok', line, facts };
-}
-
-interface WritableProbe {
-  writable: boolean;
-  problem: string | null;
-  absolute: string;
-}
-
-/**
- * Derives whether the artifacts tree is writable. `mkdir` is idempotent and is
- * the only write the console performs: a directory a run will need anyway, so
- * the derivation reports what a run would find instead of guessing from a parent.
- */
-async function probeArtifacts(deps: ConsoleDeps): Promise<WritableProbe> {
-  const absolute = absolutePath(deps, deps.artifactsDir);
-
-  try {
-    await mkdir(absolute, { recursive: true });
-  } catch (error) {
-    return { writable: false, problem: `no se pudo crear ${absolute}: ${messageOf(error)}`, absolute };
-  }
-
-  try {
-    if (!statSync(absolute).isDirectory()) {
-      return { writable: false, problem: `${absolute} no es un directorio`, absolute };
-    }
-    accessSync(absolute, constants.W_OK);
-    return { writable: true, problem: null, absolute };
-  } catch (error) {
-    return { writable: false, problem: `no se puede escribir en ${absolute}: ${messageOf(error)}`, absolute };
-  }
-}
-
 // ---------------------------------------------------------------- aggregate
 
 export interface ConsoleSnapshot {
   status: 'ok';
   readAt: string;
-  health: HealthLine;
   runtime: RuntimeInfo;
   session: SessionSection;
   runs: RunsSection;
@@ -1247,15 +1201,6 @@ export async function readConsole(deps: ConsoleDeps): Promise<ConsoleSnapshot> {
   const runs = await readRuns(deps);
   const artifacts = await readArtifacts(deps, runs.rows);
   const errors = await readErrors(deps);
-  const probe = await probeArtifacts(deps);
-
-  const health = deriveHealth({
-    lastCheck: session.lastCheck,
-    unresolvedRunIds: runs.rows.filter((row) => row.unresolved).map((row) => row.runId),
-    artifactsWritable: probe.writable,
-    artifactsProblem: probe.problem,
-    artifactsDir: probe.absolute,
-  });
 
   const warnings: Warning[] = [
     ...runtime.warnings,
@@ -1268,7 +1213,6 @@ export async function readConsole(deps: ConsoleDeps): Promise<ConsoleSnapshot> {
   return {
     status: 'ok',
     readAt: new Date().toISOString(),
-    health,
     runtime,
     session,
     runs,

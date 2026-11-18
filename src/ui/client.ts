@@ -110,17 +110,27 @@ export const CLIENT_JS = `(function () {
     return pad2(parsed.getHours()) + ':' + pad2(parsed.getMinutes());
   }
 
-  function formatBytes(bytes) {
-    if (bytes === null || bytes === undefined) return '(sin tamaño)';
-    if (bytes < 1000) return bytes + ' B';
-    var units = ['kB', 'MB', 'GB'];
-    var value = bytes / 1000;
-    var index = 0;
-    while (value >= 1000 && index < units.length - 1) {
-      value = value / 1000;
-      index += 1;
-    }
-    return (Math.round(value * 10) / 10) + ' ' + units[index];
+  /**
+   * A short "since when": the clock for a same-day timestamp, and a relative
+   * count for anything older ("hace 3 h", "hace 2 d"). Nothing longer, because
+   * the rail is read in a glance.
+   */
+  function sinceWhen(iso) {
+    if (iso === null || iso === undefined || iso === '') return null;
+    var then = Date.parse(String(iso));
+    if (isNaN(then)) return null;
+
+    var now = new Date();
+    var when = new Date(then);
+    var sameDay = when.getFullYear() === now.getFullYear() &&
+      when.getMonth() === now.getMonth() && when.getDate() === now.getDate();
+    var minutes = Math.round((now.getTime() - then) / 60000);
+
+    if (minutes < 60) return 'hace ' + (minutes < 1 ? 1 : minutes) + ' min';
+    if (sameDay) return timeOf(iso);
+    var hours = Math.round(minutes / 60);
+    if (hours < 24) return 'hace ' + hours + ' h';
+    return 'hace ' + Math.round(hours / 24) + ' d';
   }
 
   // ------------------------------------------------------------ the message
@@ -461,32 +471,49 @@ export const CLIENT_JS = `(function () {
   function renderSessionRail(data) {
     var last = data.session.lastCheck;
     if (last === null) {
-      railState('rail-session-state', 'rail-session-text', 'warn', 'Sin chequeos',
-        'la sesión no se puede afirmar utilizable hasta que corras uno');
-    } else if (last.result === 'usable') {
-      railState('rail-session-state', 'rail-session-text', 'ok', 'Utilizable',
-        'verificada ' + timeOf(last.runAt) + ' · ' + last.durationMs + ' ms');
+      railState('rail-session-state', 'rail-session-text', 'warn', 'Sin chequeos', 'nunca se verificó');
     } else {
-      railState('rail-session-state', 'rail-session-text', 'bad', 'No utilizable',
-        'chequeo del ' + timeOf(last.runAt) + ' · ' +
-          (last.exitCode === null ? 'sin código de salida' : 'código ' + last.exitCode));
+      var since = sinceWhen(last.runAt);
+      var meta = since === null ? null : 'verificada ' + since;
+      if (last.result === 'usable') {
+        railState('rail-session-state', 'rail-session-text', 'ok', 'Utilizable', meta);
+      } else {
+        railState('rail-session-state', 'rail-session-text', 'bad', 'No utilizable', meta);
+      }
     }
-    setText('rail-health', data.health.line);
+    renderExpiry(data.session.expiry);
   }
 
-  function runRowLabel(row) {
-    var when = timeOf(row.recordedAt);
-    if (row.outcome === 'created') return 'creada · ' + when;
-    if (row.outcome === 'unknown') return 'desconocida · ' + when;
-    if (row.outcome === 'not-created') return 'sin crear · ' + when;
-    return 'sin desenlace · ' + when;
+  /**
+   * The panel cookie's expiry, as a number of days. The payload carries only
+   * the day count; a value that could not be read says so instead of guessing.
+   */
+  function renderExpiry(expiry) {
+    var node = byId('rail-expiry');
+    if (!node) return;
+    var days = expiry && typeof expiry.daysRemaining === 'number' ? expiry.daysRemaining : null;
+    if (days === null) {
+      node.className = 'rail-line';
+      node.textContent = 'vence: desconocido';
+      return;
+    }
+    node.className = expiry.soon ? 'rail-line warn' : 'rail-line';
+    node.textContent = 'vence en ' + days + (days === 1 ? ' día' : ' días');
+  }
+
+  /** The one word a run's outcome gets in its single line. */
+  function outcomeWord(row) {
+    if (row.outcome === 'created') return 'creada';
+    if (row.outcome === 'unknown') return 'desconocida';
+    if (row.outcome === 'not-created') return 'sin crear';
+    return 'sin desenlace';
   }
 
   function renderRunsRail(data) {
     var list = byId('rail-runs-list');
     clear(list);
 
-    var rows = data.runs.rows.slice(0, 6);
+    var rows = data.runs.rows.slice(0, 5);
     if (rows.length === 0) {
       var empty = document.createElement('li');
       empty.appendChild(make('span', 'meta', 'no hay ningún run registrado todavía'));
@@ -496,25 +523,11 @@ export const CLIENT_JS = `(function () {
 
     rows.forEach(function (row) {
       var item = document.createElement('li');
-      item.appendChild(make('span', 'id', textOr(row.shipmentId, '—')));
-      item.appendChild(make('span', 'meta', runRowLabel(row)));
-      if (row.unresolved) item.appendChild(make('span', 'meta bad', 'sin resolver'));
+      item.textContent =
+        textOr(row.shipmentId, '—') + ' · ' + outcomeWord(row) + ' · ' + timeOf(row.recordedAt);
       list.appendChild(item);
     });
   }
-
-  /** The closed vocabulary of failed structural checks, as fixed sentences. */
-  var CHECK_LABELS = {
-    'shipment-id': 'el encabezado del detalle no trae un identificador #EM<numero>',
-    'status-badge': 'ningún estado del panel dice "Por enviar"',
-    'label-button': 'no hay un botón visible para la etiqueta',
-    'form-mismatch': 'el panel no coincide con el payload mostrado',
-    'form-not-approved': 'el hash del payload no coincide con el formulario leído',
-    'outcome-unknown': 'el desenlace quedó desconocido',
-    'status-failed': 'el informe quedó en estado failed',
-    'status-error': 'el informe quedó en estado error',
-    'reconciliation-unread': 'el informe trae una conciliación'
-  };
 
   function renderErrorsRail(data) {
     var detail = byId('rail-errors-detail');
@@ -522,82 +535,25 @@ export const CLIENT_JS = `(function () {
 
     var latest = data.errors.latest;
     if (latest === null) {
-      railState('rail-errors-state', 'rail-errors-text', 'ok', 'Ninguno',
-        'ningún informe del ejecutor falló sus comprobaciones');
+      railState('rail-errors-state', 'rail-errors-text', 'ok', 'Ninguno', null);
     } else {
-      railState('rail-errors-state', 'rail-errors-text', 'bad', 'Hay un informe con fallas',
-        latest.kind + ' · ' + timeOf(latest.recordedAt));
+      railState('rail-errors-state', 'rail-errors-text', 'bad', 'Hay un informe con fallas', null);
 
-      detail.appendChild(make('p', 'mono', latest.path));
-      if (latest.unparseable) {
-        detail.appendChild(make('p', 'bad', 'informe ilegible: se informa solo la ruta, nunca su contenido'));
-      } else if (latest.checks.length === 0) {
-        detail.appendChild(make('p', 'warn', 'el informe no nombró ninguna comprobación conocida'));
-      } else {
-        var list = make('ul', 'issues');
-        latest.checks.forEach(function (id) {
-          list.appendChild(make('li', 'bad', CHECK_LABELS[id] || id));
-        });
-        detail.appendChild(list);
-      }
+      // One line: the failing check and when. The report's path and its text stay
+      // on disk; the check names come from the server's closed vocabulary.
+      var check = latest.checks.length > 0
+        ? latest.checks.join(', ')
+        : latest.unparseable ? 'informe ilegible' : 'sin comprobación';
+      detail.appendChild(make('p', 'rail-line bad', check + ' · ' + timeOf(latest.recordedAt)));
     }
 
     var warnings = byId('rail-warnings');
     clear(warnings);
     if (data.warnings && data.warnings.length > 0) {
-      warnings.appendChild(make('p', 'note', 'Avisos de lectura (' + data.warnings.length + '), la página sigue funcionando:'));
-      var warningList = make('ul', 'issues');
       data.warnings.forEach(function (warning) {
-        warningList.appendChild(make('li', null, warning.source + ' - ' + warning.message));
+        warnings.appendChild(make('p', 'rail-line bad', warning.source + ': ' + warning.message));
       });
-      warnings.appendChild(warningList);
     }
-  }
-
-  function renderArtifactsRail(data) {
-    var list = byId('rail-artifacts-list');
-    clear(list);
-
-    var runs = data.artifacts.runs.filter(function (run) { return run.dir !== null; }).slice(0, 4);
-    if (runs.length === 0) {
-      var empty = document.createElement('li');
-      empty.appendChild(make('span', 'meta', 'no hay archivos que listar'));
-      list.appendChild(empty);
-      return;
-    }
-
-    runs.forEach(function (run) {
-      var item = document.createElement('li');
-      item.appendChild(make('span', 'id', run.runId));
-      item.appendChild(make('span', 'meta',
-        'artifacts/' + run.dir + ' · ' + run.files.length + ' archivo(s) · ' + formatBytes(run.totalBytes)));
-      // The page lists names and sizes and never serves a byte: traces and
-      // screenshots carry recipient data and leave the volume over SSH.
-      item.appendChild(make('span', 'meta', 'se retiran por SSH; no se sirven por HTTP'));
-      list.appendChild(item);
-    });
-  }
-
-  /**
-   * The process facts the old Runtime tab showed, collapsed so the rail keeps the
-   * artboard's rhythm. The store origin appears as a host and nothing else: the
-   * console never resolves a credential, and this list only prints what it read.
-   */
-  function renderRuntimeRail(data) {
-    var box = byId('rail-runtime');
-    clear(box);
-
-    var rows = [
-      ['node', data.runtime.nodeVersion],
-      ['pid', String(data.runtime.pid)],
-      ['panel', data.runtime.storeHost === null ? '(sin configurar)' : data.runtime.storeHost],
-      ['sesión', data.runtime.sessionSource],
-      ['artefactos', data.runtime.artifactsDirAbsolute],
-      ['registros', data.runtime.recordDirAbsolute]
-    ];
-    rows.forEach(function (row) {
-      box.appendChild(make('p', 'meta', row[0] + ': ' + row[1]));
-    });
   }
 
   function renderOpenAttempts(data) {
@@ -611,14 +567,12 @@ export const CLIENT_JS = `(function () {
     renderSessionRail(data);
     renderRunsRail(data);
     renderErrorsRail(data);
-    renderArtifactsRail(data);
-    renderRuntimeRail(data);
     renderOpenAttempts(data);
   }
 
   function renderRailFailure(reason) {
     railState('rail-session-state', 'rail-session-text', 'bad', 'No se pudo leer', reason);
-    setText('rail-health', 'No se pudo leer el estado del agente: ' + reason);
+    renderExpiry(null);
   }
 
   function loadConsole(statusId) {

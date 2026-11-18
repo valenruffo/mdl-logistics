@@ -30,7 +30,6 @@ import { analyzeMessage } from '../../src/ui/actions';
 import { readConsole, resolveConsoleDeps, type ConsoleDeps } from '../../src/ui/console';
 import { formValuesFromFields } from '../../src/ui/form';
 import { LOCK_BUSY_MESSAGE, browserLock, withBrowserLock } from '../../src/ui/lock';
-import { REPORT_ON_DISK_NOTE } from '../../src/ui/page';
 import {
   runSessionCheckProcess,
   type SessionCheckChild,
@@ -228,12 +227,12 @@ test('a report full of recipient data contributes no text to /api/console, the p
       assert.deepEqual(latest['checks'], ['shipment-id', 'status-badge', 'label-button', 'form-mismatch', 'form-not-approved', 'outcome-unknown', 'reconciliation-unread']);
       assert.equal(latest['unparseable'], false);
 
-      // The page says where the full report is and that it must leave over SSH.
-      assert.ok(PAGE_HTML.includes(REPORT_ON_DISK_NOTE), 'the page carries the on-disk note');
-      assert.match(REPORT_ON_DISK_NOTE, /SSH/);
-      assert.match(REPORT_ON_DISK_NOTE, /destinatario/);
-      assert.match(pageText, /SSH/);
-      assert.match(scriptText, /SSH/);
+      // The page no longer explains where the report is: the rail shows the
+      // failing check and the time, and the on-disk note was removed on request.
+      assert.doesNotMatch(PAGE_HTML, /SSH/);
+      assert.doesNotMatch(pageText, /SSH/);
+      assert.doesNotMatch(scriptText, /SSH/);
+      assert.doesNotMatch(PAGE_HTML, /El informe completo, en disco/);
       assert.deepEqual(executor.calls, [], 'reading the console never drives the panel');
 
       // And the invalid report is reported by path only, over the same route,
@@ -295,7 +294,6 @@ test('a report full of recipient data contributes no text to /api/console, the p
 test('a check-history entry full of recipient data contributes no text to /api/console, the page or the script', async () => {
   const target = await box('check-pii');
   const { startUiServer, PAGE_HTML } = await import('../../src/ui/server');
-  const { SESSION_CHECK_OUTPUT_NOTE } = await import('../../src/ui/page');
 
   try {
     await mkdir(path.dirname(target.historyPath), { recursive: true });
@@ -376,10 +374,9 @@ test('a check-history entry full of recipient data contributes no text to /api/c
       assert.equal(parsed.session.history.unparseable, false);
       assert.equal(parsed.session.history.path, target.historyPath);
 
-      // The page says where the full output is and that it leaves over SSH.
-      assert.ok(PAGE_HTML.includes(SESSION_CHECK_OUTPUT_NOTE), 'the page carries the on-disk note');
-      assert.match(SESSION_CHECK_OUTPUT_NOTE, /SSH/);
-      assert.match(SESSION_CHECK_OUTPUT_NOTE, /historial/);
+      // One line per error: the page no longer carries the note about the file.
+      assert.doesNotMatch(PAGE_HTML, /SSH/);
+      assert.doesNotMatch(PAGE_HTML, /De dónde sale cada dato/);
 
       // The POST route projects the check it just ran the same way...
       const post = await authFetch(`${started.url}/api/session-check`, { method: 'POST' });
@@ -429,7 +426,10 @@ test('an unparseable check history is reported as unparseable, by path, never an
     assert.equal(snapshot.session.history.unparseable, true);
     assert.equal(snapshot.session.history.path, target.historyPath);
     assert.doesNotMatch(JSON.stringify(snapshot), new RegExp(marker));
-    assert.notEqual(snapshot.health.level, 'ok', 'a history nobody could read is never a yes');
+    assert.ok(
+      snapshot.warnings.some((warning) => warning.source === target.historyPath),
+      'a history nobody could read is a visible warning, never a silent zero',
+    );
   } finally {
     await cleanup(target);
   }

@@ -14,7 +14,7 @@
     "ship": "node --import tsx src/cli/ship.ts",
     "dry-run": "node --import tsx tests/e2e/dry-run.spec.ts",
     "safety-guard": "node scripts/safety-guard.mjs",
-    "test": "node --import tsx --test tests/unit/config.test.ts tests/unit/parse-message.test.ts tests/unit/provinces.test.ts tests/unit/approval-gate.test.ts tests/unit/run-record.test.ts tests/unit/normalize.test.ts tests/unit/label-unpaid.test.ts tests/unit/ui-console.test.ts tests/unit/ui-flow.test.ts tests/unit/ui-theme.test.ts tests/unit/store-origin.test.ts tests/unit/session-env.test.ts tests/unit/console.test.ts tests/unit/ui-hardening.test.ts tests/unit/auth.test.ts",
+    "test": "node --import tsx --test tests/unit/config.test.ts tests/unit/parse-message.test.ts tests/unit/provinces.test.ts tests/unit/approval-gate.test.ts tests/unit/run-record.test.ts tests/unit/normalize.test.ts tests/unit/label-unpaid.test.ts tests/unit/ui-console.test.ts tests/unit/ui-flow.test.ts tests/unit/ui-theme.test.ts tests/unit/ui-rail.test.ts tests/unit/store-origin.test.ts tests/unit/session-env.test.ts tests/unit/console.test.ts tests/unit/ui-hardening.test.ts tests/unit/auth.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

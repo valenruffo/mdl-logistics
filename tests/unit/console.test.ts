@@ -1,6 +1,6 @@
 /**
- * The maintenance console: tolerant reads, the file-name listing, the health
- * derivation, the explicit session check, and the absence of any purchase.
+ * The maintenance console: tolerant reads, the file-name listing, the panel
+ * cookie's expiry, the explicit session check, and the absence of any purchase.
  *
  * Everything here is offline and fictional (R11): temporary directories, invented
  * run records, invented reports. No browser is opened — the session check is
@@ -15,7 +15,9 @@
  *    because it served recipient PII and panel-session material);
  *  - the artifact tree being empty, missing or not a readable directory is a
  *    warning on a working page;
- *  - the health line is derived for every combination of its three facts;
+ *  - the expiry is the `expires` of the `admn_session` cookie and nothing else:
+ *    absent, session-only (`-1`) or unreadable means `desconocido`, never a
+ *    guess, and no cookie value ever reaches the snapshot;
  *  - the session check only runs when asked, records its exit code, and keeps a
  *    capped history; only its four closed facts (result, exit code, timestamp,
  *    duration) cross the HTTP boundary, and an unparseable history is reported by
@@ -31,7 +33,8 @@ import path from 'node:path';
 
 import {
   ARTIFACTS_DIR,
-  deriveHealth,
+  EXPIRY_SOON_DAYS,
+  expiryOfCookies,
   readConsole,
   resolveConsoleDeps,
   type ConsoleDeps,
@@ -41,7 +44,6 @@ import { relativeSegments } from '../../src/ui/paths';
 import {
   SESSION_CHECK_HISTORY_LIMIT,
   type SessionCheckEntry,
-  type SessionCheckFact,
 } from '../../src/ui/sessionCheck';
 import type { SessionCheckRunner } from '../../src/ui/sessionCheck';
 import { TEST_AUTH, authFetch, testContext } from './auth-fixtures';
@@ -184,11 +186,11 @@ test('the empty state renders notices instead of invented numbers', async () => 
       assert.match(messages, /todavía no existe/);
       assert.match(messages, /run-records/);
 
-      // No recorded check means the health line cannot claim the agent can work.
-      assert.equal(snapshot.health.level, 'warn');
-      assert.equal(snapshot.health.canWork, false);
-      assert.match(snapshot.health.line, /No se puede afirmar/);
-      assert.match(snapshot.health.line, /sesión/);
+      // No recorded check means the rail can only show its "Sin chequeos" word,
+      // and nothing is claimed about the panel cookie either.
+      assert.equal(snapshot.session.expiry.expiresAt, null);
+      assert.equal(snapshot.session.expiry.daysRemaining, null);
+      assert.equal(snapshot.session.expiry.soon, false);
     });
   } finally {
     cleanup(box);
@@ -247,11 +249,6 @@ test('an unresolved record carries the gate\'s own human-resolution instruction'
       assert.equal(row.outcome, null);
       assert.match(row.resolution ?? '', /human resolution/);
       assert.match(row.resolution ?? '', new RegExp(`${runId}\\.outcome\\.json`));
-
-      // An open record is what blocks the create path, so health says no.
-      assert.equal(snapshot.health.canWork, false);
-      assert.equal(snapshot.health.level, 'bad');
-      assert.match(snapshot.health.line, /intentos abiertos/);
     });
   } finally {
     cleanup(box);
@@ -311,7 +308,7 @@ test('a path a run record names is refused unless it is plain and relative', () 
 
 test('no route answers with an artifact file, and no href points at one', async () => {
   const box = await sandbox('no-artifact-route');
-  const { startUiServer, handleRequest, createRoutes, PAGE_HTML, CLIENT_JS, ARTIFACT_RETRIEVAL_INSTRUCTION } =
+  const { startUiServer, handleRequest, createRoutes, PAGE_HTML, CLIENT_JS } =
     await import('../../src/ui/server');
 
   try {
@@ -365,12 +362,15 @@ test('no route answers with an artifact file, and no href points at one', async 
       }
       assert.doesNotMatch(PAGE_HTML, /href\s*=/, 'the page carries no link at all');
       assert.doesNotMatch(CLIENT_JS, /\.href\s*=/, 'the script builds no link at all');
-      assert.ok(
-        PAGE_HTML.includes(ARTIFACT_RETRIEVAL_INSTRUCTION),
-        'the page tells the operator how the files are retrieved',
-      );
-      assert.match(ARTIFACT_RETRIEVAL_INSTRUCTION, /SSH/);
-      assert.match(ARTIFACT_RETRIEVAL_INSTRUCTION, /docker compose cp/);
+      // The rail no longer explains how the files are retrieved: that prose was
+      // removed on request and lives in the request docs instead.
+      for (const [name, source] of [
+        ['the page', PAGE_HTML],
+        ['the client script', CLIENT_JS],
+      ] as const) {
+        assert.doesNotMatch(source, /SSH/, `${name} must not carry the retrieval instructions`);
+        assert.doesNotMatch(source, /docker compose cp/, `${name} must not carry the retrieval example`);
+      }
 
       // The route table itself: every route is an exact path, and none names an artifact.
       for (const route of createRoutes(deps)) {
@@ -473,87 +473,128 @@ test('the page renders when the artifact tree is missing, empty, or not a direct
       assert.equal(unreadable.status, 'ok', 'an unreadable tree never crashes the page');
       assert.deepEqual(unreadable.artifacts.runs[0]?.files, []);
       assert.ok(unreadable.warnings.some((warning) => warning.source === box.artifactsDir));
-      assert.equal(unreadable.health.level, 'bad', 'an unwritable artifacts path is not a healthy state');
     });
   } finally {
     cleanup(box);
   }
 });
 
-// ------------------------------------------------------------- 4. health facts
+// --------------------------------------- 4. the panel cookie's expiry, as days
 
-test('health is derived for every combination of its three facts', () => {
-  const results = ['usable', 'unusable', 'config-refused', 'browser-failed'] as const;
+test('the expiry comes from the admn_session cookie and never from its value', async () => {
+  const box = await sandbox('expiry');
+  try {
+    const stateFile = path.join(box.root, 'storage-state.json');
+    const value = 'COOKIE-VALUE-MUST-NEVER-APPEAR';
+    const nowSeconds = Math.floor(Date.now() / 1_000);
+    const expires = nowSeconds + 10 * 86_400;
+    const expected = new Date(expires * 1_000).toISOString();
 
-  const entry = (result: (typeof results)[number]): SessionCheckFact => ({
-    runAt: '2026-02-06T09:00:00.000Z',
-    result,
-    exitCode: result === 'usable' ? 0 : result === 'unusable' ? 1 : result === 'config-refused' ? 2 : 3,
-    durationMs: 10,
-  });
+    await writeFile(
+      stateFile,
+      `${JSON.stringify({
+        cookies: [
+          { name: 'other', value, domain: 'example.invalid', path: '/', expires: nowSeconds + 99 * 86_400 },
+          { name: 'admn_session', value, domain: 'example.invalid', path: '/', expires },
+        ],
+        origins: [{ origin: 'https://example.invalid', localStorage: [{ name: 'token', value }] }],
+      })}\n`,
+      { encoding: 'utf8' },
+    );
 
-  const sessions: (SessionCheckFact | null)[] = [null, ...results.map(entry)];
-  const attemptSets: string[][] = [[], ['open-run']];
-  const writableFlags: boolean[] = [true, false];
+    await withEnv({ ...CLEAN_ENV, MDL_STORAGE_STATE: stateFile }, async () => {
+      const snapshot = await readConsole(depsOf(box, forbiddenRunner()));
 
-  for (const session of sessions) {
-    for (const unresolved of attemptSets) {
-      for (const writable of writableFlags) {
-        const health = deriveHealth({
-          lastCheck: session,
-          unresolvedRunIds: unresolved,
-          artifactsWritable: writable,
-          artifactsProblem: writable ? null : 'not writable',
-          artifactsDir: '/tmp/artifacts',
-        });
+      assert.equal(snapshot.session.expiry.expiresAt, expected, 'the cookie expiry, verbatim');
+      assert.ok(
+        snapshot.session.expiry.daysRemaining === 9 || snapshot.session.expiry.daysRemaining === 10,
+        `ten days out is reported as 9 or 10 whole days, got ${String(snapshot.session.expiry.daysRemaining)}`,
+      );
+      assert.equal(snapshot.session.expiry.soon, false, 'ten days out is not soon');
 
-        const sessionBad = session !== null && session.result !== 'usable';
-        const attemptsBad = unresolved.length > 0;
-        const artifactsBad = !writable;
-        const label = `${session?.result ?? 'none'}/${unresolved.length}/${String(writable)}`;
-
-        const expectedCanWork = session !== null && session.result === 'usable' && !attemptsBad && !artifactsBad;
-        const expectedLevel = sessionBad || attemptsBad || artifactsBad ? 'bad' : session === null ? 'warn' : 'ok';
-
-        assert.equal(health.canWork, expectedCanWork, `canWork for ${label}`);
-        assert.equal(health.level, expectedLevel, `level for ${label}`);
-        assert.equal(health.facts.length, 3);
-
-        if (expectedLevel === 'ok') assert.match(health.line, /^Sí:/);
-        else assert.doesNotMatch(health.line, /^Sí:/, `the line for ${label} must not claim yes`);
-        if (expectedLevel === 'bad') assert.match(health.line, /^No:/);
-        if (expectedLevel === 'warn') assert.match(health.line, /^No se puede afirmar/);
-
-        if (session === null) {
-          assert.equal(health.facts[0]?.level, 'warn', 'a session nobody checked is a warn, never a yes');
-        }
-        assert.equal(health.facts[1]?.level, attemptsBad ? 'bad' : 'ok');
-        assert.equal(health.facts[2]?.level, artifactsBad ? 'bad' : 'ok');
-      }
-    }
+      // The whole snapshot, as the page receives it: the timestamp and a day
+      // count, and no byte of the file that produced them.
+      const rendered = JSON.stringify(snapshot);
+      assert.doesNotMatch(rendered, new RegExp(value), 'no cookie value is ever serialised');
+      assert.doesNotMatch(rendered, /origins/, 'the origins block is not read');
+      assert.doesNotMatch(rendered, /example\.invalid/, 'no cookie domain is serialised');
+      assert.deepEqual(Object.keys(snapshot.session.expiry).sort(), ['daysRemaining', 'expiresAt', 'soon']);
+    });
+  } finally {
+    cleanup(box);
   }
+});
 
-  // The line names the fact that makes it a no.
-  const blocked = deriveHealth({
-    lastCheck: entry('usable'),
-    unresolvedRunIds: ['run-1', 'run-2'],
-    artifactsWritable: true,
-    artifactsProblem: null,
-    artifactsDir: '/tmp/artifacts',
-  });
-  assert.equal(blocked.level, 'bad');
-  assert.match(blocked.line, /intentos abiertos/);
-  assert.match(blocked.line, /run-1, run-2/);
+test('a missing cookie, a cookie without expiry or a corrupt file is unknown, never a guess', async () => {
+  const box = await sandbox('expiry-unknown');
+  try {
+    const stateFile = path.join(box.root, 'storage-state.json');
 
-  const unreadable = deriveHealth({
-    lastCheck: entry('usable'),
-    unresolvedRunIds: [],
-    artifactsWritable: false,
-    artifactsProblem: 'no se puede escribir en /tmp/artifacts',
-    artifactsDir: '/tmp/artifacts',
-  });
-  assert.equal(unreadable.level, 'bad');
-  assert.match(unreadable.line, /no se puede escribir/);
+    const cases: { label: string; body: string }[] = [
+      {
+        label: 'no admn_session cookie',
+        body: JSON.stringify({ cookies: [{ name: 'other', value: 'x', expires: 2_000_000_000 }], origins: [] }),
+      },
+      {
+        label: 'a session cookie (expires -1)',
+        body: JSON.stringify({ cookies: [{ name: 'admn_session', value: 'x', expires: -1 }], origins: [] }),
+      },
+      {
+        label: 'a cookie with no expires field',
+        body: JSON.stringify({ cookies: [{ name: 'admn_session', value: 'x' }], origins: [] }),
+      },
+      { label: 'a file that is not JSON', body: 'TITULAR-FICTICIA-EN-STORAGE-STATE not json' },
+    ];
+
+    await withEnv({ ...CLEAN_ENV, MDL_STORAGE_STATE: stateFile }, async () => {
+      for (const item of cases) {
+        await writeFile(stateFile, `${item.body}\n`, { encoding: 'utf8' });
+        const snapshot = await readConsole(depsOf(box, forbiddenRunner()));
+        assert.equal(snapshot.session.expiry.expiresAt, null, item.label);
+        assert.equal(snapshot.session.expiry.daysRemaining, null, item.label);
+        assert.equal(snapshot.session.expiry.soon, false, item.label);
+        assert.doesNotMatch(
+          JSON.stringify(snapshot),
+          /TITULAR-FICTICIA-EN-STORAGE-STATE|Unexpected token|JSON at position/,
+          `${item.label}: the file's bytes and the parser's message are never echoed`,
+        );
+      }
+    });
+
+    // The profile mode keeps its cookie inside Chromium: there is nothing to read.
+    await withEnv({ ...CLEAN_ENV, MDL_PROFILE: path.join(box.root, 'profile') }, async () => {
+      const snapshot = await readConsole(depsOf(box, forbiddenRunner()));
+      assert.equal(snapshot.session.file.mode, 'persistent-profile');
+      assert.equal(snapshot.session.expiry.daysRemaining, null);
+    });
+  } finally {
+    cleanup(box);
+  }
+});
+
+test('a cookie three days out is marked soon, and one already past is zero and marked', () => {
+  const now = Date.UTC(2026, 1, 10, 12, 0, 0);
+  const cookie = (expires: unknown) => [{ name: 'admn_session', value: 'never-read', expires }];
+
+  const three = expiryOfCookies(cookie(now / 1_000 + 3 * 86_400), now);
+  assert.equal(three.daysRemaining, EXPIRY_SOON_DAYS);
+  assert.equal(three.soon, true);
+  assert.equal(three.expiresAt, '2026-02-13T12:00:00.000Z');
+
+  const four = expiryOfCookies(cookie(now / 1_000 + 4 * 86_400), now);
+  assert.equal(four.daysRemaining, 4);
+  assert.equal(four.soon, false);
+
+  const past = expiryOfCookies(cookie(now / 1_000 - 5 * 86_400), now);
+  assert.equal(past.daysRemaining, 0, 'an expired cookie is zero days, not a negative number');
+  assert.equal(past.soon, true);
+
+  // Nothing that is not a positive number is an expiry.
+  for (const value of [undefined, null, -1, 0, 'also not a number', Number.NaN]) {
+    assert.equal(expiryOfCookies(cookie(value), now).daysRemaining, null, String(value));
+  }
+  assert.equal(expiryOfCookies('not an array', now).daysRemaining, null);
+  assert.equal(expiryOfCookies(undefined, now).daysRemaining, null);
 });
 
 // --------------------------------------------------------- 5. the session check
@@ -576,7 +617,7 @@ test('the session check records the exit code, and the snapshot carries only clo
       assert.doesNotMatch(JSON.stringify(outcome.check), /Ficticia Delvalle/);
 
       assert.deepEqual(outcome.problems, []);
-      assert.equal(outcome.snapshot.health.canWork, true, 'a usable check with nothing open makes the agent able to work');
+      assert.equal(outcome.snapshot.session.lastCheck?.result, 'usable');
 
       // The history file keeps the check's own text: only the projection changed.
       const stored: unknown = JSON.parse(await readFile(box.historyPath, { encoding: 'utf8' }));
@@ -694,7 +735,7 @@ test('the history keeps the newest checks, capped, and survives a corrupt file',
 
 // --------------------------------------------------------------- 6. no secrets
 
-test('no session content is rendered: only the file size and its date', async () => {
+test('no session content is rendered: a stat and the cookie expiry, nothing else', async () => {
   const box = await sandbox('secrets');
   try {
     const stateFile = path.join(box.root, 'storage-state.json');
@@ -716,7 +757,7 @@ test('no session content is rendered: only the file size and its date', async ()
         const snapshot = await readConsole(depsOf(box, forbiddenRunner()));
         const rendered = JSON.stringify(snapshot);
 
-        assert.doesNotMatch(rendered, new RegExp(sessionCookie), 'the session file is only stat-ed');
+        assert.doesNotMatch(rendered, new RegExp(sessionCookie), 'the cookie value is never serialised');
         assert.equal(snapshot.runtime.storeHost, 'tienda-ficticia.mitiendanube.com');
         assert.doesNotMatch(snapshot.runtime.storeHost ?? '', /^https/, 'the scheme is not part of the host');
         assert.equal(snapshot.runtime.headless, true);
@@ -725,6 +766,8 @@ test('no session content is rendered: only the file size and its date', async ()
         assert.equal(snapshot.session.file.isFile, true);
         assert.ok((snapshot.session.file.sizeBytes ?? 0) > 0);
         assert.match(snapshot.session.file.modifiedAt ?? '', /^\d{4}-\d{2}-\d{2}T/);
+        // A cookie that is not `admn_session` says nothing about the expiry.
+        assert.equal(snapshot.session.expiry.daysRemaining, null);
       },
     );
 

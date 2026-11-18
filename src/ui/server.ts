@@ -86,9 +86,9 @@ import { CLIENT_JS } from './client';
 import { performSessionCheck, readConsole, resolveConsoleDeps, type ConsoleDeps } from './console';
 import { LOGIN_HTML } from './login';
 import { LOCK_BUSY_MESSAGE, withBrowserLock } from './lock';
-import { ARTIFACT_RETRIEVAL_INSTRUCTION, PAGE_HTML } from './page';
+import { PAGE_HTML } from './page';
 
-export { ARTIFACT_RETRIEVAL_INSTRUCTION, CLIENT_JS, LOCK_BUSY_MESSAGE, LOGIN_HTML, PAGE_HTML };
+export { CLIENT_JS, LOCK_BUSY_MESSAGE, LOGIN_HTML, PAGE_HTML };
 
 /** Loopback only. Not configurable, by design. */
 export const HOST = '127.0.0.1';
@@ -463,7 +463,7 @@ export function createRoutes(deps: ActionDeps): Route[] {
       method: 'GET',
       path: '/api/console',
       purpose:
-        'estado de solo lectura para el rail: sesion, runs, artefactos, errores, runtime y la linea de salud derivada',
+        'estado de solo lectura para el rail: sesion, runs, errores y el vencimiento de la cookie del panel',
       public: false,
       handle: async () => json(200, await readConsole(consoleDeps)),
     },

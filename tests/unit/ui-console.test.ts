@@ -693,7 +693,7 @@ test('no route returns artifact bytes and no rendered link points at /artifacts/
   await writeFile(path.join(runDir, 'failure.png'), marker, { encoding: 'utf8' });
 
   const { executor } = fakeExecutor();
-  const { startUiServer, handleRequest, PAGE_HTML, CLIENT_JS, ARTIFACT_RETRIEVAL_INSTRUCTION } =
+  const { startUiServer, handleRequest, PAGE_HTML, CLIENT_JS } =
     await import('../../src/ui/server');
   const runDeps: ActionDeps = {
     executor,
@@ -736,7 +736,9 @@ test('no route returns artifact bytes and no rendered link points at /artifacts/
     assert.doesNotMatch(CLIENT_JS, /\/artifacts\//);
     assert.doesNotMatch(PAGE_HTML, /href\s*=/);
     assert.doesNotMatch(CLIENT_JS, /\.href\s*=/);
-    assert.ok(PAGE_HTML.includes(ARTIFACT_RETRIEVAL_INSTRUCTION));
+    // The retrieval instructions were removed from the rail on request.
+    assert.doesNotMatch(PAGE_HTML, /SSH/);
+    assert.doesNotMatch(CLIENT_JS, /SSH/);
 
     // And the raw dispatcher refuses the same shapes.
     for (const candidate of candidates) {

@@ -8,8 +8,9 @@
  * the explicit button reaches.
  *
  * What is stored is the check's own output, truncated, plus its exit code. The
- * session file and the profile are only `stat`ed elsewhere — never read here:
- * their contents are a credential (R15).
+ * session file and the profile are never read here: their contents are a
+ * credential (R15). The console reads that file for one number only — the
+ * `expires` of the `admn_session` cookie — and nothing else from it.
  *
  * **The stored output never leaves the process.** The history file keeps the
  * script's `message` and `output` verbatim so the operator can read them over
