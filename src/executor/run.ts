@@ -31,7 +31,7 @@ import {
 } from './envioNube';
 import { arsAmountsEqual, parseArsAmount } from './currency';
 import { branchIdentity } from './branch';
-import { ExecutorError, UnknownOutcomeError, detailsOf, messageOf } from './errors';
+import { ExecutorError, PreClickAbortError, UnknownOutcomeError, asPreClickAbort, detailsOf, messageOf } from './errors';
 import { openSession } from './session';
 
 /**
@@ -50,6 +50,14 @@ import { openSession } from './session';
  * the shipment id, asserts the label is still unpaid (the `Comprar` button is
  * visible; it is never clicked) and stops. An unknown outcome is reconciled
  * against the shipments list once, and never retried.
+ *
+ * The click boundary is the classification boundary (R10 as amended): every
+ * failure before the `Crear envío` click — opening the session, walking the
+ * journey, the payload check, the click's own precondition gates — raises a
+ * `PreClickAbortError`, because the click is the only action that can create a
+ * shipment and the caller resolves those aborts as `not-created` by itself.
+ * Failures after the click keep today's contract: `created` on success,
+ * unknown outcome reconciled once for the human to settle.
  */
 
 export interface RunOptions {
@@ -147,7 +155,11 @@ async function withPanel<T>(artifactsDir: string | undefined, job: (context: Run
   await mkdir(dir, { recursive: true });
   const tracePath = `${dir}/trace.zip`;
 
-  const session = await openSession();
+  // Opening the session is pre-click by definition (R10): without a session the
+  // click cannot happen, so a session failure cannot have created a shipment.
+  const session = await openSession().catch((error: unknown) => {
+    throw asPreClickAbort('session open', error);
+  });
   const page = session.page;
   let tracing = false;
 
@@ -155,11 +167,15 @@ async function withPanel<T>(artifactsDir: string | undefined, job: (context: Run
     await page.context().tracing.start({ screenshots: true, snapshots: true });
     tracing = true;
     const panel = new EnvioNube(page);
-    await panel.requireFrame();
+    // Locating the admin frame is still pre-click: nothing can be clicked yet.
+    await panel.requireFrame().catch((error: unknown) => {
+      throw asPreClickAbort('admin frame', error);
+    });
     return await job({ panel, page, artifactsDir: dir, tracePath });
   } catch (error) {
     const artifactDetails = await captureFailure(page, dir, tracePath);
     const details = [...detailsOf(error), ...artifactDetails];
+    if (error instanceof PreClickAbortError) throw new PreClickAbortError(error.stage, messageOf(error), details);
     if (error instanceof UnknownOutcomeError) throw new UnknownOutcomeError(messageOf(error), details);
     if (error instanceof ExecutorError) throw new ExecutorError(messageOf(error), details);
     throw new ExecutorError(`executor run failed: ${messageOf(error)}`, details);
@@ -355,18 +371,31 @@ async function runDomicilioCreate(input: RunOptions, request: ShipmentRequest): 
   const startedAt = new Date().toISOString();
 
   return withPanel(input.artifactsDir, async ({ panel, artifactsDir }) => {
-    const journey = await walkToSummary(panel, request);
+    // Everything up to `panel.createShipment` is pre-click (R10): the click is
+    // the only action that can create a shipment, so an abort during the walk
+    // or in the payload check cannot have created one and is classified as a
+    // pre-click abort, never as an unknown outcome.
+    let journey: JourneyReadback;
+    let payload: ApprovalPayload;
+    let formPayloadHash: string;
+    let approvedPayloadHash: string;
+    let mismatches: string[];
+    try {
+      journey = await walkToSummary(panel, request);
 
-    const payload: ApprovalPayload = approvalPayloadFromReadback(journey);
-    const formPayloadHash = hashApprovalPayload(payload);
-    const approvedPayloadHash = input.approvedPayloadHash.trim().toLowerCase();
-    const mismatches = compareReadback(request, journey);
+      payload = approvalPayloadFromReadback(journey);
+      formPayloadHash = hashApprovalPayload(payload);
+      approvedPayloadHash = input.approvedPayloadHash.trim().toLowerCase();
+      mismatches = compareReadback(request, journey);
 
-    if (mismatches.length > 0) {
-      throw new ExecutorError(
-        'refusing to create the shipment: the panel does not hold the approved payload',
-        mismatches,
-      );
+      if (mismatches.length > 0) {
+        throw new ExecutorError(
+          'refusing to create the shipment: the panel does not hold the approved payload',
+          mismatches,
+        );
+      }
+    } catch (error) {
+      throw asPreClickAbort('journey to the summary (screens 1-4)', error);
     }
 
     const base: CreateRunBase = {
@@ -382,25 +411,9 @@ async function runDomicilioCreate(input: RunOptions, request: ShipmentRequest): 
       reportPath: `${artifactsDir}/create-run.json`,
     };
 
+    let shipment: ShipmentDetailReadback;
     try {
-      const shipment = await panel.createShipment({ approvedHash: input.approvedPayloadHash, payload });
-
-      // Proof of the terminal state (S12): the label exists and is unpaid.
-      // `Comprar` is only inspected — there is no purchase action in the executor.
-      await panel.assertLabelUnpaid();
-      const screenshotPath = `${artifactsDir}/shipment-detail.png`;
-      const captured = await panel.captureEvidence(screenshotPath);
-
-      const result: CreateRunResult = {
-        ...base,
-        finishedAt: new Date().toISOString(),
-        outcome: 'created',
-        shipment,
-        reconciliation: null,
-        detailScreenshot: captured ? screenshotPath : null,
-      };
-      await writeFile(result.reportPath, `${JSON.stringify(result, null, 2)}\n`, { encoding: 'utf8' });
-      return result;
+      shipment = await panel.createShipment({ approvedHash: input.approvedPayloadHash, payload });
     } catch (error) {
       if (!(error instanceof UnknownOutcomeError)) throw error;
 
@@ -428,6 +441,23 @@ async function runDomicilioCreate(input: RunOptions, request: ShipmentRequest): 
       await writeFile(result.reportPath, `${JSON.stringify(result, null, 2)}\n`, { encoding: 'utf8' });
       return result;
     }
+
+    // Proof of the terminal state (S12): the label exists and is unpaid.
+    // `Comprar` is only inspected — there is no purchase action in the executor.
+    await panel.assertLabelUnpaid();
+    const screenshotPath = `${artifactsDir}/shipment-detail.png`;
+    const captured = await panel.captureEvidence(screenshotPath);
+
+    const result: CreateRunResult = {
+      ...base,
+      finishedAt: new Date().toISOString(),
+      outcome: 'created',
+      shipment,
+      reconciliation: null,
+      detailScreenshot: captured ? screenshotPath : null,
+    };
+    await writeFile(result.reportPath, `${JSON.stringify(result, null, 2)}\n`, { encoding: 'utf8' });
+    return result;
   });
 }
 
@@ -639,15 +669,27 @@ export async function sucursalCreateAgainst(
   artifactsDir?: string,
 ): Promise<CreateRunResult> {
   const startedAt = new Date().toISOString();
-  const journey = await walkSucursalToQuotation(panel, request);
+  // Everything up to `panel.createAgencyShipment` is pre-click (R10): the walk
+  // and the payload check cannot create a shipment, so their failures are
+  // classified as pre-click aborts, never as unknown outcomes.
+  let journey: SucursalJourneyReadback;
+  let payload: SucursalApprovalPayload;
+  let formPayloadHash: string;
+  let approved: string;
+  let mismatches: string[];
+  try {
+    journey = await walkSucursalToQuotation(panel, request);
 
-  const payload = sucursalPayloadFromJourney(journey);
-  const formPayloadHash = hashSucursalApprovalPayload(payload);
-  const approved = approvedPayloadHash.trim().toLowerCase();
-  const mismatches = sucursalMismatches(request, journey);
+    payload = sucursalPayloadFromJourney(journey);
+    formPayloadHash = hashSucursalApprovalPayload(payload);
+    approved = approvedPayloadHash.trim().toLowerCase();
+    mismatches = sucursalMismatches(request, journey);
 
-  if (mismatches.length > 0) {
-    throw new ExecutorError('refusing to create the shipment: the panel does not hold the approved payload', mismatches);
+    if (mismatches.length > 0) {
+      throw new ExecutorError('refusing to create the shipment: the panel does not hold the approved payload', mismatches);
+    }
+  } catch (error) {
+    throw asPreClickAbort('journey to the branch quotation (screens P-Q)', error);
   }
 
   const base: CreateRunBase = {
@@ -663,24 +705,11 @@ export async function sucursalCreateAgainst(
     reportPath: artifactsDir === undefined ? '' : `${artifactsDir}/create-run.json`,
   };
 
+  let shipment: ShipmentDetailReadback;
   try {
     // `createAgencyShipment` itself proves the unpaid label before returning;
     // an unproven label is a loud stop, never a success report.
-    const shipment = await panel.createAgencyShipment({ approvedHash: approvedPayloadHash, payload });
-
-    const screenshotPath = artifactsDir === undefined ? null : `${artifactsDir}/shipment-detail.png`;
-    const captured = screenshotPath === null ? false : await panel.captureEvidence(screenshotPath);
-
-    const result: CreateRunResult = {
-      ...base,
-      finishedAt: new Date().toISOString(),
-      outcome: 'created',
-      shipment,
-      reconciliation: null,
-      detailScreenshot: captured ? (screenshotPath as string) : null,
-    };
-    await writeReport(result.reportPath, result);
-    return result;
+    shipment = await panel.createAgencyShipment({ approvedHash: approvedPayloadHash, payload });
   } catch (error) {
     if (!(error instanceof UnknownOutcomeError)) throw error;
 
@@ -703,6 +732,20 @@ export async function sucursalCreateAgainst(
     await writeReport(result.reportPath, result);
     return result;
   }
+
+  const screenshotPath = artifactsDir === undefined ? null : `${artifactsDir}/shipment-detail.png`;
+  const captured = screenshotPath === null ? false : await panel.captureEvidence(screenshotPath);
+
+  const result: CreateRunResult = {
+    ...base,
+    finishedAt: new Date().toISOString(),
+    outcome: 'created',
+    shipment,
+    reconciliation: null,
+    detailScreenshot: captured ? (screenshotPath as string) : null,
+  };
+  await writeReport(result.reportPath, result);
+  return result;
 }
 
 async function runSucursalCreate(input: RunOptions): Promise<CreateRunResult> {

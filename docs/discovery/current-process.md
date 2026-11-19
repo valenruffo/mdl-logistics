@@ -138,7 +138,7 @@ discovery, and override any convenience the agent might prefer.
 | R7 | Do not assume an API exists without verifying its documentation. |
 | R8 | Identify which data an AI must extract from WhatsApp messages, and which operations must be resolved with conventional code. |
 | R9 | Do not implement features until the flow is understood. |
-| R10 | Never buy or confirm a label. Creating a shipment is allowed without ceremony: the operator pastes, reviews and creates. The purchase remains forbidden and has no code path. |
+| R10 | Never buy or confirm a label. Creating a shipment is allowed without ceremony: the operator pastes, reviews and creates. The purchase remains forbidden and has no code path. A run that aborts **before** the create click auto-resolves as `not-created`: only an outcome after the click (unknown/created) leaves a record open for human reconciliation — no blocking bureaucracy on failures that cannot have created anything. |
 | R11 | Use fictional data during tests. |
 | R12 | Never invent missing recipient or address data. |
 | R13 | Prioritize official APIs when they are available. |

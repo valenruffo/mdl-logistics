@@ -50,7 +50,7 @@ import { PROVINCE_OPTIONS } from '../core/provinces';
 import type { AnyShipmentRequest, MessageModality, ParseWarning } from '../core/types';
 import { approvalPayloadFromRequest, sucursalApprovalPayloadFromRequest } from '../executor/approval';
 import { labelUnpaidProblem, SUCURSAL_CARRIER_NAME, type CardReadback } from '../executor/envioNube';
-import { ExecutorError, UnknownOutcomeError, detailsOf, messageOf } from '../executor/errors';
+import { ExecutorError, PreClickAbortError, UnknownOutcomeError, detailsOf, messageOf } from '../executor/errors';
 import type { CreateRunResult, DryRunResult, RunOptions } from '../executor/run';
 import type { ConsoleOverrides } from './console';
 import {
@@ -284,6 +284,22 @@ export interface UnknownResponse {
   note: string;
 }
 
+/**
+ * A pre-click abort (R10 as amended): the run stopped before `Crear envío`, so
+ * nothing was created, the record was resolved automatically as `not-created`,
+ * and the message can run again without any human reconciliation.
+ */
+export interface NotCreatedResponse {
+  status: 'not-created';
+  /** The pre-click stage the run reached, as the executor named it. */
+  stage: string;
+  reason: string;
+  details: string[];
+  recordPath: string;
+  outcomePath: string;
+  note: string;
+}
+
 export interface FailedResponse {
   status: 'failed';
   reason: string;
@@ -300,6 +316,7 @@ export type RunResponse =
   | DryRunResponse
   | CreatedResponse
   | UnknownResponse
+  | NotCreatedResponse
   | FailedResponse;
 
 const SUMMARY_MODALITY_CARD = 'Modalidad de envío';
@@ -455,6 +472,35 @@ async function create(
         recordPath,
         outcomePath,
         note: `compará a mano la lista de envíos con el registro ${recordPath}. No se reintenta nada.`,
+      };
+    }
+
+    if (error instanceof PreClickAbortError) {
+      // R10 as amended: the click is the only action that can create a
+      // shipment, so an abort before it resolves itself as `not-created`. The
+      // pre-click record stays on disk (crash visibility); only the resolution
+      // is automatic, and the message can run again with no human step.
+      await writeOutcome(deps, {
+        runId,
+        finishedAt: new Date().toISOString(),
+        status: 'not-created',
+        shipmentId: null,
+        costShown: { summaryModality: null, detailShipmentData: null },
+        buyButtonVisible: false,
+        buyCardText: null,
+        reconciliation: null,
+        reportPath: '',
+        recordedBy: 'executor',
+        reason: `aborted before the create click, at: ${error.stage}`,
+      });
+      return {
+        status: 'not-created',
+        stage: error.stage,
+        reason: reasonOf(error),
+        details: detailsOf(error),
+        recordPath,
+        outcomePath,
+        note: 'no se hizo ningún click: nada se creó. La corrida quedó resuelta como «sin crear» y este mensaje se puede repetir.',
       };
     }
 

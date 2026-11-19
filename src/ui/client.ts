@@ -718,6 +718,23 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
       return;
     }
 
+    if (data.status === 'not-created') {
+      renderErrorCard({
+        heading: 'El envío no se creó.',
+        sub: 'La corrida se detuvo antes del click: nada se creó y la corrida quedó resuelta sola.',
+        action: 'Podés repetir este mensaje cuando quieras: no hay nada que conciliar.',
+        lines: technicalLines(data.details).concat([
+          data.reason,
+          'Etapa alcanzada: ' + data.stage,
+          data.recordPath ? 'registro previo al click: ' + data.recordPath : '',
+          data.outcomePath ? 'desenlace escrito: ' + data.outcomePath : '',
+        ]),
+        note: data.note,
+      });
+      setStatus('run-status', 'El envío no se creó. La corrida quedó resuelta: podés reintentar.', 'warn');
+      return;
+    }
+
     renderErrorCard({
       heading: 'No se pudo crear el envío.',
       sub: 'La corrida se detuvo: no se puede saber hasta qué paso llegó.',

@@ -23,9 +23,9 @@ import {
   type BranchOption,
 } from '../../src/executor/envioNube';
 import { parseArsAmount } from '../../src/executor/currency';
-import { ExecutorError } from '../../src/executor/errors';
+import { ExecutorError, PreClickAbortError } from '../../src/executor/errors';
 import { STORE_ORIGIN_VARIABLE } from '../../src/executor/panel';
-import { sucursalCreateAgainst, sucursalDryRunAgainst } from '../../src/executor/run';
+import { sucursalCreateAgainst, sucursalDryRunAgainst, walkSucursalToQuotation } from '../../src/executor/run';
 import { buildSucursalHarness, DEFAULT_BRANCHES, type HarnessOption, type SucursalHarness } from './sucursal-harness';
 
 /**
@@ -449,6 +449,60 @@ test('a changed payload hash stops the create path before anything is clicked', 
     },
   );
   assert.equal(harness.createClickCount(), 0, 'the hash gate fired before the click');
+});
+
+// ------------------------------------------------- R10 as amended: pre-click aborts
+
+test('a refusal during the create walk is a pre-click abort naming the stage reached', async () => {
+  // The quotation section that never renders stops the walk mid-journey: still
+  // pre-click, so it must come out classified as a pre-click abort.
+  const harness = buildSucursalHarness({ quotationDeferral: 'never' });
+  const panel = newPanel(harness);
+
+  await assert.rejects(
+    () => sucursalCreateAgainst(panel, REQUEST, APPROVED_HASH),
+    (error: unknown) => {
+      assert.ok(error instanceof PreClickAbortError, 'the walk refusal is classified as a pre-click abort');
+      assert.equal(error.stage, 'journey to the branch quotation (screens P-Q)');
+      assert.match(error.message, /never appeared/);
+      return true;
+    },
+  );
+  assert.equal(harness.createClickCount(), 0, 'nothing was clicked, so nothing was created');
+});
+
+test('a create-gate refusal inside the click call is a pre-click abort, not an unknown outcome', async () => {
+  const harness = buildSucursalHarness();
+  const panel = newPanel(harness);
+
+  // The gates run on screen Q, so the walk completes first: the refusal below
+  // is the click call's own precondition, not a journey failure.
+  await walkSucursalToQuotation(panel, REQUEST);
+
+  await assert.rejects(
+    () =>
+      panel.createAgencyShipment({
+        approvedHash: 'f'.repeat(64),
+        payload: {
+          zipCode: REQUEST.zipCode,
+          sucursal: REQUEST.sucursal,
+          carrier: SUCURSAL_CARRIER_NAME,
+          height: '20',
+          width: '25',
+          depth: '10',
+          weight: '700',
+          declaredValue: '',
+          customer: { name: 'Marta', surname: 'García', email: 'marta@ejemplo.com', phone: '1155667788' },
+        },
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof PreClickAbortError, 'the gate runs before the click, so it is a pre-click abort');
+      assert.equal(error.stage, 'create gates (sucursal screen Q)');
+      assert.match(error.message, /does not match the approved payload hash/);
+      return true;
+    },
+  );
+  assert.equal(harness.createClickCount(), 0);
 });
 
 test('create mode: one gated click, then the unpaid label is proven structurally', async () => {

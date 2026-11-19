@@ -10,8 +10,11 @@
  *   CLI asked for one — the confirmation the operator typed. If the process dies
  *   mid-click, this is the only trace that a shipment may have been created.
  * - `<runId>.outcome.json` — added only once an outcome is known: `created` with
- *   the `#EM<number>`, or `unknown` with the single reconciliation report. A
- *   human adds `not-created` by hand after checking the shipment list.
+ *   the `#EM<number>`, `unknown` with the single reconciliation report, or —
+ *   written by the executor itself (R10 as amended) — `not-created` with a short
+ *   reason naming the stage, when the run aborted **before** the create click.
+ *   A human adds `not-created` by hand only for the genuinely open records:
+ *   clicked-but-unknown ones, after checking the shipment list.
  *
  * A record without an outcome file is `attempted-unresolved` and blocks any new
  * run for the same message hash (`assertNoBlockingPriorAttempt`). Reading is
@@ -64,6 +67,12 @@ export interface RunOutcomeRecord {
   reconciliation: unknown;
   reportPath: string;
   recordedBy: 'executor' | 'human';
+  /**
+   * For an executor-recorded `not-created`: the pre-click stage the run
+   * reached (`aborted before the create click, at: ...`). Absent on records
+   * written by humans and on `created`/`unknown` records.
+   */
+  reason?: string | null;
 }
 
 export function attemptRecordPath(dir: string, runId: string): string {

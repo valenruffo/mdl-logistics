@@ -333,6 +333,11 @@ export interface ExistingRun {
  *
  * Only a human clears one of these: by recording an outcome of `not-created`
  * (after checking the shipment list) or `created` (naming the shipment).
+ *
+ * A pre-click abort never becomes one of these (R10 as amended): the click is
+ * the only action that can create a shipment, so the executor resolves every
+ * abort that happened before it as `not-created` by itself, and a run that
+ * stopped before the click never blocks a retry.
  */
 export function assertNoBlockingPriorAttempt(records: readonly ExistingRun[], messageHash: string): void {
   const sameMessage = records.filter((record) => record.messageHash === messageHash);

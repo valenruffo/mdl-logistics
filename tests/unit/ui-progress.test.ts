@@ -312,6 +312,17 @@ const FAILED_BODY = {
   note: 'el registro queda attempted-unresolved a propósito: revisá la lista de envíos antes de repetir este mensaje',
 };
 
+/** A pre-click abort exactly as the run handler answers it (R10 as amended). */
+const NOT_CREATED_BODY = {
+  status: 'not-created',
+  stage: 'journey to the summary (screens 1-4)',
+  reason: 'PreClickAbortError: refusing to create the shipment: the panel does not hold the approved payload',
+  details: ['zipCode: expected "1901", the panel holds "1902"'],
+  recordPath: `run-records/${UNRESOLVED_RUN_ID}.json`,
+  outcomePath: `run-records/${UNRESOLVED_RUN_ID}.outcome.json`,
+  note: 'no se hizo ningún click: nada se creó. La corrida quedó resuelta como «sin crear» y este mensaje se puede repetir.',
+};
+
 // --------------------------------------------------- 1. the progress estimate
 
 test('the domicilio progress card shows the seven journey steps and an approximate percentage', async () => {
@@ -486,6 +497,29 @@ test('a failed run names the problem, the open record and keeps the raw reason c
   assert.match(body.textContent, new RegExp(FAILED_BODY.recordPath.replaceAll('.', '\\.')), 'the record path is in the details');
   assert.match(body.textContent, /the form no longer holds the values/, 'the raw reason is demoted, not removed');
   assert.equal(page.text('result').includes('"runId"'), false);
+});
+
+test('a pre-click abort renders its own tier: nothing was created and the retry is free', async () => {
+  const page = await boot('domicilio');
+  page.runGate.settle(NOT_CREATED_BODY);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const card = resultCard(page);
+  assert.equal(cardChild(card, 'error-heading')!.textContent, 'El envío no se creó.');
+  assert.match(
+    cardChild(card, 'error-action')!.textContent,
+    /Podés repetir este mensaje cuando quieras/,
+    'the actionable sentence matches the failure kind: nothing is open, no reconciliation needed',
+  );
+
+  const body = cardChild(card, 'error-detail-body')!;
+  assert.match(body.textContent, /Etapa alcanzada: journey to the summary/, 'the stage reached is named');
+  assert.match(body.textContent, new RegExp(NOT_CREATED_BODY.recordPath.replaceAll('.', '\\.')), 'the record path is in the details');
+
+  // R10 as amended: no resolve-the-record instruction where none applies.
+  const whole = page.text('result');
+  assert.equal(whole.includes('resolvé la corrida'), false);
+  assert.equal(whole.includes('attempted-unresolved'), false);
 });
 
 test('an HTTP failure of the run POST itself gets the same tiers', async () => {

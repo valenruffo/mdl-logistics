@@ -17,7 +17,7 @@ import {
 import { hashApprovalPayload, type ApprovalPayload } from './approval';
 import { copyPattern } from './copy';
 import { arsAmountsEqual, formatArsTyping, parseArsAmount } from './currency';
-import { ExecutorError, UnknownOutcomeError, detailsOf, messageOf } from './errors';
+import { ExecutorError, UnknownOutcomeError, asPreClickAbort, detailsOf, messageOf } from './errors';
 import { readEnvInt } from './env';
 import { adminAppDashboardUrl, BOT_CHALLENGE_FRAME_HOST, ENVIO_NUBE_FRAME_HOST, VERIFIED_AGENCY_PANEL_URL } from './panel';
 import { gotoAgencyEntry } from './session';
@@ -1843,56 +1843,67 @@ export class EnvioNube {
    * never retried and the button is never clicked again.
    */
   async createAgencyShipment(approval: SucursalCreateApproval): Promise<ShipmentDetailReadback> {
-    if (this.createAttempted) {
-      throw new ExecutorError(
-        'refusing to click "Crear envío" a second time in one run: reconcile the first attempt against the shipments list instead',
-      );
-    }
-
-    const frame = await this.waitForRoute(AGENCY_ROUTES.quotation);
-
-    const formHash = hashSucursalApprovalPayload(approval.payload);
-    const approvedHash = approval.approvedHash.trim().toLowerCase();
-    if (approvedHash === '' || formHash !== approvedHash) {
-      const details = [
-        `approved hash: ${approvedHash === '' ? '(empty)' : approvedHash}`,
-        `form hash:     ${formHash}`,
-        'the panel no longer holds the approved payload, so nothing was clicked',
-      ];
-      throw new ExecutorError('refusing to create the shipment: the form does not match the approved payload hash', details);
-    }
-
-    const button = frame.getByRole('button', { name: copyPattern(CREATE_BUTTON, { exact: true }) }).first();
-    if (!(await button.isVisible().catch(() => false))) {
-      throw new ExecutorError(`the "${CREATE_BUTTON}" button is not visible; nothing was clicked`, await this.describe(frame));
-    }
-
-    this.createAttempted = true;
-    this.note(`clicking "${CREATE_BUTTON}" once on the sucursal quotation screen (approved hash ${approvedHash.slice(0, 12)}…)`);
-    let clickError: string | null = null;
+    // The gates below run before the click, and `createAttempted` is set
+    // immediately before the click, so any error caught with the flag still
+    // false happened pre-click (R10): nothing was clicked, therefore nothing
+    // was created, and the abort is classified as such instead of leaving an
+    // unresolved record. After the flag is set, today's contract holds.
+    const wasClicked = this.createAttempted;
     try {
-      await button.click({ timeout: this.timeoutMs });
-    } catch (error) {
-      clickError = messageOf(error);
-    }
+      if (this.createAttempted) {
+        throw new ExecutorError(
+          'refusing to click "Crear envío" a second time in one run: reconcile the first attempt against the shipments list instead',
+        );
+      }
 
-    const detailFrame = await this.waitForDetailFrame(clickError);
-    const path = pathnameOf(detailFrame.url());
-    if (!path.startsWith(SHIPMENT_DETAIL_ROUTE)) {
-      throw new UnknownOutcomeError(
-        `after clicking "${CREATE_BUTTON}" a "#EM<number>" heading appeared outside the shipping-details route (frame path "${path}")`,
-        await this.describe(detailFrame),
-      );
+      const frame = await this.waitForRoute(AGENCY_ROUTES.quotation);
+
+      const formHash = hashSucursalApprovalPayload(approval.payload);
+      const approvedHash = approval.approvedHash.trim().toLowerCase();
+      if (approvedHash === '' || formHash !== approvedHash) {
+        const details = [
+          `approved hash: ${approvedHash === '' ? '(empty)' : approvedHash}`,
+          `form hash:     ${formHash}`,
+          'the panel no longer holds the approved payload, so nothing was clicked',
+        ];
+        throw new ExecutorError('refusing to create the shipment: the form does not match the approved payload hash', details);
+      }
+
+      const button = frame.getByRole('button', { name: copyPattern(CREATE_BUTTON, { exact: true }) }).first();
+      if (!(await button.isVisible().catch(() => false))) {
+        throw new ExecutorError(`the "${CREATE_BUTTON}" button is not visible; nothing was clicked`, await this.describe(frame));
+      }
+
+      this.createAttempted = true;
+      this.note(`clicking "${CREATE_BUTTON}" once on the sucursal quotation screen (approved hash ${approvedHash.slice(0, 12)}…)`);
+      let clickError: string | null = null;
+      try {
+        await button.click({ timeout: this.timeoutMs });
+      } catch (error) {
+        clickError = messageOf(error);
+      }
+
+      const detailFrame = await this.waitForDetailFrame(clickError);
+      const path = pathnameOf(detailFrame.url());
+      if (!path.startsWith(SHIPMENT_DETAIL_ROUTE)) {
+        throw new UnknownOutcomeError(
+          `after clicking "${CREATE_BUTTON}" a "#EM<number>" heading appeared outside the shipping-details route (frame path "${path}")`,
+          await this.describe(detailFrame),
+        );
+      }
+      const detail = await this.detailFrom(detailFrame);
+      const unpaidProblem = labelUnpaidProblem(detail);
+      if (unpaidProblem !== null) {
+        throw new ExecutorError(unpaidProblem.message, [
+          ...unpaidProblem.details,
+          ...(await this.describe(detailFrame)),
+        ]);
+      }
+      return detail;
+    } catch (error) {
+      if (wasClicked || this.createAttempted) throw error;
+      throw asPreClickAbort('create gates (sucursal screen Q)', error);
     }
-    const detail = await this.detailFrom(detailFrame);
-    const unpaidProblem = labelUnpaidProblem(detail);
-    if (unpaidProblem !== null) {
-      throw new ExecutorError(unpaidProblem.message, [
-        ...unpaidProblem.details,
-        ...(await this.describe(detailFrame)),
-      ]);
-    }
-    return detail;
   }
 
   // ------------------------------------------------- screen 4: the summary
@@ -2006,63 +2017,71 @@ export class EnvioNube {
    * retried and the button is never clicked again.
    */
   async createShipment(approval: CreateApproval): Promise<ShipmentDetailReadback> {
-    if (this.createAttempted) {
-      throw new ExecutorError(
-        'refusing to click "Crear envío" a second time in one run: reconcile the first attempt against the shipments list instead',
-      );
-    }
-
-    await this.assertSummaryVisible();
-    const frame = await this.waitForSummaryHeading('screen 4 (Resumen del envío)');
-
-    const formHash = hashApprovalPayload(approval.payload);
-    const approvedHash = approval.approvedHash.trim().toLowerCase();
-    if (approvedHash === '' || formHash !== approvedHash) {
-      const details = [
-        `approved hash: ${approvedHash === '' ? '(empty)' : approvedHash}`,
-        `form hash:     ${formHash}`,
-        'the panel no longer holds the approved payload, so nothing was clicked',
-      ];
-      throw new ExecutorError('refusing to create the shipment: the form does not match the approved payload hash', details);
-    }
-
-    const recipientName = [approval.payload.customer.name, approval.payload.customer.lastName]
-      .map((part) => part.trim())
-      .filter((part) => part !== '')
-      .join(' ');
-    if (recipientName !== '' && !(await this.textPresent(frame, recipientName))) {
-      const details = [
-        `approved recipient: ${JSON.stringify(recipientName)}`,
-        'the summary does not name this recipient, so it may be a stale screen',
-        ...(await this.describe(frame)),
-      ];
-      throw new ExecutorError('refusing to create the shipment: the summary does not show the approved recipient', details);
-    }
-
-    const button = frame.getByRole('button', { name: copyPattern(CREATE_BUTTON, { exact: true }) }).first();
-    if (!(await button.isVisible().catch(() => false))) {
-      throw new ExecutorError(`the "${CREATE_BUTTON}" button is not visible; nothing was clicked`, await this.describe(frame));
-    }
-
-    this.createAttempted = true;
-    this.note(`clicking "${CREATE_BUTTON}" once (approved hash ${approvedHash.slice(0, 12)}…)`);
-    let clickError: string | null = null;
+    // Same classification as `createAgencyShipment`: everything before the
+    // click is pre-click, so its failures cannot have created a shipment (R10).
+    const wasClicked = this.createAttempted;
     try {
-      await button.click({ timeout: this.timeoutMs });
-    } catch (error) {
-      clickError = messageOf(error);
-    }
+      if (this.createAttempted) {
+        throw new ExecutorError(
+          'refusing to click "Crear envío" a second time in one run: reconcile the first attempt against the shipments list instead',
+        );
+      }
 
-    const detailFrame = await this.waitForDetailFrame(clickError);
-    const detail = await this.detailFrom(detailFrame);
-    const unpaidProblem = labelUnpaidProblem(detail);
-    if (unpaidProblem !== null) {
-      throw new ExecutorError(unpaidProblem.message, [
-        ...unpaidProblem.details,
-        ...(await this.describe(detailFrame)),
-      ]);
+      await this.assertSummaryVisible();
+      const frame = await this.waitForSummaryHeading('screen 4 (Resumen del envío)');
+
+      const formHash = hashApprovalPayload(approval.payload);
+      const approvedHash = approval.approvedHash.trim().toLowerCase();
+      if (approvedHash === '' || formHash !== approvedHash) {
+        const details = [
+          `approved hash: ${approvedHash === '' ? '(empty)' : approvedHash}`,
+          `form hash:     ${formHash}`,
+          'the panel no longer holds the approved payload, so nothing was clicked',
+        ];
+        throw new ExecutorError('refusing to create the shipment: the form does not match the approved payload hash', details);
+      }
+
+      const recipientName = [approval.payload.customer.name, approval.payload.customer.lastName]
+        .map((part) => part.trim())
+        .filter((part) => part !== '')
+        .join(' ');
+      if (recipientName !== '' && !(await this.textPresent(frame, recipientName))) {
+        const details = [
+          `approved recipient: ${JSON.stringify(recipientName)}`,
+          'the summary does not name this recipient, so it may be a stale screen',
+          ...(await this.describe(frame)),
+        ];
+        throw new ExecutorError('refusing to create the shipment: the summary does not show the approved recipient', details);
+      }
+
+      const button = frame.getByRole('button', { name: copyPattern(CREATE_BUTTON, { exact: true }) }).first();
+      if (!(await button.isVisible().catch(() => false))) {
+        throw new ExecutorError(`the "${CREATE_BUTTON}" button is not visible; nothing was clicked`, await this.describe(frame));
+      }
+
+      this.createAttempted = true;
+      this.note(`clicking "${CREATE_BUTTON}" once (approved hash ${approvedHash.slice(0, 12)}…)`);
+      let clickError: string | null = null;
+      try {
+        await button.click({ timeout: this.timeoutMs });
+      } catch (error) {
+        clickError = messageOf(error);
+      }
+
+      const detailFrame = await this.waitForDetailFrame(clickError);
+      const detail = await this.detailFrom(detailFrame);
+      const unpaidProblem = labelUnpaidProblem(detail);
+      if (unpaidProblem !== null) {
+        throw new ExecutorError(unpaidProblem.message, [
+          ...unpaidProblem.details,
+          ...(await this.describe(detailFrame)),
+        ]);
+      }
+      return detail;
+    } catch (error) {
+      if (wasClicked || this.createAttempted) throw error;
+      throw asPreClickAbort('create gates (summary screen 4)', error);
     }
-    return detail;
   }
 
   private async waitForDetailFrame(clickError: string | null): Promise<Frame> {

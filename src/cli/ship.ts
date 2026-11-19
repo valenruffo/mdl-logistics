@@ -31,7 +31,7 @@ import {
 } from '../executor/approval';
 import { SUCURSAL_CARRIER_NAME } from '../executor/envioNube';
 import type { CardReadback } from '../executor/envioNube';
-import { ExecutorError, UnknownOutcomeError, detailsOf, messageOf } from '../executor/errors';
+import { ExecutorError, PreClickAbortError, UnknownOutcomeError, detailsOf, messageOf } from '../executor/errors';
 import type { CreateRunResult, DryRunResult } from '../executor/run';
 import {
   GateRefused,
@@ -303,6 +303,10 @@ async function main(): Promise<number> {
     const result = await runCreate({ request, approvedPayloadHash: verifiedHash ?? approvalHash });
     return await recordOutcome(runId, result);
   } catch (error) {
+    // R10 as amended: an abort before the create click cannot have created a
+    // shipment, so it resolves itself as `not-created` and the message can run
+    // again. A post-click unknown outcome still stays open for a human.
+    if (error instanceof PreClickAbortError) return reportPreClickStop(error, runId);
     // An unknown outcome already carries its own single reconciliation attempt in
     // `runCreate`. Either way the record stays unresolved on purpose.
     return reportExecutorStop(error, {
@@ -310,6 +314,34 @@ async function main(): Promise<number> {
       record: attemptRecordPath(RUN_RECORD_DIR, runId),
     });
   }
+}
+
+/**
+ * A pre-click abort (R10 as amended): the record is resolved automatically as
+ * `not-created` — the pre-click record file stays on disk — and the operator is
+ * told the message can run again, with no reconciliation step.
+ */
+async function reportPreClickStop(error: PreClickAbortError, runId: string): Promise<number> {
+  await writeOutcomeSafely({
+    runId,
+    finishedAt: new Date().toISOString(),
+    status: 'not-created',
+    shipmentId: null,
+    costShown: { summaryModality: null, detailShipmentData: null },
+    buyButtonVisible: false,
+    buyCardText: null,
+    reconciliation: null,
+    reportPath: '',
+    recordedBy: 'executor',
+    reason: `aborted before the create click, at: ${error.stage}`,
+  });
+
+  console.error(`\nSTOPPED — NOTHING WAS CREATED: ${error.message}`);
+  console.error(`  the run stopped before the "Crear envío" click (stage: ${error.stage}), so no shipment can exist.`);
+  for (const detail of detailsOf(error)) console.error(`  - ${detail}`);
+  console.error(`\n  the record was resolved automatically as "not-created" (${outcomeRecordPath(RUN_RECORD_DIR, runId)}).`);
+  console.error('  this message can run again; nothing needs manual reconciliation.');
+  return 1;
 }
 
 /**
@@ -331,7 +363,7 @@ async function priorAttemptNote(messageHash: string, blocking: boolean): Promise
   }
   const resolved = sameMessage.filter((record) => record.outcome?.status === 'not-created');
   if (resolved.length === 0) return '';
-  return `${resolved.length} earlier run(s) for this message were resolved as "not-created" by a human; this is a new attempt`;
+  return `${resolved.length} earlier run(s) for this message were resolved as "not-created"; this is a new attempt`;
 }
 
 /** Records the outcome durably and returns the exit code. */
@@ -410,6 +442,10 @@ async function writeOutcomeSafely(outcome: RunOutcomeRecord): Promise<void> {
 function reportExecutorStop(error: unknown, context?: { runId: string; record: string }): number {
   if (error instanceof UnknownOutcomeError) {
     console.error(`\nSTOPPED — UNKNOWN OUTCOME: ${error.message}`);
+  } else if (error instanceof PreClickAbortError) {
+    // Unreachable from the create path (handled earlier), kept for the dry run,
+    // where a pre-click abort is reported without a record to resolve.
+    console.error(`\nSTOPPED — NOTHING WAS CREATED: ${error.message}`);
   } else if (error instanceof ExecutorError) {
     console.error(`\nSTOPPED: ${error.name}: ${error.message}`);
   } else {
