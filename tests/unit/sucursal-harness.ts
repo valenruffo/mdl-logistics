@@ -705,8 +705,16 @@ function measureDiv(
   return div;
 }
 
-const DEFAULT_BRANCHES: HarnessOption[] = [
-  { value: 'uuid-villa-devoto', text: 'Villa Devoto (Av Beiro) - Av. Francisco Beiró, 4740, C.A.B.A., Buenos Aires' },
+/**
+ * The fake dropdown's options, in the **decorated panel form** observed live:
+ * the panel prefixes the branch name (`Sucursal - `, `Punto Andreani Hop - `)
+ * and repeats the city after the address, while the customer message carries
+ * the bare name. The executor matches by street+number identity, so both sides
+ * name the same branch. Exported so tests can assert against the panel's own
+ * spelling.
+ */
+export const DEFAULT_BRANCHES: HarnessOption[] = [
+  { value: 'uuid-villa-devoto', text: 'Sucursal - Villa Devoto (Av Beiro) - Av. Francisco Beiró, 4740, C.A.B.A., Buenos Aires' },
   { value: 'uuid-hop-1', text: 'Punto Andreani Hop - Av. San Martín 5001, C.A.B.A., Buenos Aires' },
   { value: 'uuid-hop-2', text: 'Punto Andreani Hop - Av. Triunvirato 4300, C.A.B.A., Buenos Aires' },
 ];

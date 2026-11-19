@@ -26,7 +26,7 @@ import { parseArsAmount } from '../../src/executor/currency';
 import { ExecutorError } from '../../src/executor/errors';
 import { STORE_ORIGIN_VARIABLE } from '../../src/executor/panel';
 import { sucursalCreateAgainst, sucursalDryRunAgainst } from '../../src/executor/run';
-import { buildSucursalHarness, type SucursalHarness } from './sucursal-harness';
+import { buildSucursalHarness, DEFAULT_BRANCHES, type HarnessOption, type SucursalHarness } from './sucursal-harness';
 
 /**
  * The sucursal walk now enters by **direct URL navigation**, which composes the
@@ -104,6 +104,7 @@ test('a branch name that matches no option is a rejection listing the real optio
   const match = matchSucursalBranch('Sucursal Que No Existe', REAL_OPTIONS);
   assert.equal(match.kind, 'none');
   if (match.kind !== 'none') throw new Error('unreachable');
+  assert.equal(match.rule, 'full-text', 'no number in the name, so the full-text fallback decided');
   assert.deepEqual(
     match.options.map((option) => option.text),
     REAL_OPTIONS.map((option) => option.text),
@@ -119,8 +120,9 @@ test('a branch name that matches no option is a rejection listing the real optio
     (error: unknown) => {
       assert.ok(error instanceof ExecutorError);
       assert.match(error.message, /no sucursal option matches/);
+      assert.match(error.message, /full text \(exact after normalization\) rule failed/, 'the rejection names which rule failed');
       // The rejection lists the panel's real options, R12.
-      for (const option of REAL_OPTIONS) {
+      for (const option of DEFAULT_BRANCHES) {
         assert.ok(
           error.details.some((detail) => detail.includes(option.text)),
           `the rejection lists ${option.text}`,
@@ -131,17 +133,118 @@ test('a branch name that matches no option is a rejection listing the real optio
   );
 });
 
+test('the street+number rule: no option containing the pair is a rejection naming the street-pair rule', () => {
+  // The harness dropdown holds the decorated Villa Devoto / Hop options only,
+  // so an approved name for a different address finds no street candidate.
+  const harness = buildSucursalHarness();
+  const panel = newPanel(harness);
+  const badRequest = { ...REQUEST, sucursal: 'Gral. San Martin 979 San Salvador de Jujuy' };
+  assert.rejects(
+    () => sucursalDryRunAgainst(panel, badRequest, computeSucursalApprovalHash(badRequest)),
+    (error: unknown) => {
+      assert.ok(error instanceof ExecutorError);
+      assert.match(error.message, /no sucursal option matches/);
+      assert.match(error.message, /street\+number pair rule failed/, 'the rejection names which rule failed');
+      assert.ok(
+        error.details.some((detail) => detail.includes('street "gral san martin"') && detail.includes('"979"')),
+        'the rejection names the parsed pair',
+      );
+      for (const option of DEFAULT_BRANCHES) {
+        assert.ok(error.details.some((detail) => detail.includes(option.text)), `the rejection lists ${option.text}`);
+      }
+      return true;
+    },
+  );
+});
+
+test('two branches on the same street with different numbers: both candidates, ambiguity named', () => {
+  const branches: HarnessOption[] = [
+    { value: 'uuid-san-martin-979', text: 'Sucursal - Gral. San Martin 979, Jujuy' },
+    { value: 'uuid-san-martin-1327', text: 'Sucursal - Gral. San Martin 1327, Jujuy' },
+    { value: 'uuid-otra', text: 'Sucursal - Corrientes 580, Jujuy' },
+  ];
+  const match = matchSucursalBranch('Gral. San Martin 979', branches);
+  assert.equal(match.kind, 'ambiguous', 'both same-street branches are candidates; the number alone is trusted to pick between them only when the street pins one option');
+  if (match.kind !== 'ambiguous') throw new Error('unreachable');
+  assert.equal(match.rule, 'street-number-pair');
+  assert.equal(match.reason, 'street-shared-by-multiple-options');
+  assert.deepEqual(
+    match.matches.map((option) => option.value),
+    ['uuid-san-martin-979', 'uuid-san-martin-1327'],
+    'both same-street candidates are named',
+  );
+
+  // End to end: the rejection names both options and the street rule.
+  const harness = buildSucursalHarness({ branches });
+  const panel = newPanel(harness);
+  const ambiguousRequest = { ...REQUEST, sucursal: 'Gral. San Martin 979' };
+  assert.rejects(
+    () => sucursalDryRunAgainst(panel, ambiguousRequest, computeSucursalApprovalHash(ambiguousRequest)),
+    (error: unknown) => {
+      assert.ok(error instanceof ExecutorError);
+      assert.match(error.message, /matches the approved branch street more than once/);
+      assert.ok(error.details.some((detail) => detail.includes('uuid-san-martin-979')));
+      assert.ok(error.details.some((detail) => detail.includes('uuid-san-martin-1327')));
+      return true;
+    },
+  );
+});
+
+test('a street-only match whose number differs aborts naming the near match, never selecting it', () => {
+  const harness = buildSucursalHarness();
+  const panel = newPanel(harness);
+  const streetOnlyRequest = { ...REQUEST, sucursal: 'Av. Triunvirato 4400, C.A.B.A., Buenos Aires' };
+  assert.rejects(
+    () => sucursalDryRunAgainst(panel, streetOnlyRequest, computeSucursalApprovalHash(streetOnlyRequest)),
+    (error: unknown) => {
+      assert.ok(error instanceof ExecutorError);
+      assert.match(error.message, /no sucursal option matches/);
+      assert.match(error.message, /street\+number pair rule failed/);
+      assert.ok(
+        error.details.some((detail) => detail.includes('street-only match is never selected')),
+        'the stop names the street-only refusal',
+      );
+      assert.ok(
+        error.details.some((detail) => detail.includes('Av. Triunvirato 4300')),
+        'the near match (the real branch on that street, different number) is reported',
+      );
+      return true;
+    },
+  );
+  assert.equal(harness.createClickCount(), 0);
+  assert.equal(harness.selectedBranchValue(), '', 'no branch option was ever selected');
+});
+
 test('multiple near matches still reject: substring overlap is never a selection', () => {
   const match = matchSucursalBranch('Punto Andreani Hop', REAL_OPTIONS);
-  assert.equal(match.kind, 'none', 'two options contain the request, so nothing is selected');
+  assert.equal(match.kind, 'none', 'no number in the approved name → full-text fallback; two options contain the request, so nothing is selected');
   if (match.kind !== 'none') throw new Error('unreachable');
+  assert.equal(match.rule, 'full-text', 'the fallback rule is reported');
   assert.equal(match.nearMatches.length, 2, 'both Hop options are reported as near matches');
 
+  // A request that contains one option verbatim plus trailing decoration now
+  // uniquely matches by street+number identity — the live-failure fix. The
+  // panel's own option text is still what gets selected.
   const reversed = matchSucursalBranch(
     'Punto Andreani Hop - Av. Triunvirato 4300, C.A.B.A., Buenos Aires (retiro por mostrador)',
     REAL_OPTIONS,
   );
-  assert.equal(reversed.kind, 'none', 'a request containing one option verbatim is still not an exact match');
+  assert.equal(reversed.kind, 'unique', 'the street+number pair pins exactly one option despite the extra decoration');
+  if (reversed.kind !== 'unique') throw new Error('unreachable');
+  assert.equal(reversed.rule, 'street-number-pair');
+  assert.equal(reversed.option.value, 'uuid-hop-2', 'the matched option is the panel’s own spelling, never the request’s');
+
+  // Same street, different number: the pair is (street AND number), so this is
+  // a street-only near match — reported, never selected.
+  const otherNumber = matchSucursalBranch('Punto Andreani Hop - Av. Triunvirato 4400', REAL_OPTIONS);
+  assert.equal(otherNumber.kind, 'none', 'a street-only match with a different number is never a selection');
+  if (otherNumber.kind !== 'none') throw new Error('unreachable');
+  assert.equal(otherNumber.rule, 'street-number-pair');
+  assert.deepEqual(
+    otherNumber.nearMatches.map((option) => option.value),
+    ['uuid-hop-2'],
+    'the street-only candidate is reported as a near match',
+  );
 });
 
 test('two options equal after normalization are ambiguous, never auto-selected', () => {
@@ -208,8 +311,10 @@ test('dry run: walks both screens, selects carrier and branch, and never clicks 
   assert.equal(harness.selectedBranchValue(), 'uuid-villa-devoto', 'the branch was selected by its UUID value');
   assert.equal(harness.framePath(), '/agency-shipment/quotation');
 
-  // The dropdown's selected option text matches the approved name after normalization.
-  assert.equal(result.journey.branch.selectedText, REAL_OPTIONS[0].text);
+  // The dropdown's selected option text is the panel's own decorated spelling;
+  // the request name (bare) and the option (prefix + city decoration) name the
+  // same branch by street+number identity.
+  assert.equal(result.journey.branch.selectedText, DEFAULT_BRANCHES[0].text);
 });
 
 test('the walk enters by the two-hop navigation to the agency route, never the domicilio entry', async () => {

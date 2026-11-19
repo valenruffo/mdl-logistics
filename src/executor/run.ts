@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import type { Page } from 'playwright';
 import { CARRIER_NAME } from '../core/carrier';
-import { sameText, textContains } from '../core/normalize';
+import { textContains } from '../core/normalize';
 import type {
   AnyShipmentRequest,
   MessageModality,
@@ -30,6 +30,7 @@ import {
   type SummaryReadback,
 } from './envioNube';
 import { arsAmountsEqual, parseArsAmount } from './currency';
+import { branchIdentity } from './branch';
 import { ExecutorError, UnknownOutcomeError, detailsOf, messageOf } from './errors';
 import { openSession } from './session';
 
@@ -459,8 +460,9 @@ export function sucursalScreenPairs(
 
 /**
  * The sucursal readback diff against the approved request. The branch is
- * compared by normalized identity (the panel's own option text is
- * authoritative); the carrier name and every other field byte for byte.
+ * compared by street+number identity (the physical address is the branch; the
+ * panel's own option text may carry prefixes and city decoration the message
+ * does not); the carrier name and every other field byte for byte.
  */
 export function sucursalMismatches(request: SucursalShipmentRequest, journey: SucursalJourneyReadback): string[] {
   const mismatches: string[] = [];
@@ -504,9 +506,9 @@ export function sucursalMismatches(request: SucursalShipmentRequest, journey: Su
       `carrier re-read: expected a checked radio named ${JSON.stringify(SUCURSAL_CARRIER_NAME)}, the panel holds ${JSON.stringify(journey.quotation.checkedCarrierName)}`,
     );
   }
-  if (!sameText(journey.branch.selectedText, request.sucursal)) {
+  if (branchIdentity(journey.branch.selectedText) !== branchIdentity(request.sucursal)) {
     mismatches.push(
-      `branch: expected ${JSON.stringify(request.sucursal)} (matched after normalization), the panel holds ${JSON.stringify(journey.branch.selectedText)}`,
+      `branch: expected ${JSON.stringify(request.sucursal)} (matched by street+number identity), the panel holds ${JSON.stringify(journey.branch.selectedText)}`,
     );
   }
   if (journey.branch.selectedValue === '') {

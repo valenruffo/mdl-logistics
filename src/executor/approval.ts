@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { normalizeText } from '../core/normalize';
 import { canonicalArsAmount } from './currency';
+import { branchIdentity } from './branch';
 import type { ShipmentRequest, SucursalShipmentRequest } from '../core/types';
 import type { AgencyScreenReadback } from './envioNube';
 import type { CarrierReadback, CostReadback, RecipientReadback } from './envioNube';
@@ -206,17 +206,20 @@ export function sucursalApprovalPayloadFromReadback(readback: {
  * Deterministic serialization for the sucursal payload, with a literal
  * `sucursal` tag first so it can never collide with the domicilio canonical form.
  *
- * The branch field is hashed by **identity, not spelling**: the panel's own
- * option text is authoritative and the request name is matched against it after
- * normalization (case/accent/whitespace), so the same normalization runs on both
- * sides before hashing. The operator approves a branch identity, not its
- * spelling. Every other field must match byte for byte.
+ * The branch field is hashed by **identity, not spelling**: the operator's
+ * agreed rule is that the physical address — street + number — is the identity
+ * of a branch. The panel's own option text is authoritative and the request
+ * name is matched against it by that identity (`branchIdentity` in `./branch`),
+ * so the same branch decorated as `Sucursal - Gral. San Martin 979 ...` on the
+ * panel and written bare in the message hashes equal, while two branches on the
+ * same street with different numbers never do. Every other field must match
+ * byte for byte.
  */
 export function canonicalSucursalApprovalPayload(payload: SucursalApprovalPayload): string {
   return JSON.stringify([
     'sucursal',
     payload.zipCode,
-    normalizeText(payload.sucursal),
+    branchIdentity(payload.sucursal),
     payload.carrier,
     payload.height,
     payload.width,

@@ -4,6 +4,13 @@ import type { PackageDefaults } from '../core/config';
 import { sameText, normalizeText, textContains } from '../core/normalize';
 import type { ShipmentRequest, SucursalShipmentRequest } from '../core/types';
 import {
+  branchIdentity,
+  parseStreetNumberPair,
+  textContainsStreetNumberPair,
+  textContainsStreetTokens,
+  type StreetNumberPair,
+} from './branch';
+import {
   hashSucursalApprovalPayload,
   type SucursalApprovalPayload,
 } from './approval';
@@ -307,11 +314,32 @@ export interface BranchOption {
   text: string;
 }
 
+/**
+ * Which matching rule produced the outcome: the street+number pair (primary),
+ * or the full-text exact comparison (fallback). Every rejection names it (R12).
+ */
+export type BranchMatchRule = 'street-number-pair' | 'full-text';
+
 /** The outcome of branch-name matching, as data so it can be tested offline. */
 export type BranchMatch =
-  | { kind: 'unique'; option: BranchOption }
-  | { kind: 'none'; options: readonly BranchOption[]; nearMatches: readonly BranchOption[] }
-  | { kind: 'ambiguous'; matches: readonly BranchOption[] };
+  | { kind: 'unique'; option: BranchOption; rule: BranchMatchRule }
+  | {
+      kind: 'none';
+      options: readonly BranchOption[];
+      nearMatches: readonly BranchOption[];
+      rule: BranchMatchRule;
+      /** Why nothing was selected, as data; the rejection prints it (R12). */
+      reason: 'empty-request' | 'no-option-contains-street' | 'street-without-number' | 'no-exact-text-match';
+      /** The pair parsed from the approved name, when one could be. */
+      pair: StreetNumberPair | null;
+    }
+  | {
+      kind: 'ambiguous';
+      matches: readonly BranchOption[];
+      rule: BranchMatchRule;
+      reason: 'street-shared-by-multiple-options' | 'multiple-options-equal-after-normalization';
+      pair: StreetNumberPair | null;
+    };
 
 /** What the sucursal dropdown actually holds after a branch selection. */
 export interface BranchReadback {
@@ -1691,9 +1719,11 @@ export class EnvioNube {
   }
 
   /**
-   * Selects a branch by option text. Option values are UUIDs on the real panel,
-   * so the write uses the value read from the matched option, never a guessed
-   * one, and the read-back must agree with the approved name.
+   * Selects a branch by its **street+number identity** (the physical address is
+   * the branch; prefixes, city names and schedule text are decoration). Option
+   * values are UUIDs on the real panel, so the write uses the value read from
+   * the matched option, never a guessed one, and the read-back must agree with
+   * the approved name by the same identity.
    */
   async selectBranch(name: string): Promise<BranchReadback> {
     const frame = await this.waitForRoute(AGENCY_ROUTES.quotation);
@@ -1707,33 +1737,41 @@ export class EnvioNube {
     if (match.kind === 'none') {
       const details = [
         `approved branch: ${JSON.stringify(name)}`,
+        ...branchMatchFailureDetails(match),
         `the dropdown offers ${options.length} options:`,
         ...offered.map((text) => `  - ${JSON.stringify(text)}`),
         ...(match.nearMatches.length > 0
           ? [
-              'near matches (none equal after normalization, so none was selected):',
+              'near matches (reported, never selected):',
               ...match.nearMatches.map((option) => `  - ${JSON.stringify(option.text)}`),
             ]
           : []),
-        'branch matching is exact after normalization (case, accents and whitespace); choosing a nearby branch is a wrong shipment (R12)',
+        'branch matching selects by street+number identity — the physical address is the branch (R12); every non-unique outcome is a rejection, never a near match',
         ...(await this.describe(frame)),
       ];
-      throw new ExecutorError('no sucursal option matches the approved branch name', details);
+      throw new ExecutorError(
+        `no sucursal option matches the approved branch name (${branchRuleLabel(match.rule)} rule failed)`,
+        details,
+      );
     }
     if (match.kind === 'ambiguous') {
-      throw new ExecutorError(
-        `the sucursal dropdown matches the approved branch name more than once (${match.matches.length} options)`,
-        [
-          `approved branch: ${JSON.stringify(name)}`,
-          ...match.matches.map((option) => `  - value=${option.value} text=${JSON.stringify(option.text)}`),
-          'selecting between identical names would be a guess (R12)',
-          ...(await this.describe(frame)),
-        ],
-      );
+      const what =
+        match.reason === 'street-shared-by-multiple-options'
+          ? `the sucursal dropdown matches the approved branch street more than once (${match.matches.length} options)`
+          : `the sucursal dropdown matches the approved branch name more than once (${match.matches.length} options)`;
+      throw new ExecutorError(what, [
+        `approved branch: ${JSON.stringify(name)}`,
+        ...branchMatchFailureDetails(match),
+        ...match.matches.map((option) => `  - value=${option.value} text=${JSON.stringify(option.text)}`),
+        'selecting between same-street branches would be a guess (R12)',
+        ...(await this.describe(frame)),
+      ]);
     }
 
     const option = match.option;
-    this.note(`selecting sucursal option value="${option.value}" (matched by normalized option text)`);
+    this.note(
+      `selecting sucursal option value="${option.value}" (matched by street+number identity, rule: ${match.rule})`,
+    );
     try {
       await select.selectOption({ value: option.value }, { timeout: this.timeoutMs });
     } catch (error) {
@@ -1743,10 +1781,13 @@ export class EnvioNube {
     const selectedValue = await select.inputValue().catch(() => '');
     const selected = options.find((candidate) => candidate.value === selectedValue);
     const selectedText = selected?.text ?? '';
-    if (selectedValue !== option.value || !sameText(selectedText, name)) {
+    // The panel may echo the branch in its own decorated spelling (`Sucursal -
+    // …, Ciudad`); the readback agrees with the approved name by street+number
+    // identity, the same comparison the approval hash and the diff use.
+    if (selectedValue !== option.value || branchIdentity(selectedText) !== branchIdentity(name)) {
       throw new ExecutorError('the sucursal dropdown does not hold the approved branch after writing it', [
         `read back: value=${JSON.stringify(selectedValue)} text=${JSON.stringify(selectedText)}`,
-        `approved (normalized): ${JSON.stringify(name)}`,
+        `approved (by street+number identity): ${JSON.stringify(name)} → ${JSON.stringify(branchIdentity(name))}`,
         ...(await this.describe(frame)),
       ]);
     }
@@ -2266,32 +2307,136 @@ function extractShipmentId(text: string): string | null {
 /**
  * The branch-name matching rule, as pure data so it can be tested offline.
  *
- * **Exact text match after normalization** — the same comparison form as every
- * other panel text (`normalizeText`: lower-case, accent-free, one space between
- * tokens). Option `value`s are UUIDs and are never compared; there is no index,
- * no substring and no fuzzy matching.
+ * **Street + number is the identity of a branch** (the operator's agreed rule,
+ * from the live CP 4800 Jujuy failure: the panel offered exactly
+ * `"Sucursal - Gral. San Martin 979 San Salvador de Jujuy, Jujuy"` for an
+ * approved `"Gral. San Martin 979 San Salvador de Jujuy"` — the same branch,
+ * decorated). In priority order:
  *
- * - Exactly one option equal after normalization → `unique`.
- * - None equal → `none`, carrying the full option list (for the rejection that
- *   names the real options, R12) and every near match (an option containing the
- *   request or vice versa) — near matches are **reported, never selected**: two
- *   or more near matches is exactly the ambiguity this rule refuses.
- * - More than one option equal after normalization → `ambiguous`. Selecting
- *   between identical names would be a guess.
+ * 1. **Street+number pair (primary).** Parse `(street, number)` out of the
+ *    approved name (last digit token = number, adjacent non-digit tokens =
+ *    street, normalized in `./branch`). Every option whose text contains that
+ *    same pair — street tokens immediately followed by the number as a whole
+ *    token — is a candidate; prefixes (`Sucursal -`, `Punto Andreani Hop`),
+ *    city names and schedule text are decoration and do not participate.
+ *    Exactly one candidate → `unique`. More than one option sharing the street
+ *    (e.g. two branches on the same street with different numbers) →
+ *    `ambiguous`, naming both.
+ * 2. **Full-text fallback (secondary).** Only when no pair can be parsed from
+ *    the approved name (e.g. the customer wrote only a branch name with no
+ *    number): exact text after `normalizeText` — the same comparison form as
+ *    every other panel text. Option `value`s are UUIDs and are never compared;
+ *    there is no index and no fuzzy matching.
+ *
+ * Never a near match: every non-unique outcome is a rejection. A street-only
+ * match whose number differs is reported as a near match and never selected —
+ * choosing a nearby branch is a wrong shipment (R12).
  */
 export function matchSucursalBranch(requested: string, options: readonly BranchOption[]): BranchMatch {
   const wanted = normalizeText(requested);
   if (wanted === '') {
-    return { kind: 'none', options, nearMatches: [] };
+    return { kind: 'none', options, nearMatches: [], rule: 'full-text', reason: 'empty-request', pair: null };
   }
+
+  // Primary rule: the physical address is the branch identity.
+  const pair = parseStreetNumberPair(requested);
+  if (pair !== null) {
+    const streetCandidates = options.filter((option) => textContainsStreetTokens(option.text, pair.street));
+    if (streetCandidates.length > 1) {
+      return {
+        kind: 'ambiguous',
+        matches: streetCandidates,
+        rule: 'street-number-pair',
+        reason: 'street-shared-by-multiple-options',
+        pair,
+      };
+    }
+    if (streetCandidates.length === 1) {
+      const candidate = streetCandidates[0]!;
+      if (textContainsStreetNumberPair(candidate.text, pair)) {
+        return { kind: 'unique', option: candidate, rule: 'street-number-pair' };
+      }
+      // Street-only match: the number differs or is absent — a near match,
+      // reported, never selected.
+      return {
+        kind: 'none',
+        options,
+        nearMatches: [candidate],
+        rule: 'street-number-pair',
+        reason: 'street-without-number',
+        pair,
+      };
+    }
+    return {
+      kind: 'none',
+      options,
+      nearMatches: [],
+      rule: 'street-number-pair',
+      reason: 'no-option-contains-street',
+      pair,
+    };
+  }
+
+  // Fallback: no (street, number) pair could be parsed from the approved name
+  // (e.g. the customer wrote only a branch name with no number) → exact text.
   const exact = options.filter((option) => normalizeText(option.text) === wanted);
-  if (exact.length === 1) return { kind: 'unique', option: exact[0]! };
-  if (exact.length > 1) return { kind: 'ambiguous', matches: exact };
+  if (exact.length === 1) return { kind: 'unique', option: exact[0]!, rule: 'full-text' };
+  if (exact.length > 1) {
+    return {
+      kind: 'ambiguous',
+      matches: exact,
+      rule: 'full-text',
+      reason: 'multiple-options-equal-after-normalization',
+      pair: null,
+    };
+  }
   const nearMatches = options.filter((option) => {
     const text = normalizeText(option.text);
     return text !== '' && (text.includes(wanted) || wanted.includes(text));
   });
-  return { kind: 'none', options, nearMatches };
+  return {
+    kind: 'none',
+    options,
+    nearMatches,
+    rule: 'full-text',
+    reason: 'no-exact-text-match',
+    pair: null,
+  };
+}
+
+/** Human label of a matching rule, used in every rejection (R12). */
+function branchRuleLabel(rule: BranchMatchRule): string {
+  return rule === 'street-number-pair' ? 'street+number pair' : 'full text (exact after normalization)';
+}
+
+/**
+ * The rejection lines naming **which rule failed** (street-pair vs full-text)
+ * and what was parsed from the approved name (R12).
+ */
+export function branchMatchFailureDetails(
+  match: Exclude<BranchMatch, { kind: 'unique' }>,
+): string[] {
+  const label = branchRuleLabel(match.rule);
+  if (match.rule === 'street-number-pair' && match.pair !== null) {
+    const parsed = `parsed street+number pair: street ${JSON.stringify(match.pair.street)}, number ${JSON.stringify(match.pair.number)}`;
+    if (match.kind === 'none') {
+      if (match.reason === 'street-without-number') {
+        return [
+          `matching rule that failed: ${label} — ${parsed}; the street matches ${match.nearMatches.length} option(s) but none carries the approved number, and a street-only match is never selected`,
+        ];
+      }
+      return [`matching rule that failed: ${label} — ${parsed}; no dropdown option contains the pair`];
+    }
+    return [
+      `matching rule that failed: ${label} — ${parsed}; ${match.matches.length} options share the street (different street numbers on the same street are listed together)`,
+    ];
+  }
+  if (match.kind === 'ambiguous') {
+    return [
+      `matching rule that failed: ${label} — ${match.matches.length} options equal the approved name after normalization`,
+    ];
+  }
+  return [`matching rule that failed: ${label} — no option equals the approved name after normalization`];
 }
 
 /** The three structural facts that prove the label has never been paid (S12). */

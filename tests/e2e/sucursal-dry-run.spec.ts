@@ -13,8 +13,9 @@
  * screen Q (`#/agency-shipment/quotation`), where it writes the destination
  * postal code (`address.zipCode` — a different anchor from domicilio's
  * `zipCode`), selects `Andreani a sucursal` inside `Modalidades activas`, and
- * selects the branch by option text (exact after normalization; an unknown
- * branch is a rejection listing the real options).
+ * selects the branch by its street+number identity (the physical address is the
+ * branch; the panel's decorated option text names the same branch; a
+ * non-unique outcome is a rejection listing the real options).
  *
  * What it never does: click `Crear envío` or `Comprar`. The run stops after the
  * branch selection. Nothing is created and nothing is purchased.

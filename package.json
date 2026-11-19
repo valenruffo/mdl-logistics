@@ -16,7 +16,7 @@
     "sucursal-dry-run": "node --import tsx tests/e2e/sucursal-dry-run.spec.ts",
     "sucursal-harness-dry-run": "node --import tsx tests/e2e/sucursal-harness-dry-run.ts",
     "safety-guard": "node scripts/safety-guard.mjs",
-    "test": "node --import tsx --test tests/unit/config.test.ts tests/unit/parse-message.test.ts tests/unit/sucursal.test.ts tests/unit/sucursal-executor.test.ts tests/unit/provinces.test.ts tests/unit/approval-gate.test.ts tests/unit/run-record.test.ts tests/unit/normalize.test.ts tests/unit/label-unpaid.test.ts tests/unit/ui-console.test.ts tests/unit/ui-flow.test.ts tests/unit/ui-modalidad.test.ts tests/unit/ui-theme.test.ts tests/unit/ui-rail.test.ts tests/unit/store-origin.test.ts tests/unit/session-env.test.ts tests/unit/console.test.ts tests/unit/ui-hardening.test.ts tests/unit/auth.test.ts",
+    "test": "node --import tsx --test tests/unit/config.test.ts tests/unit/parse-message.test.ts tests/unit/sucursal.test.ts tests/unit/branch-match.test.ts tests/unit/sucursal-executor.test.ts tests/unit/provinces.test.ts tests/unit/approval-gate.test.ts tests/unit/run-record.test.ts tests/unit/normalize.test.ts tests/unit/label-unpaid.test.ts tests/unit/ui-console.test.ts tests/unit/ui-flow.test.ts tests/unit/ui-modalidad.test.ts tests/unit/ui-theme.test.ts tests/unit/ui-rail.test.ts tests/unit/store-origin.test.ts tests/unit/session-env.test.ts tests/unit/console.test.ts tests/unit/ui-hardening.test.ts tests/unit/auth.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

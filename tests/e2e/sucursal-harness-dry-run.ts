@@ -32,7 +32,9 @@ if (process.env[STORE_ORIGIN_VARIABLE] === undefined) {
 /**
  * Fictional message (R11) with the real branch name observed for CP 1419
  * (plan §4c, "Sucursal — Screen Q"): the executor matches it against the
- * dropdown's own options after normalization.
+ * dropdown's own options by street+number identity — the panel's option text is
+ * the decorated form (`Sucursal - …, C.A.B.A., Buenos Aires`) and the message
+ * carries the bare name; the physical address is the branch identity.
  */
 const MESSAGE = [
   '*MDL - Datos de envío*',
