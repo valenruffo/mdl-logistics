@@ -145,6 +145,13 @@ export const AGENCY_ROUTES = {
 /** The carrier card approved for sucursal (S8), matched by accessible name. */
 export const SUCURSAL_CARRIER_NAME = 'Andreani a sucursal';
 
+/**
+ * The section heading screen Q renders only after the postal-code quote
+ * resolves. The `freight-option` radios and the `sucursal` dropdown exist only
+ * under it, so the walk waits for this heading before reading either.
+ */
+export const SUCURSAL_QUOTATION_HEADING = 'Modalidad de envío';
+
 const AGENCY_RECIPIENT_FIELDS = {
   name: 'customer.name',
   surname: 'customer.surname',
@@ -1595,6 +1602,17 @@ export class EnvioNube {
   /**
    * Writes the destination postal code on screen Q. The anchor is
    * `address.zipCode` — a different name from domicilio's `zipCode`.
+   *
+   * After the write, the walk waits for the `Modalidad de envío` heading: the
+   * panel quotes asynchronously for the entered postal code, and the carrier
+   * radios and the branch select only render once that quote resolves. Observed
+   * live, the quotation screen initially showed only `Destino` + `Resumen del
+   * envío`, and a carrier lookup that ran immediately timed out on radios that
+   * did not exist yet. If the heading is still missing at half the wait budget,
+   * one change/blur is dispatched on the postal code (the quote may be gated on
+   * that event) and the wait resumes for the other half — no loops, still the
+   * standard budget in total. A missing heading past the budget is a loud stop
+   * that names the heading and the frame URL.
    */
   async fillAgencyDestination(zipCode: string): Promise<void> {
     const frame = await this.waitForRoute(AGENCY_ROUTES.quotation);
@@ -1604,6 +1622,50 @@ export class EnvioNube {
       'sucursal screen Q (#/agency-shipment/quotation)',
       () => this.agencyQuotationDiagnostics(frame),
     );
+    await this.waitForAgencyCarrierSection(frame);
+  }
+
+  /**
+   * Waits for the `Modalidad de envío` heading on sucursal screen Q, within the
+   * standard wait budget split in two halves around one postal-code change/blur
+   * dispatch. The carrier radios and the branch select exist only under that
+   * heading, so nothing downstream may read them before it renders.
+   */
+  private async waitForAgencyCarrierSection(frame: Frame): Promise<void> {
+    const heading = (): Locator => frame.getByRole('heading', { name: copyPattern(SUCURSAL_QUOTATION_HEADING) });
+    const halfBudgetMs = Math.ceil(this.timeoutMs / 2);
+    const first = await poll(async () => ((await heading().count()) > 0 ? true : null), { timeoutMs: halfBudgetMs });
+    if (first !== null) return;
+
+    this.note(
+      `the "${SUCURSAL_QUOTATION_HEADING}" heading is still missing after ${halfBudgetMs}ms; dispatching one change/blur on [name="${AGENCY_ZIP_FIELD}"] to trigger the postal-code quote`,
+    );
+    await this.dispatchAgencyZipChange(frame);
+    const second = await poll(async () => ((await heading().count()) > 0 ? true : null), { timeoutMs: halfBudgetMs });
+    if (second !== null) return;
+
+    throw new ExecutorError(
+      `timed out after ${this.timeoutMs}ms waiting for sucursal screen Q: heading "${SUCURSAL_QUOTATION_HEADING}" never appeared (the panel's postal-code quote did not resolve, so the carrier radios and the branch select were never rendered)`,
+      [
+        `missing heading: "${SUCURSAL_QUOTATION_HEADING}"`,
+        `panel frame url: ${frame.url()}`,
+        'the freight radios and the sucursal dropdown only exist under that heading; nothing was read, selected or created',
+        ...(await this.describe(frame)),
+      ],
+    );
+  }
+
+  /**
+   * One change/blur on the postal code, best effort: the quote may be gated on
+   * that event rather than on the typed value alone. Neither dispatch is
+   * retried and neither failure masks the heading wait that follows — a panel
+   * that needs neither simply keeps the walk waiting for the quote to resolve.
+   */
+  private async dispatchAgencyZipChange(frame: Frame): Promise<void> {
+    const zip = frame.locator(`input[name="${AGENCY_ZIP_FIELD}"]`).first();
+    await zip.dispatchEvent('change').catch(() => undefined);
+    await zip.blur().catch(() => undefined);
+    this.note(`dispatched one change/blur on [name="${AGENCY_ZIP_FIELD}"]`);
   }
 
   /** The sucursal dropdown's real option list, read from the panel before any write. */

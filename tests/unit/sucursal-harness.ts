@@ -58,6 +58,21 @@ export interface HarnessOptions {
    * the app router, so the frame stayed on the previous screen.
    */
   ignoredHashRoutes?: readonly string[];
+  /**
+   * Models the panel's asynchronous quotation on screen Q (observed live: the
+   * screen rendered only `Destino` + `Resumen del envío` while the carrier and
+   * branch sections were missing until the postal-code quote resolved):
+   *
+   * - `'tick'`: the section renders a moment after the screen is built —
+   *   the walk must wait for the `Modalidad de envío` heading;
+   * - `'change'`: the section renders only after a change/blur is dispatched
+   *   on `address.zipCode` — the walk's one-event recovery must fire it;
+   * - `'never'`: the section never renders (the observed live failure) — the
+   *   walk must abort loudly, naming the missing heading and the frame URL.
+   *
+   * `undefined` (the default) renders the section immediately, as before.
+   */
+  quotationDeferral?: 'tick' | 'change' | 'never';
 }
 
 export interface SucursalHarness {
@@ -74,6 +89,8 @@ export interface SucursalHarness {
   checkedFreightLabel(): string | null;
   /** How many times the create button was actually clicked. */
   createClickCount(): number;
+  /** Whether the deferred quotation section of screen Q has rendered. */
+  quotationSectionRevealed(): boolean;
 }
 
 // ------------------------------------------------------------------ element tree
@@ -104,6 +121,8 @@ class El {
   maskFrozen = false;
   /** The mask's internal digit accumulator (only meaningful when currencyMask). */
   maskDigits = '';
+  /** Change/blur hook (the deferred-quotation zip trigger); otherwise unused. */
+  onChange: (() => void) | null = null;
 
   constructor(tag: string, attrs: Attrs = {}, text = '') {
     this.tag = tag;
@@ -403,6 +422,16 @@ class FakeLocator {
     el.value = options.value;
   }
 
+  /** A blur the executor dispatches explicitly (`Locator.blur()`). */
+  async blur(): Promise<void> {
+    this.one().onChange?.();
+  }
+
+  /** An explicit DOM event; only `change` carries a panel-side effect here. */
+  async dispatchEvent(type: string): Promise<void> {
+    if (type === 'change') this.one().onChange?.();
+  }
+
   locator(selector: string): Locator {
     if (selector.startsWith('xpath=') || /^(ancestor|preceding)::/.test(selector)) {
       const base = this.one();
@@ -443,6 +472,9 @@ const ADMIN_APP_PATH = '/admin/apps/envionube/ar';
 /** Frame route the app SPA mounts when the admin hash is `#/dashboard`. */
 const DASHBOARD_FRAME_ROUTE = '/dashboard';
 
+/** How long the `'tick'` quotation deferral takes to render the section. */
+const QUOTATION_TICK_MS = 120;
+
 class Harness {
   readonly clicks: string[] = [];
   private readonly navigations: string[] = [];
@@ -451,6 +483,9 @@ class Harness {
   private readonly ignoredHashRoutes: ReadonlySet<string>;
   private currentPath = '';
   private createClicked = 0;
+  /** The deferred quotation reveal of screen Q, registered by `buildScreenQ`. */
+  private quotationReveal: (() => void) | null = null;
+  private quotationRevealed = false;
 
   constructor(ignoredHashRoutes: readonly string[] = []) {
     this.ignoredHashRoutes = new Set(ignoredHashRoutes);
@@ -530,6 +565,35 @@ class Harness {
     this.createClicked += 1;
   }
 
+  /**
+   * Registers screen Q's deferred quotation reveal. `'tick'` reveals after a
+   * short timer (unref'd, so it never holds the test process open); `'change'`
+   * and `'never'` wait for `requestQuotationReveal()` — which only the
+   * change/blur dispatch on the postal code calls — or never reveal at all.
+   */
+  setQuotationReveal(reveal: () => void, mode: 'tick' | 'change' | 'never'): void {
+    // 'never' is the observed live failure: the quote never resolves, so the
+    // section never renders — not even when the walk dispatches change/blur.
+    if (mode === 'never') return;
+    this.quotationReveal = () => {
+      reveal();
+      this.quotationRevealed = true;
+    };
+    if (mode === 'tick') {
+      const timer = setTimeout(this.quotationReveal, QUOTATION_TICK_MS);
+      timer.unref?.();
+    }
+  }
+
+  /** Fired by the zip input's change/blur hook; a no-op without a deferral. */
+  requestQuotationReveal(): void {
+    this.quotationReveal?.();
+  }
+
+  quotationSectionIsRevealed(): boolean {
+    return this.quotationRevealed;
+  }
+
   checkRadio(radio: El): void {
     const group = radio.attrs['name'];
     if (group !== undefined) {
@@ -567,6 +631,7 @@ class Harness {
         return textOf(radio.parent);
       },
       createClickCount: (): number => this.createClicked,
+      quotationSectionRevealed: (): boolean => this.quotationRevealed,
     };
   }
 }
@@ -686,12 +751,42 @@ function buildScreenP(harness: Harness, options: HarnessOptions): El {
 function buildScreenQ(harness: Harness, options: HarnessOptions): El {
   const body = new El('body');
   body.append(new El('h2', {}, 'Destino'));
-  body.append(fieldDiv('Código postal', 'address.zipCode', ''));
+  // The zip input is built here (not via `fieldDiv`) so its change/blur hook can
+  // fire the deferred quotation reveal — how the real panel's quote is gated.
+  const zipDiv = new El('div', { class: 'field' });
+  zipDiv.append(new El('label', {}, 'Código postal'));
+  const zipInput = new El('input', { name: 'address.zipCode' });
+  zipInput.onChange = () => harness.requestQuotationReveal();
+  zipDiv.append(zipInput);
+  body.append(zipDiv);
 
-  body.append(new El('h2', {}, 'Modalidad de envío'));
+  const carrierSection = buildScreenQCarrierSection(harness, options);
+  if (options.quotationDeferral === undefined) {
+    body.append(carrierSection);
+  } else {
+    // The panel quotes asynchronously for the entered postal code: until the
+    // quote resolves, screen Q holds only `Destino` + `Resumen del envío`.
+    harness.setQuotationReveal(() => {
+      // Idempotent: the walk may dispatch change + blur, and both fire this hook.
+      if (carrierSection.parent !== null) return;
+      carrierSection.parent = body;
+      body.children.push(carrierSection);
+    }, options.quotationDeferral);
+  }
+
+  const summaryPanel = new El('div', { class: 'summary' });
+  summaryPanel.append(new El('h3', {}, 'Resumen del envío'));
+  body.append(summaryPanel);
+  return body;
+}
+
+/** The `Modalidad de envío` + `Sucursales` block and the create button: the part of screen Q that renders only after the postal-code quote resolves. */
+function buildScreenQCarrierSection(harness: Harness, options: HarnessOptions): El {
+  const section = new El('div', { class: 'quotation' });
+  section.append(new El('h2', {}, 'Modalidad de envío'));
   const carriers = options.carriers ?? DEFAULT_CARRIERS;
   for (const group of ['activas', 'inactivas'] as const) {
-    body.append(new El('h3', {}, group === 'activas' ? 'Modalidades activas' : 'Modalidades inactivas'));
+    section.append(new El('h3', {}, group === 'activas' ? 'Modalidades activas' : 'Modalidades inactivas'));
     for (const carrier of carriers.filter((candidate) => candidate.group === group)) {
       const label = new El('label', {});
       label.append(new El('input', { type: 'radio', name: 'freight-option' }));
@@ -700,20 +795,20 @@ function buildScreenQ(harness: Harness, options: HarnessOptions): El {
       } else {
         label.append(new El('span', {}, carrier.text));
       }
-      body.append(label);
+      section.append(label);
     }
   }
 
-  body.append(new El('h2', {}, 'Sucursales'));
+  section.append(new El('h2', {}, 'Sucursales'));
   const select = new El('select', { name: 'sucursal', id: 'sucursal' });
   select.append(new El('option', { value: '' }, 'Seleccioná una sucursal'));
   for (const branch of options.branches ?? DEFAULT_BRANCHES) {
     select.append(new El('option', { value: branch.value }, branch.text));
   }
-  body.append(select);
+  section.append(select);
 
-  body.append(new El('button', {}, 'Editar'));
-  body.append(new El('button', {}, 'Cancelar'));
+  section.append(new El('button', {}, 'Editar'));
+  section.append(new El('button', {}, 'Cancelar'));
 
   const create = new El('button', {}, 'Crear envío');
   create.enabledWhen = () => {
@@ -729,12 +824,8 @@ function buildScreenQ(harness: Harness, options: HarnessOptions): El {
     const shipmentId = (options.shipmentId ?? '#EM1053').replace('#', '');
     harness.navigate(`/shipping-details/${shipmentId}`);
   };
-  body.append(create);
-
-  const summaryPanel = new El('div', { class: 'summary' });
-  summaryPanel.append(new El('h3', {}, 'Resumen del envío'));
-  body.append(summaryPanel);
-  return body;
+  section.append(create);
+  return section;
 }
 
 /**
@@ -822,5 +913,6 @@ export function buildSucursalHarness(options: HarnessOptions = {}): SucursalHarn
     selectedBranchValue: harness.state().selectedBranchValue,
     checkedFreightLabel: harness.state().checkedFreightLabel,
     createClickCount: harness.state().createClickCount,
+    quotationSectionRevealed: harness.state().quotationSectionRevealed,
   };
 }

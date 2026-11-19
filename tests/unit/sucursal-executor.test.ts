@@ -455,3 +455,70 @@ test('the sucursal carrier is picked from Modalidades activas, ignoring inactive
   assert.ok(inactive, 'the inactive card was classified by the preceding heading');
   assert.equal(inactive.checked, false, 'the inactive card was never clicked');
 });
+
+// ------------------------------------- 3. the asynchronous quotation (observed live)
+
+/**
+ * The observed live failure: screen Q renders only `Destino` + `Resumen del
+ * envío` until the postal-code quote resolves, and the carrier/branch sections
+ * appear afterwards. The harness models the deferral (`quotationDeferral`), and
+ * these tests prove the walk waits for the `Modalidad de envío` heading before
+ * looking for the carrier radios — or stops loudly when it never renders.
+ */
+test('the quotation section renders late (after a tick); the walk waits and completes', async () => {
+  const harness = buildSucursalHarness({ quotationDeferral: 'tick' });
+  const panel = newPanel(harness);
+
+  const result = await sucursalDryRunAgainst(panel, REQUEST, APPROVED_HASH);
+
+  assert.equal(harness.quotationSectionRevealed(), true, 'the panel rendered the carrier/branch section');
+  assert.equal(result.stoppedAt, 'agency-quotation', 'the walk completed to the branch selection');
+  assert.equal(result.formMatchesApproval, true);
+  assert.equal(harness.checkedFreightLabel(), SUCURSAL_CARRIER_NAME, 'the carrier was selected once the section rendered');
+  assert.equal(harness.selectedBranchValue(), 'uuid-villa-devoto');
+  assert.equal(harness.createClickCount(), 0);
+  assert.ok(!harness.clicks.includes('Crear envío'));
+});
+
+test('the quotation section renders only after a change on the postal code; the executor dispatches it once', async () => {
+  // The quote is gated on the CP change event: nothing renders until the walk
+  // dispatches one change/blur on `address.zipCode` — exactly the recovery the
+  // executor performs when the heading is missing at half the wait budget.
+  const harness = buildSucursalHarness({ quotationDeferral: 'change' });
+  const panel = newPanel(harness);
+
+  const result = await sucursalDryRunAgainst(panel, REQUEST, APPROVED_HASH);
+
+  assert.equal(harness.quotationSectionRevealed(), true, 'the dispatched change/blur triggered the quote');
+  assert.equal(result.stoppedAt, 'agency-quotation');
+  assert.equal(result.formMatchesApproval, true);
+  assert.equal(harness.checkedFreightLabel(), SUCURSAL_CARRIER_NAME);
+  assert.equal(harness.createClickCount(), 0);
+});
+
+test('the quotation section that never renders aborts naming the missing heading and the frame url', async () => {
+  const harness = buildSucursalHarness({ quotationDeferral: 'never' });
+  const panel = newPanel(harness);
+
+  await assert.rejects(
+    () => sucursalDryRunAgainst(panel, REQUEST, APPROVED_HASH),
+    (error: unknown) => {
+      assert.ok(error instanceof ExecutorError);
+      assert.match(error.message, /Modalidad de envío/);
+      assert.match(error.message, /never appeared/);
+      assert.ok(
+        error.details.some((detail) => detail.includes('missing heading: "Modalidad de envío"')),
+        'the stop names the missing heading',
+      );
+      assert.ok(
+        error.details.some((detail) => detail.includes('panel frame url:') && detail.includes('/agency-shipment/quotation')),
+        'the stop names the frame url',
+      );
+      return true;
+    },
+  );
+  assert.equal(harness.framePath(), '/agency-shipment/quotation');
+  assert.equal(harness.quotationSectionRevealed(), false, 'nothing triggered the quote');
+  assert.ok(!harness.clicks.includes('Andreani a sucursal'), 'no carrier card was clicked');
+  assert.equal(harness.createClickCount(), 0, 'nothing was created');
+});
