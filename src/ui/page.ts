@@ -172,7 +172,10 @@ export const PAGE_HTML = `<!doctype html>
   .note { font-size:12.5px; color:var(--muted); }
 
   ul.issues { margin:6px 0 0; padding-left:1.1rem; font-size:13.5px; }
-  ul.issues li { margin:2px 0; }
+  ul.issues li { margin:2px 0; overflow-wrap:anywhere; }
+  /* The analyze rejection and its warnings are prose fed by the parser: same
+     containment rule, so no reason line can leave the frame either. */
+  #rejection, #warnings { min-width:0; overflow-wrap:anywhere; }
   /* Text colours are the ones that clear 4.5:1 on their own surface; the dot
      palette above stays for the dots, which always carry a word next to them. */
   .bad { color:var(--bad-text); } .ok { color:var(--ok-text); } .warn { color:var(--warn-text); }
@@ -181,10 +184,35 @@ export const PAGE_HTML = `<!doctype html>
   .field-note { font-size:11.5px; color:var(--warn-text); margin:4px 0 0; }
   .field-wrap { display:block; }
   .inline-status { min-height:1.2rem; font-size:13px; color:var(--muted); margin:12px 0 0; }
-  .inline-result { margin-top:16px; padding-top:14px; border-top:1px solid var(--line); font-size:13.5px; }
+  .inline-result { margin-top:16px; padding-top:14px; border-top:1px solid var(--line); font-size:13.5px;
+                   min-width:0; overflow-wrap:anywhere; }
   .inline-result:empty { margin:0; padding:0; border:0; }
   .inline-result p { margin:4px 0; }
   .result-id { font-size:19px; font-weight:650; letter-spacing:-.01em; margin:0 0 6px; }
+
+  /* Every run outcome — success, estimate or error — is one contained card.
+     overflow-wrap:anywhere keeps run-record paths and long technical lines
+     inside the column (the operator's complaint: "todo salido del encuadre"),
+     and the details body scrolls internally so even a big raw reason can never
+     push the layout wider than the page. */
+  .result-card { border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin-top:6px;
+                 min-width:0; overflow-wrap:anywhere; }
+  .result-card.is-bad { border-color:var(--bad); }
+  .error-heading { font-size:15px; font-weight:650; margin:0 0 6px; }
+  .error-action { margin:0; }
+  .error-details { margin-top:10px; }
+  .error-details summary { cursor:pointer; font-size:12.5px; color:var(--muted); }
+  .error-detail-body { margin-top:8px; padding:10px; border:1px solid var(--line); border-radius:6px;
+                       background:var(--field); max-height:220px; overflow-y:auto; overflow-wrap:anywhere; }
+  .error-detail-body p { margin:3px 0; }
+  .progress-title { font-weight:650; margin:0 0 2px; }
+  .progress-note { font-size:12px; color:var(--muted); margin:0 0 8px; }
+  .progress-steps { list-style:none; margin:0; padding:0; font-size:13.5px; }
+  .progress-steps li { padding:3px 0; }
+  .progress-steps li.done { color:var(--ok-text); }
+  .progress-steps li.current { font-weight:600; }
+  .progress-steps li.pending { color:var(--muted); }
+  .progress-percent { font-variant-numeric:tabular-nums; margin:10px 0 0; }
 
   @media (max-width:860px){ .app { grid-template-columns:1fr; } .rail { flex-direction:row; flex-wrap:wrap; gap:14px; }
     .rail footer { margin:0; } .work { padding:22px 18px 40px; } .grid { grid-template-columns:1fr; } }

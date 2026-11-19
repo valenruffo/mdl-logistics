@@ -20,11 +20,29 @@
  *   control that writes anything locally (the theme key, never a datum).
  * - **An expired session is not an error dialog.** A `401` from any call sends the
  *   browser to `/login`: the operator sees the card, not a JSON reason in the rail.
+ * - **Progress is an honest estimate.** The run POST answers only at the end, so
+ *   the in-flight card advances its step checklist on a timer over the known
+ *   journey (`JOURNEY_STEPS`, injected from `./progress`), labels the percentage
+ *   `aproximado`/`estimado`, never shows the last step as done, and snaps to the
+ *   response's real outcome when it arrives. Nothing says "creado" before the
+ *   response says so.
+ * - **Errors come in tiers.** One human heading, one actionable sentence, and
+ *   the raw internals (run-record paths, the executor's reason) collapsed inside
+ *   a `<details>` that wraps and scrolls inside its card. The hand-edit JSON
+ *   recipe for resolving a record never reaches the screen — the record's file
+ *   path does, and the recipe itself stays in docs/ops.
  */
-export const CLIENT_JS = `(function () {
+import { JOURNEY_STEPS } from './progress';
+
+export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, setTimer, clearTimer) {
   'use strict';
 
   var THEME_KEY = 'mdl-theme';
+
+  // The fixed journey steps, injected from src/ui/progress.ts: one source of
+  // truth for the estimate the progress card shows while the run POST is in
+  // flight.
+  var JOURNEY_STEPS = ${JSON.stringify(JOURNEY_STEPS)};
 
   var state = {
     message: '',
@@ -91,10 +109,6 @@ export const CLIENT_JS = `(function () {
       list.appendChild(make('li', null, item));
     });
     return list;
-  }
-
-  function pathRow(label, value) {
-    return make('p', 'mono', label + ': ' + (value === '' || value === null || value === undefined ? '(no registrado)' : value));
   }
 
   function textOr(value, fallback) {
@@ -300,6 +314,183 @@ export const CLIENT_JS = `(function () {
     byId('analyze').disabled = state.busy;
   }
 
+  // ----------------------------------------------------- the progress estimate
+
+  var PROGRESS_TICK_MS = 2000;
+  var progress = { timer: null, steps: [], completed: 0 };
+
+  function stepsFor(modality) {
+    return JOURNEY_STEPS[modality === 'sucursal' ? 'sucursal' : 'domicilio'];
+  }
+
+  /** Completed steps to a percentage, capped below 100: only the response can say "done". */
+  function approximatePercent(completed, total) {
+    if (total <= 0) return 0;
+    var capped = Math.max(0, Math.min(completed, total - 1));
+    return Math.round((capped / total) * 100);
+  }
+
+  function stopProgress() {
+    if (progress.timer !== null) {
+      clearTimer(progress.timer);
+      progress.timer = null;
+    }
+  }
+
+  function renderProgressList(list, percentNode) {
+    clear(list);
+    progress.steps.forEach(function (label, index) {
+      var marker;
+      var cls;
+      if (index < progress.completed) {
+        marker = '✓';
+        cls = 'done';
+      } else if (index === progress.completed) {
+        marker = '⏳';
+        cls = 'current';
+      } else {
+        marker = '·';
+        cls = 'pending';
+      }
+      list.appendChild(make('li', cls, marker + ' ' + label));
+    });
+    // Approximate by nature: the steps last about the same, the clock is a
+    // guess, and the wording on screen says so.
+    percentNode.textContent =
+      'Progreso estimado: ' + approximatePercent(progress.completed, progress.steps.length) + ' % (aproximado)';
+  }
+
+  /**
+   * The in-flight card: the step checklist for this modality, a current step
+   * advancing on a timer, and an approximate percentage. The timer stops at the
+   * second-to-last step and never marks the last one done — the response is the
+   * only thing that can close the run, and renderResult snaps the card to it.
+   */
+  function startProgressCard(mode, modality) {
+    progress.steps = stepsFor(modality).slice();
+    progress.completed = 0;
+    stopProgress();
+
+    var box = byId('result');
+    clear(box);
+    var card = make('div', 'result-card progress-card');
+    card.appendChild(make(
+      'p',
+      'progress-title',
+      mode === 'create' ? 'Creando el envío — progreso estimado' : 'Prueba en seco — progreso estimado'
+    ));
+    card.appendChild(make('p', 'progress-note', 'El porcentaje es aproximado: los pasos duran parejo y el recuento es estimado.'));
+    var list = document.createElement('ul');
+    list.className = 'progress-steps';
+    card.appendChild(list);
+    var percentNode = make('p', 'progress-percent', '');
+    card.appendChild(percentNode);
+    box.appendChild(card);
+
+    renderProgressList(list, percentNode);
+
+    progress.timer = setTimer(function () {
+      if (progress.completed < progress.steps.length - 1) {
+        progress.completed += 1;
+        renderProgressList(list, percentNode);
+      }
+    }, PROGRESS_TICK_MS);
+  }
+
+  // ------------------------------------------------------------ the error card
+
+  function pushUnique(lines, text) {
+    if (text !== '' && lines.indexOf(text) === -1) lines.push(text);
+  }
+
+  /**
+   * The technical lines for the collapsed details: everything is demoted there,
+   * nothing is dropped — except the hand-edit JSON recipe for resolving a run
+   * record, which is an operator trap on screen. The recipe stays in docs/ops;
+   * here the record's file path survives so the file can still be found.
+   */
+  function technicalLines(items) {
+    var lines = [];
+    (items || []).forEach(function (item) {
+      var text = String(item);
+      if (text.indexOf('"runId"') !== -1) {
+        var recordPath = /run-records\\/[^\\s")]+\\.json/.exec(text);
+        if (recordPath) pushUnique(lines, 'registro en disco: ' + recordPath[0]);
+        return;
+      }
+      pushUnique(lines, text);
+    });
+    return lines;
+  }
+
+  function errorDetails(lines) {
+    var details = document.createElement('details');
+    details.className = 'error-details';
+    var summary = document.createElement('summary');
+    summary.textContent = 'Detalles técnicos';
+    details.appendChild(summary);
+    var body = make('div', 'error-detail-body');
+    lines.forEach(function (line) {
+      body.appendChild(make('p', 'mono', line));
+    });
+    details.appendChild(body);
+    return details;
+  }
+
+  /**
+   * The readable, contained error: one short human heading, one actionable
+   * sentence, and the raw internals collapsed. Everything lives inside the
+   * card, so long paths wrap instead of pushing the layout wide.
+   */
+  function renderErrorCard(parts) {
+    stopProgress();
+    var box = byId('result');
+    clear(box);
+    var card = make('div', 'result-card is-bad');
+    card.appendChild(make('p', 'error-heading bad', parts.heading));
+    if (parts.sub) card.appendChild(make('p', null, parts.sub));
+    card.appendChild(make('p', 'error-action', 'Qué podés hacer: ' + parts.action));
+    if (parts.lines.length > 0) card.appendChild(errorDetails(parts.lines));
+    if (parts.note) card.appendChild(make('p', 'note', parts.note));
+    box.appendChild(card);
+  }
+
+  /** The heading and the one action sentence, derived from the gate's refusal. */
+  function refusalCopy(reason) {
+    if (String(reason).indexOf('already created a shipment') !== -1) {
+      return {
+        heading: 'Este mensaje ya creó un envío.',
+        action: 'Si de verdad necesitás otro envío, cambiá el mensaje para que sea un pedido distinto.',
+      };
+    }
+    return {
+      heading: 'Este mensaje ya tiene una corrida sin resolver.',
+      action: 'Revisá el panel y, si el envío no existe, marcá la corrida como resuelta.',
+    };
+  }
+
+  /** An HTTP-level failure (the run POST itself failed): the same tiers, honestly worded. */
+  function renderRunFailure(error) {
+    var reason = error && error.message ? error.message : String(error);
+    if (error && error.status === 409) {
+      renderErrorCard({
+        heading: 'Hay otra corrida en curso.',
+        sub: null,
+        action: 'Esperá a que termine y volvé a intentar; no se cambió nada.',
+        lines: [reason],
+        note: null,
+      });
+      return;
+    }
+    renderErrorCard({
+      heading: 'No se pudo completar la corrida.',
+      sub: null,
+      action: 'Podés volver a intentar; si vuelve a fallar, avisá con los detalles de abajo.',
+      lines: ['código HTTP: ' + (error && error.status ? error.status : '(desconocido)'), reason],
+      note: null,
+    });
+  }
+
   // ------------------------------------------------------------- the actions
 
   function analyze() {
@@ -407,23 +598,21 @@ export const CLIENT_JS = `(function () {
 
     state.busy = true;
     syncButtons();
-    clear(byId('result'));
     setStatus(
       'run-status',
       mode === 'create' ? 'Creando el envío: recorre el panel y hace un solo click en Crear envío…' : 'Recorriendo el panel hasta el resumen, sin crear nada…',
       null
     );
 
+    // The POST answers only at the end, so the card is an estimate that runs on
+    // a timer; renderResult snaps it to the response's real outcome.
+    startProgressCard(mode, state.modalidad);
+
     post('/api/run', { message: state.message, form: collect(), mode: mode }).then(function (data) {
       renderResult(data);
       loadConsole(null);
     }).catch(function (error) {
-      var box = byId('result');
-      clear(box);
-      box.appendChild(make('p', 'bad', describeError(error)));
-      if (error && error.status === 409) {
-        box.appendChild(make('p', 'note', 'No se cambió nada: cuando la corrida en curso termine, volvé a intentar.'));
-      }
+      renderRunFailure(error);
       setStatus('run-status', 'La corrida no se completó.', 'bad');
       loadConsole(null);
     }).then(function () {
@@ -432,76 +621,115 @@ export const CLIENT_JS = `(function () {
     });
   }
 
+  /**
+   * The run's final state, snapped over whatever estimate the progress card
+   * was showing: whatever the response says is what the screen now says.
+   */
   function renderResult(data) {
-    var box = byId('result');
-    clear(box);
+    stopProgress();
 
     if (data.status === 'invalid-form') {
-      box.appendChild(make('p', 'bad', 'No se ejecutó nada: revisá estos campos.'));
-      box.appendChild(issueList(data.errors.map(function (item) { return item.message; })));
+      var box = byId('result');
+      clear(box);
+      var formCard = make('div', 'result-card is-bad');
+      formCard.appendChild(make('p', 'error-heading bad', 'No se ejecutó nada: revisá estos campos.'));
+      formCard.appendChild(issueList(data.errors.map(function (item) { return item.message; })));
+      box.appendChild(formCard);
       setStatus('run-status', 'El envío no se creó.', 'bad');
       return;
     }
 
     if (data.status === 'refused') {
-      box.appendChild(make('p', 'bad', 'RECHAZADO antes de tocar el panel: ' + data.reason));
-      if (data.details.length > 0) box.appendChild(issueList(data.details));
-      box.appendChild(make('p', 'note', 'No se creó nada y no se escribió ningún registro nuevo.'));
+      var copy = refusalCopy(data.reason);
+      renderErrorCard({
+        heading: copy.heading,
+        sub: 'La corrida se detuvo antes del primer paso: el panel no se abrió y no se creó nada.',
+        action: copy.action,
+        lines: technicalLines(data.details).concat([data.reason]),
+        note: null,
+      });
       setStatus('run-status', 'El envío no se creó.', 'bad');
       return;
     }
 
     if (data.status === 'dry-run') {
-      box.appendChild(make('p', data.formMatchesApproval ? 'ok' : 'bad',
+      var box = byId('result');
+      clear(box);
+      var dryCard = make('div', 'result-card');
+      dryCard.appendChild(make('p', data.formMatchesApproval ? 'result-id ok' : 'result-id bad',
         data.formMatchesApproval
           ? 'Resumen alcanzado. No se creó nada y no se tocó la etiqueta.'
           : 'El panel no tiene el payload que muestra la página. No se creó nada.'));
-      if (data.mismatches.length > 0) box.appendChild(issueList(data.mismatches));
-      box.appendChild(pathRow('hash del payload', data.payloadHash));
-      box.appendChild(pathRow('informe del recorrido', data.reportPath));
-      if (data.note) box.appendChild(make('p', 'note', data.note));
+      dryCard.appendChild(make('p', null, data.stoppedAt === 'summary'
+        ? 'El recorrido llegó hasta el resumen del panel.'
+        : 'El recorrido llegó hasta la sucursal seleccionada en el panel.'));
+      if (data.mismatches.length > 0) dryCard.appendChild(issueList(data.mismatches));
+      dryCard.appendChild(errorDetails(technicalLines([
+        data.payloadHash ? 'hash del payload: ' + data.payloadHash : '',
+        data.reportPath ? 'informe del recorrido: ' + data.reportPath : '',
+      ])));
+      if (data.note) dryCard.appendChild(make('p', 'note', data.note));
+      box.appendChild(dryCard);
       setStatus('run-status', 'Prueba en seco terminada: nada se creó.', data.formMatchesApproval ? 'ok' : 'warn');
       return;
     }
 
     if (data.status === 'created') {
-      var heading = make('p', 'result-id ok', 'Envío creado ' + data.shipmentId);
-      box.appendChild(heading);
-      box.appendChild(make('p', null, 'Estado en el panel: ' + (data.statusBadges.join(', ') || '(no leído)')));
-      box.appendChild(make('p', null, 'Costo (resumen): ' + (data.cost.summary || '(no leído)')));
-      box.appendChild(make('p', null, 'Costo (detalle): ' + (data.cost.detail || '(no leído)')));
+      var box = byId('result');
+      clear(box);
+      var card = make('div', 'result-card');
+      card.appendChild(make('p', 'result-id ok', 'Envío creado: ' + data.shipmentId));
+      card.appendChild(make('p', null, 'Estado en el panel: ' + (data.statusBadges.join(', ') || '(no leído)')));
+      card.appendChild(make('p', null, 'Costo (resumen): ' + (data.cost.summary || '(no leído)')));
+      card.appendChild(make('p', null, 'Costo (detalle): ' + (data.cost.detail || '(no leído)')));
       if (data.labelUnpaid.proven) {
-        box.appendChild(make('p', 'ok',
-          'Prueba de etiqueta impaga: el identificador, el estado del panel y el control de etiqueta siguen presentes; no se accionó nada sobre la etiqueta.'));
+        card.appendChild(make('p', 'ok',
+          'Etiqueta impaga confirmada: el identificador, el estado del panel y el control de etiqueta siguen presentes; no se accionó nada sobre la etiqueta.'));
       } else {
-        box.appendChild(make('p', 'bad', 'INCOMPLETO: no se puede probar que la etiqueta siga impaga.'));
-        if (data.labelUnpaid.problem) box.appendChild(make('p', 'bad', data.labelUnpaid.problem));
-        if (data.labelUnpaid.details.length > 0) box.appendChild(issueList(data.labelUnpaid.details));
+        card.appendChild(make('p', 'bad', 'INCOMPLETO: no se puede probar que la etiqueta siga impaga.'));
+        if (data.labelUnpaid.problem) card.appendChild(make('p', 'bad', data.labelUnpaid.problem));
+        if (data.labelUnpaid.details.length > 0) card.appendChild(issueList(data.labelUnpaid.details));
       }
-      box.appendChild(pathRow('registro previo al click', data.recordPath));
-      box.appendChild(pathRow('desenlace', data.outcomePath));
-      box.appendChild(pathRow('informe del ejecutor', data.reportPath));
-      if (data.detailScreenshot) box.appendChild(pathRow('captura del detalle', data.detailScreenshot));
+      card.appendChild(errorDetails(technicalLines([
+        data.recordPath ? 'registro previo al click: ' + data.recordPath : '',
+        data.outcomePath ? 'desenlace: ' + data.outcomePath : '',
+        data.reportPath ? 'informe del ejecutor: ' + data.reportPath : '',
+        data.detailScreenshot ? 'captura del detalle: ' + data.detailScreenshot : '',
+      ])));
+      box.appendChild(card);
       setStatus('run-status', 'Listo: la etiqueta queda impaga.', 'ok');
       return;
     }
 
     if (data.status === 'unknown') {
-      box.appendChild(make('p', 'warn', 'Resultado DESCONOCIDO: ' + data.reason));
-      box.appendChild(make('p', null, 'Conciliación: ' + data.interpretation));
-      if (data.matches.length > 0) box.appendChild(issueList(data.matches));
-      if (data.details.length > 0) box.appendChild(issueList(data.details));
-      box.appendChild(pathRow('registro a inspeccionar', data.recordPath));
-      box.appendChild(pathRow('desenlace', data.outcomePath));
-      box.appendChild(make('p', 'note', data.note));
+      renderErrorCard({
+        heading: 'No sabemos si el envío se creó.',
+        sub: 'El click se hizo una sola vez y la página de detalle nunca llegó: la corrida queda abierta a propósito.',
+        action: 'Revisá la lista de envíos del panel antes de repetir este mensaje.',
+        lines: technicalLines(data.details.concat(data.matches)).concat([
+          data.reason,
+          'Conciliación: ' + data.interpretation,
+          data.recordPath ? 'registro a inspeccionar: ' + data.recordPath : '',
+          data.outcomePath ? 'desenlace: ' + data.outcomePath : '',
+        ]),
+        note: data.note,
+      });
       setStatus('run-status', 'Hay que conciliar a mano antes de repetir este mensaje.', 'warn');
       return;
     }
 
-    box.appendChild(make('p', 'bad', 'La ejecución se detuvo: ' + data.reason));
-    if (data.details.length > 0) box.appendChild(issueList(data.details));
-    if (data.recordPath) box.appendChild(pathRow('registro a inspeccionar', data.recordPath));
-    box.appendChild(make('p', 'note', data.note));
+    renderErrorCard({
+      heading: 'No se pudo crear el envío.',
+      sub: 'La corrida se detuvo: no se puede saber hasta qué paso llegó.',
+      action: data.recordPath
+        ? 'Antes de reintentar, resolvé la corrida que quedó abierta (el archivo está en los detalles).'
+        : 'Podés volver a intentar cuando quieras: no quedó ninguna corrida abierta.',
+      lines: technicalLines(data.details).concat([
+        data.reason,
+        data.recordPath ? 'registro a inspeccionar: ' + data.recordPath : '',
+      ]),
+      note: data.note,
+    });
     setStatus('run-status', 'La corrida no se completó.', 'bad');
   }
 
@@ -755,5 +983,5 @@ export const CLIENT_JS = `(function () {
   updateMessageBadge();
   syncButtons();
   loadConsole(null);
-})();
+})(document, fetch, localStorage, matchMedia, setInterval, clearInterval);
 `;
