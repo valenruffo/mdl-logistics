@@ -20,7 +20,7 @@
  */
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 
-import type { ApprovalPayload } from '../executor/approval';
+import type { ApprovalPayload, SucursalApprovalPayload } from '../executor/approval';
 import { GateRefused } from './gates';
 import type { ExistingRun, RunOutcomeStatus } from './gates';
 
@@ -39,8 +39,8 @@ export interface ApprovalRunRecord {
   messageHash: string;
   /** sha-256 of the approved payload — the same value the executor re-checks. */
   approvalHash: string;
-  /** The full approved payload, not just its hash. */
-  payload: ApprovalPayload;
+  /** The full approved payload, not just its hash. Either modality's shape. */
+  payload: ApprovalPayload | SucursalApprovalPayload;
   /**
    * The token the CLI asks the operator to type. **Absent** for the local page,
    * where creating a shipment needs no ceremony (R10 as amended); `loadRunRecords`

@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
-import type { ShipmentRequest } from '../core/types';
+import { normalizeText } from '../core/normalize';
+import type { ShipmentRequest, SucursalShipmentRequest } from '../core/types';
+import type { AgencyScreenReadback } from './envioNube';
 import type { CarrierReadback, CostReadback, RecipientReadback } from './envioNube';
 
 /**
@@ -114,4 +116,116 @@ export function canonicalApprovalPayload(payload: ApprovalPayload): string {
 /** Lower-case sha-256 hex digest of the canonical payload. */
 export function hashApprovalPayload(payload: ApprovalPayload): string {
   return createHash('sha256').update(canonicalApprovalPayload(payload), 'utf8').digest('hex');
+}
+
+// --------------------------------------------------------------- sucursal
+
+/**
+ * The sucursal approval artifact. The shape mirrors what the two sucursal
+ * screens actually hold: no address group (the destination is only a postal
+ * code on screen Q), a branch instead of a province, and the panel's
+ * `customer.surname` anchor in place of domicilio's `customer.lastName`.
+ */
+export interface SucursalApprovalPayload {
+  /** Screen Q's `address.zipCode` readback. */
+  zipCode: string;
+  /** The branch: the request name on the request side, the selected option text on the readback side. */
+  sucursal: string;
+  /** The approved carrier name (SUCURSAL_CARRIER_NAME), never the panel's decoration. */
+  carrier: string;
+  height: string;
+  width: string;
+  depth: string;
+  weight: string;
+  declaredValue: string;
+  customer: { name: string; surname: string; email: string; phone: string };
+}
+
+/** The sucursal payload the preview would show, before the panel is touched. */
+export function sucursalApprovalPayloadFromRequest(
+  request: SucursalShipmentRequest,
+  carrier: string,
+): SucursalApprovalPayload {
+  return {
+    zipCode: request.zipCode,
+    sucursal: request.sucursal,
+    carrier,
+    height: text(request.box.heightCm),
+    width: text(request.box.widthCm),
+    depth: text(request.box.depthCm),
+    weight: text(request.box.weightG),
+    declaredValue: text(request.box.declaredValueArs),
+    customer: {
+      name: request.customer.name,
+      surname: request.customer.lastName ?? '',
+      email: request.customer.email ?? '',
+      phone: request.customer.phone ?? '',
+    },
+  };
+}
+
+/**
+ * The same payload, built from what the panel actually holds after the walk.
+ *
+ * `sucursal` carries the **selected option text** as the panel shows it; the
+ * branch is matched by normalized option text, so the request name and this
+ * text can differ in case/accents/whitespace while naming the same branch.
+ * `carrier` is the approved carrier name the caller verified against the
+ * readback (same trust model as domicilio's `carrier.selectedName`).
+ */
+export function sucursalApprovalPayloadFromReadback(readback: {
+  screen: AgencyScreenReadback;
+  zipCode: string;
+  sucursal: string;
+  carrier: string;
+}): SucursalApprovalPayload {
+  return {
+    zipCode: readback.zipCode,
+    sucursal: readback.sucursal,
+    carrier: readback.carrier,
+    height: readback.screen.height,
+    width: readback.screen.width,
+    depth: readback.screen.depth,
+    weight: readback.screen.weight,
+    declaredValue: readback.screen.declaredValue,
+    customer: {
+      name: readback.screen.name,
+      surname: readback.screen.surname,
+      email: readback.screen.email,
+      phone: readback.screen.phone,
+    },
+  };
+}
+
+/**
+ * Deterministic serialization for the sucursal payload, with a literal
+ * `sucursal` tag first so it can never collide with the domicilio canonical form.
+ *
+ * The branch field is hashed by **identity, not spelling**: the panel's own
+ * option text is authoritative and the request name is matched against it after
+ * normalization (case/accent/whitespace), so the same normalization runs on both
+ * sides before hashing. The operator approves a branch identity, not its
+ * spelling. Every other field must match byte for byte.
+ */
+export function canonicalSucursalApprovalPayload(payload: SucursalApprovalPayload): string {
+  return JSON.stringify([
+    'sucursal',
+    payload.zipCode,
+    normalizeText(payload.sucursal),
+    payload.carrier,
+    payload.height,
+    payload.width,
+    payload.depth,
+    payload.weight,
+    payload.declaredValue,
+    payload.customer.name,
+    payload.customer.surname,
+    payload.customer.email,
+    payload.customer.phone,
+  ]);
+}
+
+/** Lower-case sha-256 hex digest of the canonical sucursal payload. */
+export function hashSucursalApprovalPayload(payload: SucursalApprovalPayload): string {
+  return createHash('sha256').update(canonicalSucursalApprovalPayload(payload), 'utf8').digest('hex');
 }

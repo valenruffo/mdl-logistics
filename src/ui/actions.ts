@@ -29,9 +29,9 @@
  * page never imports Playwright itself.
  */
 import {
+  computeAnyApprovalHash,
   GateRefused,
   assertNoBlockingPriorAttempt,
-  computeApprovalHash,
   messageFingerprint,
   type ExistingRun,
 } from '../cli/gates';
@@ -47,9 +47,9 @@ import { CARRIER_NAME } from '../core/carrier';
 import { DEFAULT_CONFIG } from '../core/config';
 import { parseMessage } from '../core/parse-message';
 import { PROVINCE_OPTIONS } from '../core/provinces';
-import type { MessageModality, ParseWarning, ShipmentRequest } from '../core/types';
-import { approvalPayloadFromRequest } from '../executor/approval';
-import { labelUnpaidProblem, type CardReadback } from '../executor/envioNube';
+import type { AnyShipmentRequest, MessageModality, ParseWarning } from '../core/types';
+import { approvalPayloadFromRequest, sucursalApprovalPayloadFromRequest } from '../executor/approval';
+import { labelUnpaidProblem, SUCURSAL_CARRIER_NAME, type CardReadback } from '../executor/envioNube';
 import { ExecutorError, UnknownOutcomeError, detailsOf, messageOf } from '../executor/errors';
 import type { CreateRunResult, DryRunResult, RunOptions } from '../executor/run';
 import type { ConsoleOverrides } from './console';
@@ -231,15 +231,7 @@ export interface RunInput {
 }
 
 /** A refusal raised by a gate that prevents a duplicate shipment. */
-export type RefusalStage = 'prior-attempt' | 'sucursal-not-implemented';
-
-/**
- * The exact inline wording shown when a sucursal run is attempted before the
- * executor slice lands. The preview stays honest: parsing and editing work,
- * the run does not pretend to.
- */
-export const SUCURSAL_RUN_REFUSAL =
-  'la carga de envíos a sucursal todavía no está implementada en esta versión';
+export type RefusalStage = 'prior-attempt';
 
 export interface RefusedResponse {
   status: 'refused';
@@ -250,9 +242,11 @@ export interface RefusedResponse {
 
 export interface DryRunResponse {
   status: 'dry-run';
-  /** The dry run's terminal state: the panel summary. Nothing was created. */
-  summaryReached: true;
-  /** The hash of the payload that was walked to the summary. */
+  /** True only when the terminal state is the domicilio summary; sucursal stops on the selected branch. */
+  summaryReached: boolean;
+  /** The dry run's terminal state, as the executor reported it. */
+  stoppedAt: 'summary' | 'agency-quotation';
+  /** The hash of the payload that was walked. */
   payloadHash: string;
   /** True when the panel's own readback hashes to the same payload. */
   formMatchesApproval: boolean;
@@ -338,16 +332,11 @@ export async function runAttempt(input: RunInput, deps: ActionDeps): Promise<Run
   const built = requestFromForm(input.form);
   if (!built.ok) return { status: 'invalid-form', errors: built.errors };
 
-  // Sucursal runs are refused before anything else happens: no payload hash,
-  // no record, no browser. The executor slice lands after a DOM discovery pass.
-  if (built.value.modality === 'sucursal') {
-    return { status: 'refused', stage: 'sucursal-not-implemented', reason: SUCURSAL_RUN_REFUSAL, details: [] };
-  }
-
-  const request: ShipmentRequest = built.value;
+  const request: AnyShipmentRequest = built.value;
   // Integrity only: the executor recomputes this from the panel readback, so a
   // page that shows one payload and a panel that receives another is caught.
-  const payloadHash = computeApprovalHash(request);
+  // Sucursal runs the exact same gates as domicilio: the refusal is gone.
+  const payloadHash = computeAnyApprovalHash(request);
   const messageHash = messageFingerprint(input.message);
 
   let records: ExistingRun[];
@@ -372,7 +361,7 @@ export async function runAttempt(input: RunInput, deps: ActionDeps): Promise<Run
 }
 
 async function dryRun(
-  request: ShipmentRequest,
+  request: AnyShipmentRequest,
   payloadHash: string,
   note: string | null,
   deps: ActionDeps,
@@ -392,7 +381,10 @@ async function dryRun(
 
   return {
     status: 'dry-run',
-    summaryReached: true,
+    // For sucursal the terminal state is the selected branch on screen Q — the
+    // form was filled, the carrier and branch hold, and nothing was created.
+    summaryReached: result.stoppedAt === 'summary',
+    stoppedAt: result.stoppedAt,
     payloadHash,
     formMatchesApproval: result.formMatchesApproval,
     mismatches: [...result.mismatches],
@@ -402,7 +394,7 @@ async function dryRun(
 }
 
 async function create(
-  request: ShipmentRequest,
+  request: AnyShipmentRequest,
   messageHash: string,
   payloadHash: string,
   deps: ActionDeps,
@@ -418,7 +410,10 @@ async function create(
       messageFile: '(pasted in the UI)',
       messageHash,
       approvalHash: payloadHash,
-      payload: approvalPayloadFromRequest(request, CARRIER_NAME),
+      payload:
+        request.modality === 'sucursal'
+          ? sucursalApprovalPayloadFromRequest(request, SUCURSAL_CARRIER_NAME)
+          : approvalPayloadFromRequest(request, CARRIER_NAME),
       // No confirmation: this surface has no typed token, by design (R10 as
       // amended). The CLI still records the one it asks for.
       status: 'attempted-unresolved',
@@ -499,8 +494,10 @@ async function create(
   }
 
   const shipment = result.shipment;
+  // Only the domicilio journey has a summary screen; sucursal goes from screen
+  // Q straight to the detail page, so its summary cost card does not exist.
   const cost = {
-    summaryModality: cardText(result.journey.summary.cards, SUMMARY_MODALITY_CARD),
+    summaryModality: 'summary' in result.journey ? cardText(result.journey.summary.cards, SUMMARY_MODALITY_CARD) : null,
     detailShipmentData: cardText(shipment.cards, DETAIL_SHIPMENT_CARD),
   };
 

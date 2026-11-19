@@ -18,8 +18,16 @@
  */
 import { createHash } from 'node:crypto';
 
-import type { ShipmentRequest } from '../core/types';
-import { approvalPayloadFromRequest, hashApprovalPayload, type ApprovalPayload } from '../executor/approval';
+import type { AnyShipmentRequest, ShipmentRequest, SucursalShipmentRequest } from '../core/types';
+import {
+  approvalPayloadFromRequest,
+  hashApprovalPayload,
+  hashSucursalApprovalPayload,
+  sucursalApprovalPayloadFromRequest,
+  type ApprovalPayload,
+  type SucursalApprovalPayload,
+} from '../executor/approval';
+import { SUCURSAL_CARRIER_NAME } from '../executor/envioNube';
 import { CARRIER_NAME } from '../core/carrier';
 
 /** The word the operator types after the postal code to authorize the creation. */
@@ -160,6 +168,23 @@ export function computeApprovalHash(request: ShipmentRequest): string {
   return hashApprovalPayload(approvalPayloadFromRequest(request, CARRIER_NAME));
 }
 
+/**
+ * The sucursal approval hash: same gate, same canonicalizer discipline, sucursal
+ * payload shape. The branch is hashed by identity (normalized option text), so
+ * the operator-approved name and the panel's own spelling hash the same whenever
+ * they name the same branch — and only then.
+ */
+export function computeSucursalApprovalHash(request: SucursalShipmentRequest): string {
+  return hashSucursalApprovalPayload(sucursalApprovalPayloadFromRequest(request, SUCURSAL_CARRIER_NAME));
+}
+
+/** Approval hash for either modality, dispatched by the request itself. */
+export function computeAnyApprovalHash(request: AnyShipmentRequest): string {
+  return request.modality === 'sucursal'
+    ? computeSucursalApprovalHash(request)
+    : computeApprovalHash(request);
+}
+
 /** Every panel field of the resolved payload, in a stable order, for printing. */
 export function describeApprovalPayload(payload: ApprovalPayload): PanelField[] {
   return [
@@ -179,6 +204,25 @@ export function describeApprovalPayload(payload: ApprovalPayload): PanelField[] 
     { field: 'address.neighborhood', value: payload.neighborhood },
     { field: 'customer.name', value: payload.customer.name },
     { field: 'customer.lastName', value: payload.customer.lastName },
+  ];
+}
+
+/** Every panel field of the resolved sucursal payload, in a stable order. */
+export function describeSucursalApprovalPayload(payload: SucursalApprovalPayload): PanelField[] {
+  return [
+    { field: 'modality', value: 'sucursal' },
+    { field: 'zipCode (address.zipCode en el panel)', value: payload.zipCode },
+    { field: 'sucursal (select del panel)', value: payload.sucursal },
+    { field: 'carrier', value: payload.carrier },
+    { field: 'box.height (cm)', value: payload.height },
+    { field: 'box.width (cm)', value: payload.width },
+    { field: 'box.depth (cm)', value: payload.depth },
+    { field: 'box.weight (g)', value: payload.weight },
+    { field: 'declaredValue', value: payload.declaredValue },
+    { field: 'customer.name', value: payload.customer.name },
+    { field: 'customer.surname', value: payload.customer.surname },
+    { field: 'customer.email', value: payload.customer.email },
+    { field: 'customer.phoneNumber', value: payload.customer.phone },
   ];
 }
 
@@ -223,7 +267,7 @@ export function assertApprovalHash(provided: string | null | undefined, expected
 }
 
 /** `"<postal code> crear"` — the exact text the operator must type before the click. */
-export function confirmationTokenFor(request: ShipmentRequest): string {
+export function confirmationTokenFor(request: AnyShipmentRequest): string {
   return `${request.zipCode} ${CONFIRMATION_WORD}`;
 }
 

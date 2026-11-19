@@ -24,9 +24,10 @@ import {
   type ShipmentRequest,
   type SucursalShipmentRequest,
 } from '../../src/core/types';
-import { SUCURSAL_RUN_REFUSAL, analyzeMessage, runAttempt, type ActionDeps, type UiExecutor } from '../../src/ui/actions';
+import { analyzeMessage, runAttempt, type ActionDeps, type UiExecutor } from '../../src/ui/actions';
+import { sucursalApprovalPayloadFromRequest } from '../../src/executor/approval';
+import { SUCURSAL_CARRIER_NAME } from '../../src/executor/envioNube';
 import {
-  SUCURSAL_ANCHOR_PENDING,
   formFieldsForBothModalities,
   formFieldsFromRequest,
   formValuesFromFields,
@@ -300,7 +301,11 @@ test('analyze: a sucursal message yields the sucursal field set, with no address
 
   const sucursalField = analyzed.fields.find((field) => field.key === 'sucursal');
   assert.ok(sucursalField);
-  assert.equal(sucursalField.panelField, SUCURSAL_ANCHOR_PENDING, 'the real anchors belong to the executor slice');
+  assert.equal(
+    sucursalField.panelField,
+    'sucursal',
+    'the sucursal field maps to the observed dropdown anchor select[name="sucursal"]',
+  );
 });
 
 test('analyze: the declared value is prefilled with 100000, shown as an editable input', () => {
@@ -430,81 +435,155 @@ test('both modality lists agree on the package defaults, in centimetres and gram
   }
 });
 
-// ------------------------------------------------------- 3. the run refusals
+// --------------------------------------------------- 3. the run path is wired
 
-test('a sucursal create run is refused before anything is hashed or touched', async () => {
+const SUCURSAL_PAYLOAD = (() => {
   const analyzed = analyzeMessage(SUCURSAL_MESSAGE);
   assert.equal(analyzed.status, 'parsed');
   if (analyzed.status !== 'parsed') throw new Error('unreachable');
+  const built = requestFromForm(formValuesFromFields(analyzed.fieldsByModalidad.sucursal));
+  assert.ok(built.ok);
+  if (!built.ok) throw new Error('unreachable');
+  return built.value;
+})();
 
-  const form = formValuesFromFields(analyzed.fieldsByModalidad.sucursal);
-  const response = await runAttemptWith(form, 'create');
-
-  assert.deepEqual(response, {
-    status: 'refused',
-    stage: 'sucursal-not-implemented',
-    reason: 'la carga de envíos a sucursal todavía no está implementada en esta versión',
-    details: [],
-  });
-});
-
-test('a sucursal dry run is refused with the same wording: the UI stays honest', async () => {
-  const analyzed = analyzeMessage(SUCURSAL_MESSAGE);
-  assert.equal(analyzed.status, 'parsed');
-  if (analyzed.status !== 'parsed') throw new Error('unreachable');
-
-  const form = formValuesFromFields(analyzed.fieldsByModalidad.sucursal);
-  const response = await runAttemptWith(form, 'dry-run');
-
-  assert.equal(response.status, 'refused');
-  if (response.status !== 'refused') throw new Error('unreachable');
-  assert.equal(response.reason, SUCURSAL_RUN_REFUSAL);
-});
-
-test('the refusal never reaches the injected executor', async () => {
-  let touched = false;
-  const deps: ActionDeps = {
+function recordingDryRunExecutor(): { executor: UiExecutor; seen: unknown[] } {
+  const seen: unknown[] = [];
+  return {
+    seen,
     executor: {
-      runDryRun: async () => {
-        touched = true;
-        throw new Error('unreachable');
+      runDryRun: async (input) => {
+        seen.push(input.request);
+        return {
+          mode: 'dry-run',
+          modality: 'sucursal',
+          startedAt: '2026-01-01T00:00:00.000Z',
+          finishedAt: '2026-01-01T00:00:01.000Z',
+          approvedPayloadHash: 'a'.repeat(64),
+          formPayloadHash: 'a'.repeat(64),
+          formMatchesApproval: true,
+          mismatches: [],
+          journey: {},
+          stoppedAt: 'agency-quotation',
+          createButtonPresent: true,
+          reportPath: 'artifacts/fixture/dry-run.json',
+        } as never;
       },
       runCreate: async () => {
-        touched = true;
-        throw new Error('unreachable');
+        throw new Error('unreachable in the dry-run test');
       },
     },
-    recordDir: '/nonexistent-run-records',
   };
-  const analyzed = analyzeMessage(SUCURSAL_MESSAGE);
-  assert.equal(analyzed.status, 'parsed');
-  if (analyzed.status !== 'parsed') throw new Error('unreachable');
-
-  await runAttemptWith(formValuesFromFields(analyzed.fieldsByModalidad.sucursal), 'create', deps);
-  assert.equal(touched, false);
-});
-
-async function runAttemptWith(
-  form: Record<string, string>,
-  mode: 'create' | 'dry-run',
-  deps: ActionDeps = DEPS,
-): Promise<unknown> {
-  return runAttempt({ message: SUCURSAL_MESSAGE, form, mode }, deps);
 }
 
-// ------------------------------------------------------------ 4. the CLI refusal
+function createdExecutor(): UiExecutor {
+  return {
+    runDryRun: async () => {
+      throw new Error('unreachable in the create test');
+    },
+    runCreate: async () => ({
+      mode: 'create',
+      modality: 'sucursal',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      finishedAt: '2026-01-01T00:00:05.000Z',
+      approvedPayloadHash: 'a'.repeat(64),
+      formPayloadHash: 'a'.repeat(64),
+      mismatches: [],
+      journey: {
+        screen: {},
+        carrier: {},
+        branch: {},
+        quotation: { createButtonVisible: true },
+      },
+      outcome: 'created',
+      shipment: {
+        url: 'https://example.invalid/shipping-details/8888',
+        shipmentId: '#EM8888',
+        shipmentIdHeading: '#EM8888',
+        statusBadges: ['Por enviar', 'Envío manual'],
+        badgeTexts: ['Por enviar', 'Envío manual'],
+        buyButtonVisible: true,
+        buyCardText: 'El código de seguimiento se generará al imprimir la etiqueta',
+        buttonNames: ['Comprar'],
+        bodyText: 'Envío creado con éxito',
+        cards: [{ title: 'Datos del envío', present: true, text: 'Andreani a sucursal · Costo $4.500' }],
+      },
+      reconciliation: null,
+      detailScreenshot: null,
+      reportPath: 'artifacts/fixture/create-run.json',
+    }) as never,
+  };
+}
 
-test('the CLI refuses a sucursal message before any payload is hashed', async () => {
+test('a sucursal dry run reaches the executor and reports the sucursal terminal state', async () => {
+  const { executor, seen } = recordingDryRunExecutor();
+  const deps: ActionDeps = { executor, recordDir: '/nonexistent-run-records' };
+  const form = formValuesFromFields(analyzeMessage(SUCURSAL_MESSAGE).fieldsByModalidad.sucursal);
+  const response = await runAttempt({ message: SUCURSAL_MESSAGE, form, mode: 'dry-run' }, deps);
+
+  assert.equal(response.status, 'dry-run');
+  if (response.status !== 'dry-run') throw new Error('unreachable');
+  assert.equal(response.summaryReached, false, 'sucursal has no summary screen');
+  assert.equal(response.stoppedAt, 'agency-quotation');
+  assert.match(response.payloadHash, /^[0-9a-f]{64}$/);
+  assert.equal(seen.length, 1);
+  assert.equal((seen[0] as { modality: string }).modality, 'sucursal');
+});
+
+test('a sucursal create run executes under the same duplicate gates', async (t) => {
+  const { mkdtemp, mkdir, rm, writeFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const path = await import('node:path');
+  const root = await mkdtemp(path.join(tmpdir(), 'mdl-sucursal-run-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const recordDir = path.join(root, 'run-records');
+  await mkdir(recordDir, { recursive: true });
+
+  const form = formValuesFromFields(analyzeMessage(SUCURSAL_MESSAGE).fieldsByModalidad.sucursal);
+
+  // No prior attempt: the create path reaches the executor and proves the unpaid label.
+  const response = await runAttempt({ message: SUCURSAL_MESSAGE, form, mode: 'create' }, {
+    executor: createdExecutor(),
+    recordDir,
+  });
+  assert.equal(response.status, 'created');
+  if (response.status !== 'created') throw new Error('unreachable');
+  assert.equal(response.shipmentId, '#EM8888');
+  assert.equal(response.labelUnpaid.proven, true);
+  assert.equal(response.cost.summary, null, 'sucursal has no summary screen, so no summary cost card');
+
+  // An open prior attempt for the same message blocks the run, exactly as for domicilio.
+  const { writeAttemptRecord } = await import('../../src/cli/runRecord');
+  const { messageFingerprint } = await import('../../src/cli/gates');
+  await writeAttemptRecord(recordDir, {
+    runId: 'prior-sucursal-run',
+    recordedAt: new Date().toISOString(),
+    messageFile: '(fixture)',
+    messageHash: messageFingerprint(SUCURSAL_MESSAGE),
+    approvalHash: 'a'.repeat(64),
+    payload: sucursalApprovalPayloadFromRequest(SUCURSAL_PAYLOAD, SUCURSAL_CARRIER_NAME),
+    status: 'attempted-unresolved',
+    note: 'fixture',
+  });
+  const refused = await runAttempt({ message: SUCURSAL_MESSAGE, form, mode: 'create' }, {
+    executor: createdExecutor(),
+    recordDir,
+  });
+  assert.equal(refused.status, 'refused');
+  if (refused.status !== 'refused') throw new Error('unreachable');
+  assert.equal(refused.stage, 'prior-attempt');
+});
+
+// ------------------------------------------------------------- 4. the CLI
+
+test('the CLI drives sucursal like domicilio: the refusal is gone and the hash is per modality', async () => {
   const source = await readFile(new URL('../../src/cli/ship.ts', import.meta.url), { encoding: 'utf8' });
 
-  const refusalIndex = source.indexOf(
-    'REFUSED: este mensaje es de envío a sucursal y la carga a sucursal todavía no está implementada en esta versión',
+  assert.ok(
+    !source.includes('todavía no está implementada'),
+    'the sucursal refusal wording is gone from the CLI',
   );
-  assert.ok(refusalIndex > 0, 'the CLI carries the exact sucursal refusal wording');
-
-  const narrowingIndex = source.indexOf("request.modality === 'sucursal'");
-  assert.ok(narrowingIndex > 0, 'the CLI narrows the parsed value by modality');
-  const firstHashUse = source.indexOf('approvalPayloadFromRequest(request, CARRIER_NAME)');
-  assert.ok(firstHashUse > narrowingIndex, 'nothing is hashed before the sucursal refusal');
-  assert.ok(refusalIndex < firstHashUse, 'the refusal sits before any domicilio payload is built');
+  assert.ok(source.includes('computeSucursalApprovalHash'), 'sucursal payloads are hashed by the sucursal canonicalizer');
+  assert.ok(source.includes('sucursalApprovalPayloadFromRequest'), 'sucursal payloads get their own shape');
+  assert.ok(source.includes("request.modality === 'sucursal'"), 'the CLI dispatches the payload by modality');
 });

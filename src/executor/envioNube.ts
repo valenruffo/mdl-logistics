@@ -1,8 +1,12 @@
 import type { Frame, Locator, Page } from 'playwright';
 import { CARRIER_NAME } from '../core/carrier';
 import type { PackageDefaults } from '../core/config';
-import { sameText, textContains } from '../core/normalize';
-import type { ShipmentRequest } from '../core/types';
+import { sameText, normalizeText, textContains } from '../core/normalize';
+import type { ShipmentRequest, SucursalShipmentRequest } from '../core/types';
+import {
+  hashSucursalApprovalPayload,
+  type SucursalApprovalPayload,
+} from './approval';
 import { hashApprovalPayload, type ApprovalPayload } from './approval';
 import { copyPattern } from './copy';
 import { ExecutorError, UnknownOutcomeError, detailsOf, messageOf } from './errors';
@@ -116,6 +120,54 @@ const RECIPIENT_FIELDS = {
 const PROVINCE_FIELD = 'address.province';
 const DELIVERY_OPTION_FIELD = 'deliveryOptionId';
 
+// ------------------------------------------------------- sucursal: verified anchors
+
+/**
+ * The two sucursal routes, observed live (`docs/plans/mvp-01-manual-shipment.md`,
+ * "Sucursal — Screen P/Q"). Unlike domicilio, the sucursal journey is two screens:
+ *
+ * - Screen P (`#/agency-shipment`): recipient **and** package on one screen, with
+ *   no address section at all — the destination is only a postal code, entered on
+ *   the next screen. The declared value is **required** here (domicilio: optional).
+ * - Screen Q (`#/agency-shipment/quotation`): postal code, carrier, branch and
+ *   the `Crear envío` button on one screen — there is no summary screen.
+ *
+ * The traps the observation settled, which a domicilio-shaped executor would
+ * walk straight into: the surname anchor is `customer.surname` (domicilio uses
+ * `customer.lastName`), the postal code lives on screen Q as `address.zipCode`
+ * (domicilio screen 1 uses `zipCode`), and the carrier radios are named
+ * `freight-option` with `Andreani a sucursal` as the only approved card.
+ */
+export const AGENCY_ROUTES = {
+  recipient: '/agency-shipment',
+  quotation: '/agency-shipment/quotation',
+} as const;
+
+/** The carrier card approved for sucursal (S8), matched by accessible name. */
+export const SUCURSAL_CARRIER_NAME = 'Andreani a sucursal';
+
+const AGENCY_RECIPIENT_FIELDS = {
+  name: 'customer.name',
+  surname: 'customer.surname',
+  email: 'customer.email',
+  phoneNumber: 'customer.phoneNumber',
+} as const;
+
+const AGENCY_PACKAGE_FIELDS = {
+  height: 'box.height',
+  width: 'box.width',
+  depth: 'box.depth',
+  weight: 'box.weight',
+  declaredValue: 'declaredValue',
+} as const;
+
+const AGENCY_ZIP_FIELD = 'address.zipCode';
+const FREIGHT_OPTION_FIELD = 'freight-option';
+const SUCURSAL_SELECT_FIELD = 'sucursal';
+
+/** Route prefix of the shipment detail page, asserted after a sucursal create. */
+export const SHIPMENT_DETAIL_ROUTE = '/shipping-details/';
+
 /**
  * Bounded waits. A stuck screen must abort with evidence, not sit for minutes.
  * Route/heading waits are capped at 25 s, the "Continuar became enabled" gate at
@@ -212,6 +264,73 @@ export interface CardReadback {
   title: string;
   present: boolean;
   text: string | null;
+}
+
+/** What screen P actually holds after filling recipient + package. */
+export interface AgencyScreenReadback {
+  url: string;
+  units: PanelUnits;
+  name: string;
+  /** The panel's `customer.surname` anchor — the request's `lastName`. */
+  surname: string;
+  email: string;
+  phone: string;
+  height: string;
+  width: string;
+  depth: string;
+  weight: string;
+  declaredValue: string;
+  continueEnabled: boolean;
+}
+
+/** One `<option>` of the sucursal dropdown, read from the panel. */
+export interface BranchOption {
+  index: number;
+  /** The option's `value` — a UUID on the real panel, never used for matching. */
+  value: string;
+  /** The option's visible text: the only thing branch matching may compare. */
+  text: string;
+}
+
+/** The outcome of branch-name matching, as data so it can be tested offline. */
+export type BranchMatch =
+  | { kind: 'unique'; option: BranchOption }
+  | { kind: 'none'; options: readonly BranchOption[]; nearMatches: readonly BranchOption[] }
+  | { kind: 'ambiguous'; matches: readonly BranchOption[] };
+
+/** What the sucursal dropdown actually holds after a branch selection. */
+export interface BranchReadback {
+  url: string;
+  /** The approved branch name, as the request wrote it. */
+  requestedName: string;
+  /** The selected option's `value` (a UUID) — recorded, never used for matching. */
+  selectedValue: string;
+  /** The selected option's text, as the panel shows it. */
+  selectedText: string;
+  /** Every option text offered, for the report. */
+  offeredOptions: string[];
+}
+
+/** What screen Q actually holds, read back after the walk. */
+export interface AgencyQuotationReadback {
+  url: string;
+  zipCode: string;
+  /** Accessible name of the checked freight radio, re-read from the panel. */
+  checkedCarrierName: string | null;
+  branchSelectedValue: string;
+  branchSelectedText: string;
+  /** Every option text the dropdown offered, for the report. */
+  branchOptions: string[];
+  /** Visibility assertion only: `createAgencyShipment` is the only click site. */
+  createButtonVisible: boolean;
+}
+
+/** The approval required to click `Crear envío` on the sucursal quotation screen. */
+export interface SucursalCreateApproval {
+  /** sha-256 of the sucursal payload the human approved, lower-case hex. */
+  approvedHash: string;
+  /** The payload read back from the sucursal screens during this run. */
+  payload: SucursalApprovalPayload;
 }
 
 /** The summary (step 4) — the terminal state of a dry run. */
@@ -446,8 +565,21 @@ export class EnvioNube {
     }
   }
 
-  private continueButton(frame: Frame): Locator {
-    return frame.getByRole('button', { name: copyPattern(CONTINUE_BUTTON, { exact: true }) }).first();
+  /**
+   * `Continuar`, found by copy first. The observed sucursal screen renders it
+   * with a custom `role="submit-form"` instead of a plain button role, so when
+   * no button role matches, the verified attribute anchor is tried before the
+   * lookup gives up. A missing match on both anchors is the caller's timeout.
+   */
+  private async continueButton(frame: Frame): Promise<Locator> {
+    const byRole = frame.getByRole('button', { name: copyPattern(CONTINUE_BUTTON, { exact: true }) }).first();
+    if ((await byRole.count().catch(() => 0)) > 0) return byRole;
+    const bySubmitRole = frame.locator('[role="submit-form"]').first();
+    if ((await bySubmitRole.count().catch(() => 0)) > 0) {
+      this.note('"Continuar" resolved through [role="submit-form"] (observed on the sucursal screen)');
+      return bySubmitRole;
+    }
+    return byRole;
   }
 
   /**
@@ -459,7 +591,7 @@ export class EnvioNube {
     screen: string,
     timeoutMs: number = this.readyTimeoutMs,
   ): Promise<void> {
-    const button = this.continueButton(frame);
+    const button = await this.continueButton(frame);
     try {
       await button.waitFor({ state: 'visible', timeout: timeoutMs });
     } catch {
@@ -480,7 +612,7 @@ export class EnvioNube {
   private async clickContinue(frame: Frame, screen: string): Promise<void> {
     await this.waitForContinueEnabled(frame, screen);
     try {
-      await this.continueButton(frame).click({ timeout: this.timeoutMs });
+      await (await this.continueButton(frame)).click({ timeout: this.timeoutMs });
       this.note(`clicked "${CONTINUE_BUTTON}" on ${screen}`);
     } catch (error) {
       // The iframe can navigate or reload while the click resolves. The route
@@ -593,7 +725,7 @@ export class EnvioNube {
       depth: await this.inputValue(frame, COST_FIELDS.depth),
       weight: await this.inputValue(frame, COST_FIELDS.weight),
       declaredValue: await this.inputValue(frame, COST_FIELDS.declaredValue),
-      continueEnabled: await this.continueButton(frame).isEnabled().catch(() => false),
+      continueEnabled: await (await this.continueButton(frame)).isEnabled().catch(() => false),
     };
   }
 
@@ -657,8 +789,47 @@ export class EnvioNube {
   async selectCarrier(name: string = CARRIER_NAME): Promise<CarrierReadback> {
     const frame = await this.waitForRoute(ROUTES.quotation);
     await this.waitForHeading(frame, HEADINGS.quotation, 'screen 2 (Seleccionar medio de envío)');
+    return this.selectRadioCarrier(frame, DELIVERY_OPTION_FIELD, name, 'screen 2 (Seleccionar medio de envío)', {
+      waitForContinueGate: true,
+    });
+  }
 
-    const diagnostics = await this.readCarrierDiagnostics(frame);
+  /**
+   * Selects the sucursal carrier card, `Andreani a sucursal`, on screen Q
+   * (`#/agency-shipment/quotation`). Same radio mechanics as domicilio — hidden
+   * `input`, wrapping label as the click target, `Modalidades activas` group
+   * detection by nearest preceding heading — but with the observed
+   * `freight-option` field name, and no `Continuar` gate: screen Q has no
+   * `Continuar`, the create button lives there instead.
+   */
+  async selectCarrierSucursal(name: string = SUCURSAL_CARRIER_NAME): Promise<CarrierReadback> {
+    const frame = await this.waitForRoute(AGENCY_ROUTES.quotation);
+    return this.selectRadioCarrier(frame, FREIGHT_OPTION_FIELD, name, 'sucursal screen Q (#/agency-shipment/quotation)', {
+      waitForContinueGate: false,
+    });
+  }
+
+  /**
+   * The radio mechanics shared by both quotation screens (observed, §4c):
+   *
+   * - The native radio `input` is visually hidden behind the card, so clicking it
+   *   directly never resolves; the person clicks the wrapping label/card.
+   * - Radio `id`s embed UUIDs and are never used as selectors.
+   * - The accessible name may include the price and delivery estimate, so it is
+   *   read from the panel and matched by substring, never assumed.
+   * - Only a card inside `Modalidades activas` is genuinely selectable; the group
+   *   is resolved from the nearest preceding heading.
+   * - Success is either the screen's own `Continuar` gate (domicilio) or the
+   *   radio reporting checked (sucursal, whose screen has no `Continuar`).
+   */
+  private async selectRadioCarrier(
+    frame: Frame,
+    fieldName: string,
+    name: string,
+    screen: string,
+    options: { waitForContinueGate: boolean },
+  ): Promise<CarrierReadback> {
+    const diagnostics = await this.readCarrierDiagnostics(frame, fieldName);
     const offeredOptions = diagnostics.map((option) => option.accessibleName);
     const nameMatches = diagnostics.filter(
       (option) => !option.disabled && textContains(option.accessibleName, name),
@@ -670,7 +841,7 @@ export class EnvioNube {
 
     if (match === undefined) {
       const details = [
-        ...formatCarrierDiagnostics(diagnostics),
+        ...formatCarrierDiagnostics(diagnostics, fieldName),
         `radios matching ${JSON.stringify(name)} and not disabled: ${nameMatches.length}`,
         'choosing a different carrier is a different product decision and a wrong purchase (R12)',
         ...(await this.describe(frame)),
@@ -679,11 +850,11 @@ export class EnvioNube {
     }
     if (match.group !== 'activas') {
       this.note(
-        `group heading for radio [${match.index}] could not be read; using the only non-disabled name match ${JSON.stringify(match.accessibleName)} and relying on the Continuar gate`,
+        `group heading for radio [${match.index}] could not be read; using the only non-disabled name match ${JSON.stringify(match.accessibleName)} and relying on the screen's own gate`,
       );
     }
 
-    const radio = frame.locator(`input[name="${DELIVERY_OPTION_FIELD}"]`).nth(match.index);
+    const radio = frame.locator(`input[name="${fieldName}"]`).nth(match.index);
     const label = radio.locator('xpath=ancestor::label[1]').first();
     const labelVisible =
       (await label.count().catch(() => 0)) > 0 && (await label.isVisible().catch(() => false));
@@ -698,31 +869,35 @@ export class EnvioNube {
         this.note(`force-checked the hidden radio "${match.accessibleName}" (index ${match.index})`);
       }
     } catch (error) {
-      const after = await this.readCarrierDiagnostics(frame).catch(() => diagnostics);
+      const after = await this.readCarrierDiagnostics(frame, fieldName).catch(() => diagnostics);
       throw new ExecutorError(`could not select the carrier "${match.accessibleName}": ${messageOf(error)}`, [
-        ...formatCarrierDiagnostics(after),
+        ...formatCarrierDiagnostics(after, fieldName),
         ...(await this.describe(frame)),
       ]);
     }
 
     const checked = await poll(async () => ((await radio.isChecked()) ? true : null), { timeoutMs: 10_000 });
     if (checked === null) {
-      const after = await this.readCarrierDiagnostics(frame).catch(() => diagnostics);
+      const after = await this.readCarrierDiagnostics(frame, fieldName).catch(() => diagnostics);
       throw new ExecutorError('the carrier card was clicked but its radio does not report as checked', [
-        ...formatCarrierDiagnostics(after),
+        ...formatCarrierDiagnostics(after, fieldName),
         ...(await this.describe(frame)),
       ]);
     }
 
-    // The success condition is the screen's own validity gate, not a timeout.
-    try {
-      await this.waitForContinueEnabled(frame, 'screen 2 (Seleccionar medio de envío)');
-    } catch (error) {
-      const after = await this.readCarrierDiagnostics(frame).catch(() => diagnostics);
-      throw new ExecutorError(messageOf(error), [...detailsOf(error), ...formatCarrierDiagnostics(after)]);
+    // The success condition is the screen's own validity gate — the `Continuar`
+    // button where the screen has one (domicilio), the checked radio itself where
+    // it does not (sucursal screen Q, whose create button lives beside it).
+    if (options.waitForContinueGate) {
+      try {
+        await this.waitForContinueEnabled(frame, screen);
+      } catch (error) {
+        const after = await this.readCarrierDiagnostics(frame, fieldName).catch(() => diagnostics);
+        throw new ExecutorError(messageOf(error), [...detailsOf(error), ...formatCarrierDiagnostics(after, fieldName)]);
+      }
     }
 
-    const finalDiagnostics = await this.readCarrierDiagnostics(frame).catch(() => diagnostics);
+    const finalDiagnostics = await this.readCarrierDiagnostics(frame, fieldName).catch(() => diagnostics);
     return {
       url: frame.url(),
       selectedName: name,
@@ -730,7 +905,9 @@ export class EnvioNube {
       checked: true,
       offeredOptions,
       diagnostics: finalDiagnostics,
-      continueEnabled: await this.continueButton(frame).isEnabled().catch(() => false),
+      continueEnabled: options.waitForContinueGate
+        ? await (await this.continueButton(frame)).isEnabled().catch(() => false)
+        : false,
     };
   }
 
@@ -746,8 +923,8 @@ export class EnvioNube {
    * accessible name, wrapping label text, which rendered group holds it, whether
    * it is disabled, checked or visible. Logged verbatim on any screen-2 failure.
    */
-  private async readCarrierDiagnostics(frame: Frame): Promise<CarrierOptionDiagnostic[]> {
-    const radios = frame.locator(`input[name="${DELIVERY_OPTION_FIELD}"]`);
+  private async readCarrierDiagnostics(frame: Frame, fieldName: string): Promise<CarrierOptionDiagnostic[]> {
+    const radios = frame.locator(`input[name="${fieldName}"]`);
     const count = await radios.count().catch(() => 0);
     const diagnostics: CarrierOptionDiagnostic[] = [];
     for (let index = 0; index < count; index += 1) {
@@ -892,27 +1069,8 @@ export class EnvioNube {
     // Order matters: Provincia, then Ciudad, then the rest. A province change
     // re-renders the form and resets the city component to empty, so writing the
     // city afterwards is required.
-    const cityField = { name: RECIPIENT_FIELDS.city, value: input.address.city };
-    let cityReadback = await this.typeField(frame, cityField.name, cityField.value);
-    if (cityReadback.trim() === '') {
-      // One typed retry: a controlled input may drop the first write. This is not a
-      // retry of a failed step and not a navigation — it touches no irreversible
-      // action, and the value written is the approved one.
-      this.note(`city read back empty; one typed retry of ${JSON.stringify(cityField.value)}`);
-      cityReadback = await this.typeField(frame, cityField.name, cityField.value);
-    }
-    if (cityReadback.trim() === '') {
-      const details = [
-        `wrote ${JSON.stringify(cityField.value)} into [name="${cityField.name}"] twice with click + real key events + blur; the panel holds it as empty`,
-        'the form is not submitted with an empty required field; nothing was advanced',
-        ...(await this.fieldDiagnostics(frame, cityField.name)),
-        ...(await this.recipientDiagnostics(frame)),
-        ...(await this.describe(frame)),
-      ];
-      throw new ExecutorError(`the panel did not keep the city ${JSON.stringify(cityField.value)}`, details);
-    }
-
     const fields: { name: string; value: string }[] = [
+      { name: RECIPIENT_FIELDS.city, value: input.address.city },
       { name: RECIPIENT_FIELDS.address, value: input.address.address },
       { name: RECIPIENT_FIELDS.number, value: input.address.number },
       ...(input.address.complement === null
@@ -923,37 +1081,11 @@ export class EnvioNube {
       ...(input.customer.lastName === null
         ? []
         : [{ name: RECIPIENT_FIELDS.lastName, value: input.customer.lastName }]),
-      cityField,
     ];
 
-    for (const field of fields) {
-      if (field.name === cityField.name) continue;
-      await this.typeField(frame, field.name, field.value);
-    }
-
-    let drift = await this.recipientDrift(frame, fields);
-    if (drift.length > 0) {
-      // Refilling a text input is idempotent and touches no irreversible action:
-      // this converges on the approved value the panel dropped, it does not retry
-      // a failed step or a navigation.
-      this.note(`refilling values the panel cleared: ${drift.map((entry) => entry.name).join(', ')}`);
-      for (const field of fields) {
-        if (drift.some((entry) => entry.name === field.name)) {
-          await this.typeField(frame, field.name, field.value);
-        }
-      }
-      drift = await this.recipientDrift(frame, fields);
-    }
-    if (drift.length > 0) {
-      throw new ExecutorError('the panel did not keep the recipient values that were written', [
-        ...drift.map(
-          (entry) =>
-            `[name="${entry.name}"] reads ${JSON.stringify(entry.actual)}, expected ${JSON.stringify(entry.expected)}`,
-        ),
-        ...(await this.recipientDiagnostics(frame)),
-        ...(await this.describe(frame)),
-      ]);
-    }
+    await this.typeFieldsWithDriftCheck(frame, fields, 'screen 3 (Completar datos del destinatario)', () =>
+      this.recipientDiagnostics(frame),
+    );
 
     try {
       await this.waitForContinueEnabled(frame, 'screen 3 (Completar datos del destinatario)');
@@ -996,7 +1128,64 @@ export class EnvioNube {
     this.note('the recipient screen kept changing for ~4s; continuing with the reads it holds');
   }
 
-  private async recipientDrift(
+  /**
+   * Types each approved value the way a person does, re-fills anything the panel
+   * dropped once, and stops loudly if it still reads differently.
+   *
+   * Refilling a text input is idempotent and touches no irreversible action: it
+   * converges on the approved value the panel dropped, it does not retry a failed
+   * step or a navigation. A value that still reads wrong after the refill — or
+   * that reads empty after being written — is what a reload or a bot challenge
+   * does to a filled form, and that is a stop, never a blind retry.
+   */
+  private async typeFieldsWithDriftCheck(
+    frame: Frame,
+    fields: readonly { name: string; value: string }[],
+    screen: string,
+    diagnostics: () => Promise<string[]>,
+  ): Promise<void> {
+    for (const field of fields) {
+      let readback = await this.typeField(frame, field.name, field.value);
+      if (readback.trim() === '' && field.value.trim() !== '') {
+        // One typed retry: a controlled input may drop the first write. This is
+        // not a retry of a failed step and not a navigation — it touches no
+        // irreversible action, and the value written is the approved one.
+        this.note(`${field.name} read back empty; one typed retry of ${JSON.stringify(field.value)}`);
+        readback = await this.typeField(frame, field.name, field.value);
+      }
+      if (readback.trim() === '' && field.value.trim() !== '') {
+        throw new ExecutorError(`the panel did not keep the value written into [name="${field.name}"]`, [
+          `wrote ${JSON.stringify(field.value)} into [name="${field.name}"] twice with click + real key events + blur; the panel holds it as empty`,
+          'the form is not submitted with an empty required field; nothing was advanced',
+          ...(await diagnostics()),
+          ...(await this.describe(frame)),
+        ]);
+      }
+    }
+
+    let drift = await this.readFieldDrift(frame, fields);
+    if (drift.length > 0) {
+      this.note(`refilling values the panel cleared: ${drift.map((entry) => entry.name).join(', ')}`);
+      for (const field of fields) {
+        if (drift.some((entry) => entry.name === field.name)) {
+          await this.typeField(frame, field.name, field.value);
+        }
+      }
+      drift = await this.readFieldDrift(frame, fields);
+    }
+    if (drift.length > 0) {
+      throw new ExecutorError(`${screen}: the panel did not keep the values that were written`, [
+        ...drift.map(
+          (entry) =>
+            `[name="${entry.name}"] reads ${JSON.stringify(entry.actual)}, expected ${JSON.stringify(entry.expected)}`,
+        ),
+        ...(await diagnostics()),
+        ...(await this.describe(frame)),
+      ]);
+    }
+  }
+
+  private async readFieldDrift(
     frame: Frame,
     fields: readonly { name: string; value: string }[],
   ): Promise<{ name: string; expected: string; actual: string }[]> {
@@ -1047,7 +1236,7 @@ export class EnvioNube {
       neighborhood: await this.inputValue(frame, RECIPIENT_FIELDS.neighborhood),
       name: await this.inputValue(frame, RECIPIENT_FIELDS.name),
       lastName: await this.inputValue(frame, RECIPIENT_FIELDS.lastName),
-      continueEnabled: await this.continueButton(frame).isEnabled().catch(() => false),
+      continueEnabled: await (await this.continueButton(frame)).isEnabled().catch(() => false),
     };
   }
 
@@ -1106,6 +1295,356 @@ export class EnvioNube {
       lines.push(`  container text (sibling error text included)=${JSON.stringify(text.slice(0, 400))}`);
     }
     return lines;
+  }
+
+  // -------------------------------- sucursal screen P: recipient + package
+
+  /** Everything the panel holds on screen P, for a loud stop. */
+  private async agencyScreenDiagnostics(frame: Frame): Promise<string[]> {
+    const lines: string[] = ['sucursal screen P form as the panel holds it:'];
+    for (const name of Object.values(AGENCY_RECIPIENT_FIELDS)) {
+      lines.push(`  [name="${name}"]=${JSON.stringify(await this.inputValueQuiet(frame, name))}`);
+    }
+    for (const name of Object.values(AGENCY_PACKAGE_FIELDS)) {
+      lines.push(`  [name="${name}"]=${JSON.stringify(await this.inputValueQuiet(frame, name))}`);
+    }
+    return lines;
+  }
+
+  private async inputValueQuiet(frame: Frame, name: string): Promise<string> {
+    return frame
+      .locator(`input[name="${name}"]`)
+      .first()
+      .inputValue({ timeout: 3_000 })
+      .catch(() => '<unreadable>');
+  }
+
+  /**
+   * Fills the sucursal recipient fields on screen P (`#/agency-shipment`).
+   *
+   * The request's `lastName` goes into the panel's `customer.surname` anchor —
+   * a different anchor from domicilio's `customer.lastName`, which is exactly
+   * the kind of trap the observations settle. Optional fields (email, phone)
+   * are written only when the request carries them; nothing is invented.
+   */
+  async fillAgencyRecipient(input: { customer: SucursalShipmentRequest['customer'] }): Promise<void> {
+    const frame = await this.waitForRoute(AGENCY_ROUTES.recipient);
+    const nameInput = frame.locator(`input[name="${AGENCY_RECIPIENT_FIELDS.name}"]`).first();
+    await this.waitForVisible(nameInput, `input[name="${AGENCY_RECIPIENT_FIELDS.name}"]`, frame);
+
+    const fields = [
+      { name: AGENCY_RECIPIENT_FIELDS.name, value: input.customer.name },
+      ...(input.customer.lastName === null
+        ? []
+        : [{ name: AGENCY_RECIPIENT_FIELDS.surname, value: input.customer.lastName }]),
+      ...(input.customer.email === null
+        ? []
+        : [{ name: AGENCY_RECIPIENT_FIELDS.email, value: input.customer.email }]),
+      ...(input.customer.phone === null
+        ? []
+        : [{ name: AGENCY_RECIPIENT_FIELDS.phoneNumber, value: input.customer.phone }]),
+    ];
+    await this.typeFieldsWithDriftCheck(frame, fields, 'sucursal screen P (#/agency-shipment)', () =>
+      this.agencyScreenDiagnostics(frame),
+    );
+    // No `Continuar` wait here: the screen stays invalid until the package fields
+    // are filled too, and `fillAgencyPackage` is the one that waits for it.
+  }
+
+  /**
+   * Fills the sucursal package fields on screen P. The unit buttons (`cm` ×3 +
+   * `g`, `$` for the declared value) are verified **before** any write, exactly
+   * as on the domicilio cost screen: a mismatch aborts with nothing filled.
+   * The declared value is required on this screen, so an absent value is a
+   * refusal, never a silent skip.
+   */
+  async fillAgencyPackage(box: SucursalShipmentRequest['box']): Promise<void> {
+    const frame = await this.waitForRoute(AGENCY_ROUTES.recipient);
+
+    const units = await this.readUnits(frame);
+    const problems: string[] = [];
+    const expectUnit = (label: string, actual: string | null, expected: string): void => {
+      if (actual !== expected) {
+        problems.push(`${label} unit reads ${JSON.stringify(actual)}, expected "${expected}"`);
+      }
+    };
+    expectUnit(AGENCY_PACKAGE_FIELDS.height, units.height, 'cm');
+    expectUnit(AGENCY_PACKAGE_FIELDS.width, units.width, 'cm');
+    expectUnit(AGENCY_PACKAGE_FIELDS.depth, units.depth, 'cm');
+    expectUnit(AGENCY_PACKAGE_FIELDS.weight, units.weight, 'g');
+    expectUnit(AGENCY_PACKAGE_FIELDS.declaredValue, units.declaredValue, '$');
+    if (problems.length > 0) {
+      const details = [
+        ...problems,
+        `observed units: ${JSON.stringify(units)}`,
+        'nothing was filled: writing the declared magnitudes under different units would be wrong',
+        ...(await this.describe(frame)),
+      ];
+      throw new ExecutorError(
+        'refusing to fill sucursal screen P: the unit controls do not match the declared magnitudes',
+        details,
+      );
+    }
+
+    if (box.declaredValueArs === undefined) {
+      throw new ExecutorError('refusing to fill sucursal screen P: the declared value is required there', [
+        'the panel requires "Valor declarado" on the sucursal screen (on domicilio it is optional)',
+        'the declared policy lives in config.sucursal.declaredValueArs and is shown editable in the preview',
+        ...(await this.describe(frame)),
+      ]);
+    }
+
+    const fields = [
+      { name: AGENCY_PACKAGE_FIELDS.height, value: String(box.heightCm) },
+      { name: AGENCY_PACKAGE_FIELDS.width, value: String(box.widthCm) },
+      { name: AGENCY_PACKAGE_FIELDS.depth, value: String(box.depthCm) },
+      { name: AGENCY_PACKAGE_FIELDS.weight, value: String(box.weightG) },
+      { name: AGENCY_PACKAGE_FIELDS.declaredValue, value: String(box.declaredValueArs) },
+    ];
+    await this.typeFieldsWithDriftCheck(frame, fields, 'sucursal screen P (#/agency-shipment)', () =>
+      this.agencyScreenDiagnostics(frame),
+    );
+    await this.waitForContinueEnabled(frame, 'sucursal screen P (#/agency-shipment)');
+  }
+
+  /** Reads back every screen-P field, exactly as the panel holds it. */
+  async readAgencyScreen(): Promise<AgencyScreenReadback> {
+    const frame = await this.waitForRoute(AGENCY_ROUTES.recipient);
+    return {
+      url: frame.url(),
+      units: await this.readUnits(frame),
+      name: await this.inputValue(frame, AGENCY_RECIPIENT_FIELDS.name),
+      surname: await this.inputValue(frame, AGENCY_RECIPIENT_FIELDS.surname),
+      email: await this.inputValue(frame, AGENCY_RECIPIENT_FIELDS.email),
+      phone: await this.inputValue(frame, AGENCY_RECIPIENT_FIELDS.phoneNumber),
+      height: await this.inputValue(frame, AGENCY_PACKAGE_FIELDS.height),
+      width: await this.inputValue(frame, AGENCY_PACKAGE_FIELDS.width),
+      depth: await this.inputValue(frame, AGENCY_PACKAGE_FIELDS.depth),
+      weight: await this.inputValue(frame, AGENCY_PACKAGE_FIELDS.weight),
+      declaredValue: await this.inputValue(frame, AGENCY_PACKAGE_FIELDS.declaredValue),
+      continueEnabled: await (await this.continueButton(frame)).isEnabled().catch(() => false),
+    };
+  }
+
+  /** Advances to screen Q, asserting the route change (screen P has no verified heading). */
+  async continueFromAgencyRecipient(): Promise<void> {
+    const frame = await this.waitForRoute(AGENCY_ROUTES.recipient);
+    await this.clickContinue(frame, 'sucursal screen P (#/agency-shipment)');
+    await this.waitForRoute(AGENCY_ROUTES.quotation);
+  }
+
+  // -------------------------------- sucursal screen Q: destination, carrier, branch, create
+
+  /** Everything the panel holds on screen Q, for a loud stop. */
+  private async agencyQuotationDiagnostics(frame: Frame): Promise<string[]> {
+    const lines: string[] = ['sucursal screen Q as the panel holds it:'];
+    lines.push(`  [name="${AGENCY_ZIP_FIELD}"]=${JSON.stringify(await this.inputValueQuiet(frame, AGENCY_ZIP_FIELD))}`);
+    const diagnostics = await this.readCarrierDiagnostics(frame, FREIGHT_OPTION_FIELD).catch(() => []);
+    lines.push(...formatCarrierDiagnostics(diagnostics, FREIGHT_OPTION_FIELD));
+    const options = await this.branchOptions(frame).catch(() => []);
+    lines.push(`  sucursal dropdown (${options.length} options):`);
+    for (const option of options) lines.push(`    - value=${option.value} text=${JSON.stringify(option.text)}`);
+    return lines;
+  }
+
+  /**
+   * Writes the destination postal code on screen Q. The anchor is
+   * `address.zipCode` — a different name from domicilio's `zipCode`.
+   */
+  async fillAgencyDestination(zipCode: string): Promise<void> {
+    const frame = await this.waitForRoute(AGENCY_ROUTES.quotation);
+    await this.typeFieldsWithDriftCheck(
+      frame,
+      [{ name: AGENCY_ZIP_FIELD, value: zipCode }],
+      'sucursal screen Q (#/agency-shipment/quotation)',
+      () => this.agencyQuotationDiagnostics(frame),
+    );
+  }
+
+  /** The sucursal dropdown's real option list, read from the panel before any write. */
+  async readSucursalOptions(): Promise<BranchOption[]> {
+    const frame = await this.waitForRoute(AGENCY_ROUTES.quotation);
+    return this.branchOptions(frame);
+  }
+
+  private async branchOptions(frame: Frame): Promise<BranchOption[]> {
+    const options = frame.locator(`select[name="${SUCURSAL_SELECT_FIELD}"] option`);
+    const count = await options.count().catch(() => 0);
+    if (count === 0) {
+      throw new ExecutorError('the sucursal <select> has no readable options', await this.describe(frame));
+    }
+    const result: BranchOption[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const option = options.nth(index);
+      const value = (await option.getAttribute('value').catch(() => null)) ?? '';
+      const text = ((await option.textContent().catch(() => '')) ?? '').trim();
+      result.push({ index, value, text });
+    }
+    return result;
+  }
+
+  /**
+   * Selects a branch by option text. Option values are UUIDs on the real panel,
+   * so the write uses the value read from the matched option, never a guessed
+   * one, and the read-back must agree with the approved name.
+   */
+  async selectBranch(name: string): Promise<BranchReadback> {
+    const frame = await this.waitForRoute(AGENCY_ROUTES.quotation);
+    const select = frame.locator(`select[name="${SUCURSAL_SELECT_FIELD}"]`).first();
+    await this.waitForVisible(select, `select[name="${SUCURSAL_SELECT_FIELD}"]`, frame);
+
+    const options = await this.branchOptions(frame);
+    const offered = options.map((option) => option.text);
+    const match = matchSucursalBranch(name, options);
+
+    if (match.kind === 'none') {
+      const details = [
+        `approved branch: ${JSON.stringify(name)}`,
+        `the dropdown offers ${options.length} options:`,
+        ...offered.map((text) => `  - ${JSON.stringify(text)}`),
+        ...(match.nearMatches.length > 0
+          ? [
+              'near matches (none equal after normalization, so none was selected):',
+              ...match.nearMatches.map((option) => `  - ${JSON.stringify(option.text)}`),
+            ]
+          : []),
+        'branch matching is exact after normalization (case, accents and whitespace); choosing a nearby branch is a wrong shipment (R12)',
+        ...(await this.describe(frame)),
+      ];
+      throw new ExecutorError('no sucursal option matches the approved branch name', details);
+    }
+    if (match.kind === 'ambiguous') {
+      throw new ExecutorError(
+        `the sucursal dropdown matches the approved branch name more than once (${match.matches.length} options)`,
+        [
+          `approved branch: ${JSON.stringify(name)}`,
+          ...match.matches.map((option) => `  - value=${option.value} text=${JSON.stringify(option.text)}`),
+          'selecting between identical names would be a guess (R12)',
+          ...(await this.describe(frame)),
+        ],
+      );
+    }
+
+    const option = match.option;
+    this.note(`selecting sucursal option value="${option.value}" (matched by normalized option text)`);
+    try {
+      await select.selectOption({ value: option.value }, { timeout: this.timeoutMs });
+    } catch (error) {
+      throw new ExecutorError(`could not select the branch option: ${messageOf(error)}`, await this.describe(frame));
+    }
+
+    const selectedValue = await select.inputValue().catch(() => '');
+    const selected = options.find((candidate) => candidate.value === selectedValue);
+    const selectedText = selected?.text ?? '';
+    if (selectedValue !== option.value || !sameText(selectedText, name)) {
+      throw new ExecutorError('the sucursal dropdown does not hold the approved branch after writing it', [
+        `read back: value=${JSON.stringify(selectedValue)} text=${JSON.stringify(selectedText)}`,
+        `approved (normalized): ${JSON.stringify(name)}`,
+        ...(await this.describe(frame)),
+      ]);
+    }
+
+    return {
+      url: frame.url(),
+      requestedName: name,
+      selectedValue,
+      selectedText,
+      offeredOptions: offered,
+    };
+  }
+
+  /** Reads back every screen-Q field, exactly as the panel holds it. */
+  async readAgencyQuotation(): Promise<AgencyQuotationReadback> {
+    const frame = await this.waitForRoute(AGENCY_ROUTES.quotation);
+    const diagnostics = await this.readCarrierDiagnostics(frame, FREIGHT_OPTION_FIELD);
+    const checked = diagnostics.find((option) => option.checked);
+    const options = await this.branchOptions(frame);
+    const selectedValue = await frame
+      .locator(`select[name="${SUCURSAL_SELECT_FIELD}"]`)
+      .first()
+      .inputValue()
+      .catch(() => '');
+    const selected = options.find((option) => option.value === selectedValue);
+    return {
+      url: frame.url(),
+      zipCode: await this.inputValue(frame, AGENCY_ZIP_FIELD),
+      checkedCarrierName: checked?.accessibleName ?? null,
+      branchSelectedValue: selectedValue,
+      branchSelectedText: selected?.text ?? '',
+      branchOptions: options.map((option) => option.text),
+      createButtonVisible: await frame
+        .getByRole('button', { name: copyPattern(CREATE_BUTTON, { exact: true }) })
+        .first()
+        .isVisible()
+        .catch(() => false),
+    };
+  }
+
+  /**
+   * The **only** call site of a sucursal `Crear envío` click.
+   *
+   * Screen Q has no summary screen: destination, carrier, branch and the create
+   * button live together, so the gates run here, in order, and every one of
+   * them aborts before clicking:
+   * 1. `createAgencyShipment` has not been called before in this instance
+   *    (the flag is shared with the domicilio `createShipment`);
+   * 2. the payload read back from the sucursal screens hashes to the approved hash.
+   *
+   * After the click: the shipment detail page is awaited; if it never appears the
+   * outcome is genuinely unknown and an `UnknownOutcomeError` is raised. It is
+   * never retried and the button is never clicked again.
+   */
+  async createAgencyShipment(approval: SucursalCreateApproval): Promise<ShipmentDetailReadback> {
+    if (this.createAttempted) {
+      throw new ExecutorError(
+        'refusing to click "Crear envío" a second time in one run: reconcile the first attempt against the shipments list instead',
+      );
+    }
+
+    const frame = await this.waitForRoute(AGENCY_ROUTES.quotation);
+
+    const formHash = hashSucursalApprovalPayload(approval.payload);
+    const approvedHash = approval.approvedHash.trim().toLowerCase();
+    if (approvedHash === '' || formHash !== approvedHash) {
+      const details = [
+        `approved hash: ${approvedHash === '' ? '(empty)' : approvedHash}`,
+        `form hash:     ${formHash}`,
+        'the panel no longer holds the approved payload, so nothing was clicked',
+      ];
+      throw new ExecutorError('refusing to create the shipment: the form does not match the approved payload hash', details);
+    }
+
+    const button = frame.getByRole('button', { name: copyPattern(CREATE_BUTTON, { exact: true }) }).first();
+    if (!(await button.isVisible().catch(() => false))) {
+      throw new ExecutorError(`the "${CREATE_BUTTON}" button is not visible; nothing was clicked`, await this.describe(frame));
+    }
+
+    this.createAttempted = true;
+    this.note(`clicking "${CREATE_BUTTON}" once on the sucursal quotation screen (approved hash ${approvedHash.slice(0, 12)}…)`);
+    let clickError: string | null = null;
+    try {
+      await button.click({ timeout: this.timeoutMs });
+    } catch (error) {
+      clickError = messageOf(error);
+    }
+
+    const detailFrame = await this.waitForDetailFrame(clickError);
+    const path = pathnameOf(detailFrame.url());
+    if (!path.startsWith(SHIPMENT_DETAIL_ROUTE)) {
+      throw new UnknownOutcomeError(
+        `after clicking "${CREATE_BUTTON}" a "#EM<number>" heading appeared outside the shipping-details route (frame path "${path}")`,
+        await this.describe(detailFrame),
+      );
+    }
+    const detail = await this.detailFrom(detailFrame);
+    const unpaidProblem = labelUnpaidProblem(detail);
+    if (unpaidProblem !== null) {
+      throw new ExecutorError(unpaidProblem.message, [
+        ...unpaidProblem.details,
+        ...(await this.describe(detailFrame)),
+      ]);
+    }
+    return detail;
   }
 
   // ------------------------------------------------- screen 4: the summary
@@ -1499,8 +2038,8 @@ function compactText(value: string | null | undefined): string {
 }
 
 /** Every delivery radio with its group and state, one line each, for loud stops. */
-function formatCarrierDiagnostics(options: readonly CarrierOptionDiagnostic[]): string[] {
-  if (options.length === 0) return ['no deliveryOptionId radios were found on screen 2'];
+function formatCarrierDiagnostics(options: readonly CarrierOptionDiagnostic[], fieldName: string): string[] {
+  if (options.length === 0) return [`no ${fieldName} radios were found on the screen`];
   const lines = [`delivery radios read from the panel (${options.length}):`];
   for (const option of options) {
     lines.push(
@@ -1515,6 +2054,37 @@ function extractShipmentId(text: string): string | null {
   const match = SHIPMENT_ID_PATTERN.exec(text);
   if (match === null) return null;
   return match[0];
+}
+
+/**
+ * The branch-name matching rule, as pure data so it can be tested offline.
+ *
+ * **Exact text match after normalization** — the same comparison form as every
+ * other panel text (`normalizeText`: lower-case, accent-free, one space between
+ * tokens). Option `value`s are UUIDs and are never compared; there is no index,
+ * no substring and no fuzzy matching.
+ *
+ * - Exactly one option equal after normalization → `unique`.
+ * - None equal → `none`, carrying the full option list (for the rejection that
+ *   names the real options, R12) and every near match (an option containing the
+ *   request or vice versa) — near matches are **reported, never selected**: two
+ *   or more near matches is exactly the ambiguity this rule refuses.
+ * - More than one option equal after normalization → `ambiguous`. Selecting
+ *   between identical names would be a guess.
+ */
+export function matchSucursalBranch(requested: string, options: readonly BranchOption[]): BranchMatch {
+  const wanted = normalizeText(requested);
+  if (wanted === '') {
+    return { kind: 'none', options, nearMatches: [] };
+  }
+  const exact = options.filter((option) => normalizeText(option.text) === wanted);
+  if (exact.length === 1) return { kind: 'unique', option: exact[0]! };
+  if (exact.length > 1) return { kind: 'ambiguous', matches: exact };
+  const nearMatches = options.filter((option) => {
+    const text = normalizeText(option.text);
+    return text !== '' && (text.includes(wanted) || wanted.includes(text));
+  });
+  return { kind: 'none', options, nearMatches };
 }
 
 /** The three structural facts that prove the label has never been paid (S12). */

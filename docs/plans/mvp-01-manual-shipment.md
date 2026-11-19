@@ -240,6 +240,49 @@ Three facts that settle earlier open questions:
 `#/create-single-shipment` (cost) → `.../quotation` (carrier) → `.../customer` (recipient) →
 pending capture (confirmation, where the create button lives).
 
+### Sucursal — Screen P — `#/agency-shipment` → recipient + package
+
+First sucursal screen. No address section at all — the destination is only a postal code, entered
+on the next screen.
+
+| Label in panel | Anchor | Notes |
+| --- | --- | --- |
+| Nombre | `input[name="customer.name"]` | same anchor as domicilio |
+| Apellido | `input[name="customer.surname"]` | **different** from domicilio's `customer.lastName` |
+| Email (opcional) | `input[name="customer.email"]` | same |
+| Teléfono (opcional) | `input[name="customer.phoneNumber"]` | same |
+| Alto/Ancho/Profundidad | `box.height` / `box.width` / `box.depth` | same as domicilio |
+| Peso | `box.weight` | unit buttons `cm` ×3 + `g`, same as domicilio |
+| **Valor declarado** | `input[name="declaredValue"]` | unit `$`; **required here** (domicilio: optional) |
+
+Buttons: `Cancelar` (reset) and `Continuar` (`role="submit-form"`, type `submit`).
+
+Note the trap: `customer.surname` vs `customer.lastName`, and `declaredValue` required vs optional —
+a domicilio-shaped executor would silently skip the declared value and never be able to advance.
+
+### Sucursal — Screen Q — `#/agency-shipment/quotation` → destination + carrier + branch + create
+
+Unlike domicilio, the sucursal flow's quotation screen combines everything: CP, carrier, branch,
+and the create button — no separate summary screen.
+
+| Element | Anchor |
+| --- | --- |
+| Sub-heading | `Destino` + `Modalidad de envío` + `Sucursales` |
+| Postal code | `input[name="address.zipCode"]` — **different name** from domicilio's `zipCode` |
+| Carrier radios | `input[name="freight-option"]` — **different name** from `deliveryOptionId`; ids embed UUIDs (unstable) |
+| The one to pick | label `Andreani a sucursal` (exact), by accessible name |
+| Branch dropdown | `select[name="sucursal"]` with `id="sucursal"`; placeholder `Seleccioná una sucursal` |
+| Option values | UUIDs — match must be by **option text**, never by value or index |
+| Create button | `Crear envío` — lives **on this screen**, no summary screen |
+| Also present | `Editar` + `Cancelar` buttons; `Resumen del envío` side panel |
+
+Observed branch options for CP 1419 (13): `Villa Devoto (Av Beiro) - Av. Francisco Beiró, 4740, C.A.B.A., Buenos Aires`,
+plus 12 `Punto Andreani Hop …` entries — matching the panel screenshot exactly. This list is the
+**authoritative** one the manual client entry is validated against.
+
+Branch-name matching rule for the executor: exact text match after normalization (case/accent/
+whitespace); a message name that matches no option is a rejection listing the real options.
+
 ### Corrections to earlier assumptions
 
 - **Weight is displayed in grams.** S7 must therefore define the unit explicitly and convert, or a

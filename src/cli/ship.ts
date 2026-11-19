@@ -22,8 +22,14 @@ import { createInterface } from 'node:readline/promises';
 
 import { CARRIER_NAME } from '../core/carrier';
 import { parseMessage } from '../core/parse-message';
-import type { ShipmentRequest } from '../core/types';
-import { approvalPayloadFromRequest, type ApprovalPayload } from '../executor/approval';
+import type { AnyShipmentRequest } from '../core/types';
+import {
+  approvalPayloadFromRequest,
+  sucursalApprovalPayloadFromRequest,
+  type ApprovalPayload,
+  type SucursalApprovalPayload,
+} from '../executor/approval';
+import { SUCURSAL_CARRIER_NAME } from '../executor/envioNube';
 import type { CardReadback } from '../executor/envioNube';
 import { ExecutorError, UnknownOutcomeError, detailsOf, messageOf } from '../executor/errors';
 import type { CreateRunResult, DryRunResult } from '../executor/run';
@@ -34,8 +40,10 @@ import {
   assertConfirmationToken,
   assertNoBlockingPriorAttempt,
   computeApprovalHash,
+  computeSucursalApprovalHash,
   confirmationTokenFor,
   describeApprovalPayload,
+  describeSucursalApprovalPayload,
   messageFingerprint,
   parseCliArgs,
   type CliArgs,
@@ -79,12 +87,13 @@ function refuse(error: unknown): number {
   return 2;
 }
 
-function printPayload(payload: ApprovalPayload): void {
+function printPayload(payload: ApprovalPayload | SucursalApprovalPayload): void {
   section('Resolved payload — exactly these values will be typed into Envío Nube');
-  for (const field of describeApprovalPayload(payload)) row(field.field, field.value);
+  const fields = 'province' in payload ? describeApprovalPayload(payload) : describeSucursalApprovalPayload(payload);
+  for (const field of fields) row(field.field, field.value);
 }
 
-function printParseNotes(request: ShipmentRequest, messagePath: string, warnings: readonly string[]): void {
+function printParseNotes(request: AnyShipmentRequest, messagePath: string, warnings: readonly string[]): void {
   const derived = request.derived ?? [];
   if (derived.length === 0 && warnings.length === 0) return;
 
@@ -101,8 +110,10 @@ function cardText(cards: readonly CardReadback[], title: string): string | null 
 }
 
 function costShown(result: CreateRunResult & { outcome: 'created' }): RunOutcomeRecord['costShown'] {
+  // Only the domicilio journey has a summary screen; sucursal goes from screen
+  // Q straight to the detail page, so its summary cost card does not exist.
   return {
-    summaryModality: cardText(result.journey.summary.cards, 'Modalidad de envío'),
+    summaryModality: 'summary' in result.journey ? cardText(result.journey.summary.cards, 'Modalidad de envío') : null,
     detailShipmentData: cardText(result.shipment.cards, 'Datos del envío'),
   };
 }
@@ -161,18 +172,14 @@ async function main(): Promise<number> {
 
   const request = parsed.value;
 
-  // The CLI drives the domicilio journey only. A sucursal message stops here,
-  // before anything is hashed: the sucursal executor comes after a DOM
-  // discovery pass, and building a domicilio payload from sucursal data would
-  // be exactly the invented data R12 forbids.
-  if (request.modality === 'sucursal') {
-    console.error('\nREFUSED: este mensaje es de envío a sucursal y la carga a sucursal todavía no está implementada en esta versión');
-    console.error('  nothing was hashed, the panel was not opened and nothing was created');
-    return 2;
-  }
-
-  const payload = approvalPayloadFromRequest(request, CARRIER_NAME);
-  const approvalHash = computeApprovalHash(request);
+  // The payload, its hash and the carrier are per modality: sucursal runs the
+  // same gates with its own payload shape (plan §4c, "Sucursal — Screen P/Q").
+  const payload =
+    request.modality === 'sucursal'
+      ? sucursalApprovalPayloadFromRequest(request, SUCURSAL_CARRIER_NAME)
+      : approvalPayloadFromRequest(request, CARRIER_NAME);
+  const approvalHash =
+    request.modality === 'sucursal' ? computeSucursalApprovalHash(request) : computeApprovalHash(request);
   const messageHash = messageFingerprint(messageText);
 
   printParseNotes(
@@ -225,12 +232,18 @@ async function main(): Promise<number> {
 
   if (args.mode === 'dry-run') {
     if (priorWarning !== null) console.log(`\nnote: ${priorWarning}`);
-    section('DRY RUN — walking screens 1-4 and stopping on the summary; nothing is created');
+    section(
+      request.modality === 'sucursal'
+        ? 'DRY RUN — walking the sucursal screens and stopping after the branch is selected; nothing is created'
+        : 'DRY RUN — walking screens 1-4 and stopping on the summary; nothing is created',
+    );
     try {
       const result: DryRunResult = await runDryRun({
         request,
         approvedPayloadHash: verifiedHash ?? approvalHash,
       });
+      row('modality', result.modality);
+      row('stopped at', result.stoppedAt);
       row('form payload hash', result.formPayloadHash);
       row('form matches approval', String(result.formMatchesApproval));
       row('mismatches', String(result.mismatches.length));
@@ -363,6 +376,7 @@ async function recordOutcome(runId: string, result: CreateRunResult): Promise<nu
   });
 
   section('CREATED — the label is pending payment and nothing was purchased');
+  row('modality', result.modality);
   row('shipment id', result.shipment.shipmentId);
   row('status badges', result.shipment.statusBadges.join(', ') || '(none read)');
   row('cost shown (summary)', shown.summaryModality ?? '(not read)');

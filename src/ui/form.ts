@@ -82,11 +82,13 @@ export const FORM_GROUP_LABELS: Readonly<Record<FormGroup, string>> = {
 };
 
 /**
- * Placeholder for the sucursal field's panel anchor: the real anchors for the
- * sucursal dropdown are decided by the executor slice, after a DOM discovery
- * pass. The form never claims an anchor it has not observed.
+ * The sucursal field's panel anchor is real now: the dropdown is observed at
+ * `select[name="sucursal"]` (`id="sucursal"`, UUID option values). The shared
+ * fields keep the domicilio anchor in `panelField` and name the sucursal
+ * variant in their help text, because the panel uses different anchors per
+ * modality (`zipCode` vs `address.zipCode`, `customer.lastName` vs
+ * `customer.surname`).
  */
-export const SUCURSAL_ANCHOR_PENDING = '(pendiente de descubrir en el panel)';
 
 interface FormSpec {
   key: FormKey;
@@ -142,7 +144,7 @@ const FORM_SPECS: readonly FormSpec[] = [
     modalities: BOTH_MODALITIES,
     group: 'destino',
     wide: false,
-    help: '4 dígitos (1901) u 8 caracteres CPA (B1900ABC)',
+    help: '4 dígitos (1901) u 8 caracteres CPA (B1900ABC); en sucursal el ancla del panel es address.zipCode',
   },
   {
     key: 'province',
@@ -225,7 +227,7 @@ const FORM_SPECS: readonly FormSpec[] = [
   {
     key: 'sucursal',
     label: 'Sucursal',
-    panelField: SUCURSAL_ANCHOR_PENDING,
+    panelField: 'sucursal',
     anchor: null,
     unit: '',
     kind: 'text',
@@ -233,7 +235,7 @@ const FORM_SPECS: readonly FormSpec[] = [
     modalities: SUCURSAL_ONLY,
     group: 'destino',
     wide: true,
-    help: 'texto libre; se valida contra el dropdown del panel en una etapa posterior',
+    help: 'dropdown real del panel (select[name="sucursal"]); se elige por texto exacto tras normalizar entre las opciones reales',
   },
   {
     key: 'name',
@@ -259,7 +261,7 @@ const FORM_SPECS: readonly FormSpec[] = [
     modalities: BOTH_MODALITIES,
     group: 'destinatario',
     wide: false,
-    help: 'opcional en el panel',
+    help: 'opcional en el panel; en sucursal el ancla es customer.surname',
   },
   {
     key: 'email',
