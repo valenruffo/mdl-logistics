@@ -22,6 +22,7 @@ import {
   SUCURSAL_CARRIER_NAME,
   type BranchOption,
 } from '../../src/executor/envioNube';
+import { parseArsAmount } from '../../src/executor/currency';
 import { ExecutorError } from '../../src/executor/errors';
 import { STORE_ORIGIN_VARIABLE } from '../../src/executor/panel';
 import { sucursalCreateAgainst, sucursalDryRunAgainst } from '../../src/executor/run';
@@ -192,7 +193,17 @@ test('dry run: walks both screens, selects carrier and branch, and never clicks 
   assert.equal(values['customer.phoneNumber'], '1155667788');
   assert.equal(values['box.height'], String(REQUEST.box.heightCm));
   assert.equal(values['box.weight'], String(REQUEST.box.weightG));
-  assert.equal(values['declaredValue'], '100000', 'the declared value from the request was written');
+  assert.equal(
+    values['declaredValue'],
+    '$ 100.000,00',
+    'the masked declared-value input holds the approved amount in the panel format',
+  );
+  assert.equal(parseArsAmount(values['declaredValue'] ?? ''), 100000, 'the numeric readback equals the approved declaredValueArs');
+  assert.equal(
+    result.journey.screen.declaredValue,
+    '$ 100.000,00',
+    'the screen readback carries the masked format, compared numerically downstream',
+  );
   assert.equal(values['address.zipCode'], '1419', 'the screen-Q zip anchor, not domicilio zipCode');
   assert.equal(harness.selectedBranchValue(), 'uuid-villa-devoto', 'the branch was selected by its UUID value');
   assert.equal(harness.framePath(), '/agency-shipment/quotation');
@@ -368,6 +379,61 @@ test('create mode: one gated click, then the unpaid label is proven structurally
     },
   );
   assert.equal(harness.createClickCount(), 1);
+});
+
+test('the fake panel mask reproduces the live failure for a raw programmatic write', async () => {
+  // The live dry run wrote the raw digits and the currency mask reinterpreted
+  // them: the panel showed `$ 1.000,00` for an approved 100000 and `Continuar`
+  // never enabled (25 s timeout). The harness mask must reproduce that exact
+  // failure mode for a programmatic value assignment.
+  const harness = buildSucursalHarness();
+  const frame = harness.page.frames()[0];
+  const field = frame.locator('input[name="declaredValue"]').first();
+  await field.fill(String(REQUEST.box.declaredValueArs));
+  const raw = await field.inputValue();
+  assert.equal(raw, '$ 1.000,00', 'the raw write shows the observed live failure');
+  assert.equal(parseArsAmount(raw), 1000, 'the mask read 100000 as a cent amount: 1000 ARS, not the approved 100000');
+});
+
+test('typing the declared value digit by digit lands the approved amount in the mask', async () => {
+  // The mask counts every typed digit as a cent, so the approved 100000 ARS
+  // must be typed as "100000,00" (eight digits); the display then reads
+  // `$ 100.000,00` and the numeric readback equals 100000.
+  const harness = buildSucursalHarness();
+  const frame = harness.page.frames()[0];
+  const field = frame.locator('input[name="declaredValue"]').first();
+  await field.pressSequentially('100000,00');
+  const raw = await field.inputValue();
+  assert.equal(raw, '$ 100.000,00');
+  assert.equal(parseArsAmount(raw), 100000);
+});
+
+test('a masked declared value that reads wrong aborts screen P, naming both amounts', async () => {
+  // A mask whose controlled state refuses typed input: the readback disagrees
+  // with the approved amount, so the walk must stop — no Continuar, no retry.
+  const harness = buildSucursalHarness({ declaredValueFrozen: true });
+  const panel = newPanel(harness);
+
+  await assert.rejects(
+    () => sucursalDryRunAgainst(panel, REQUEST, APPROVED_HASH),
+    (error: unknown) => {
+      assert.ok(error instanceof ExecutorError);
+      assert.match(error.message, /declared value does not match the approved amount/);
+      assert.match(error.message, /100000/);
+      assert.ok(
+        error.details.some((detail) => detail.includes('approved declaredValueArs: 100000')),
+        'the stop names the approved amount',
+      );
+      assert.ok(
+        error.details.some((detail) => detail.includes('panel readback of [name="declaredValue"]')),
+        'the stop names the panel readback',
+      );
+      return true;
+    },
+  );
+  assert.ok(!harness.clicks.includes('Continuar'), 'nothing was advanced past the mismatch');
+  assert.equal(harness.createClickCount(), 0);
+  assert.equal(harness.framePath(), '/agency-shipment', 'the walk stopped on screen P');
 });
 
 test('the sucursal carrier is picked from Modalidades activas, ignoring inactive cards', async () => {

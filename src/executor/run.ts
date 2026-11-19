@@ -29,6 +29,7 @@ import {
   type ShipmentDetailReadback,
   type SummaryReadback,
 } from './envioNube';
+import { arsAmountsEqual, parseArsAmount } from './currency';
 import { ExecutorError, UnknownOutcomeError, detailsOf, messageOf } from './errors';
 import { openSession } from './session';
 
@@ -127,6 +128,12 @@ interface FieldPair {
   label: string;
   expected: string;
   actual: string;
+  /**
+   * Compare as ARS amounts, not strings: a currency-masked panel holds the
+   * Argentine format (`$ 100.000,00`), which equals the payload's `100000`
+   * numerically. Parsed with `parseArsAmount`; unparsable text never matches.
+   */
+  numeric?: boolean;
 }
 
 function stamp(): string {
@@ -444,6 +451,8 @@ export function sucursalScreenPairs(
       label: 'declaredValue ($)',
       expected: String(request.box.declaredValueArs ?? ''),
       actual: screen.declaredValue,
+      // The panel's currency mask renders `$ 100.000,00`; compare numerically.
+      numeric: true,
     },
   ];
 }
@@ -456,6 +465,19 @@ export function sucursalScreenPairs(
 export function sucursalMismatches(request: SucursalShipmentRequest, journey: SucursalJourneyReadback): string[] {
   const mismatches: string[] = [];
   const record = (pair: FieldPair): void => {
+    if (pair.numeric) {
+      const expectedArs = parseArsAmount(pair.expected);
+      const actualArs = parseArsAmount(pair.actual);
+      const equal = expectedArs !== null && actualArs !== null && arsAmountsEqual(expectedArs, actualArs);
+      if (!equal) {
+        mismatches.push(
+          `${pair.label}: expected ${JSON.stringify(pair.expected)}` +
+            ` (${expectedArs === null ? 'unreadable' : `${expectedArs} ARS`}), the panel holds ${JSON.stringify(pair.actual)}` +
+            ` (${actualArs === null ? 'unreadable' : `${actualArs} ARS`})`,
+        );
+      }
+      return;
+    }
     if (pair.expected !== pair.actual) {
       mismatches.push(
         `${pair.label}: expected ${JSON.stringify(pair.expected)}, the panel holds ${JSON.stringify(pair.actual)}`,

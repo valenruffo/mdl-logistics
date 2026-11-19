@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { normalizeText } from '../core/normalize';
+import { canonicalArsAmount } from './currency';
 import type { ShipmentRequest, SucursalShipmentRequest } from '../core/types';
 import type { AgencyScreenReadback } from './envioNube';
 import type { CarrierReadback, CostReadback, RecipientReadback } from './envioNube';
@@ -187,7 +188,11 @@ export function sucursalApprovalPayloadFromReadback(readback: {
     width: readback.screen.width,
     depth: readback.screen.depth,
     weight: readback.screen.weight,
-    declaredValue: readback.screen.declaredValue,
+    // The declared-value input is currency-masked and holds the Argentine
+    // format (`$ 100.000,00`); canonicalize it to the approved payload's plain
+    // number so the hash compares amounts, not spellings. An unparsable
+    // readback stays verbatim and the hash then mismatches — a loud stop.
+    declaredValue: canonicalArsAmount(readback.screen.declaredValue),
     customer: {
       name: readback.screen.name,
       surname: readback.screen.surname,

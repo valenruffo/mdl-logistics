@@ -9,6 +9,7 @@ import {
 } from './approval';
 import { hashApprovalPayload, type ApprovalPayload } from './approval';
 import { copyPattern } from './copy';
+import { arsAmountsEqual, formatArsTyping, parseArsAmount } from './currency';
 import { ExecutorError, UnknownOutcomeError, detailsOf, messageOf } from './errors';
 import { readEnvInt } from './env';
 import { adminAppDashboardUrl, BOT_CHALLENGE_FRAME_HOST, ENVIO_NUBE_FRAME_HOST, VERIFIED_AGENCY_PANEL_URL } from './panel';
@@ -1487,12 +1488,67 @@ export class EnvioNube {
       { name: AGENCY_PACKAGE_FIELDS.width, value: String(box.widthCm) },
       { name: AGENCY_PACKAGE_FIELDS.depth, value: String(box.depthCm) },
       { name: AGENCY_PACKAGE_FIELDS.weight, value: String(box.weightG) },
-      { name: AGENCY_PACKAGE_FIELDS.declaredValue, value: String(box.declaredValueArs) },
     ];
     await this.typeFieldsWithDriftCheck(frame, fields, 'sucursal screen P (#/agency-shipment)', () =>
       this.agencyScreenDiagnostics(frame),
     );
+    // The declared value is currency-masked on the panel: it is written digit
+    // by digit with real key events and verified numerically — never a raw
+    // programmatic write and never a string comparison.
+    await this.typeAgencyDeclaredValue(frame, box.declaredValueArs);
     await this.waitForContinueEnabled(frame, 'sucursal screen P (#/agency-shipment)');
+  }
+
+  /**
+   * Types the declared value into the currency-masked input the way the mask
+   * accepts it, and verifies the readback **numerically** against the approved
+   * amount.
+   *
+   * The mask counts every digit it sees as a cent and reformats in the
+   * Argentine format (`$ 100.000,00` for 100000 ARS). A raw programmatic write
+   * of the bare digits (`fill("100000")`) is reinterpreted as a cent amount and
+   * renders `$ 1.000,00` — the observed live failure that left `Continuar`
+   * disabled. So this field is written with the same real-key-events technique
+   * as the city field: click, clear by keyboard, `pressSequentially` digit by
+   * digit, blur — **no `fill()`**, not even to clear.
+   *
+   * The typed string carries the two decimals (`"100000,00"`), because the
+   * bare digits are exactly what the mask swallows. The readback is parsed
+   * (`$`/thousand `.` stripped, `,` as the decimal mark) and compared as a
+   * number; a disagreement aborts naming both values, with no retry.
+   */
+  private async typeAgencyDeclaredValue(frame: Frame, amountArs: number): Promise<void> {
+    const name = AGENCY_PACKAGE_FIELDS.declaredValue;
+    const locator = frame.locator(`input[name="${name}"]`).first();
+    try {
+      await locator.waitFor({ state: 'visible', timeout: this.timeoutMs });
+      await locator.click({ timeout: this.timeoutMs });
+      await locator.press('ControlOrMeta+a');
+      await locator.press('Backspace');
+      const typed = formatArsTyping(amountArs);
+      await locator.pressSequentially(typed, { delay: 20, timeout: this.timeoutMs });
+      this.note(`typed [name="${name}"]=${JSON.stringify(typed)} digit by digit with real key events`);
+      await locator.press('Tab').catch(() => undefined);
+      const readback = await locator.inputValue({ timeout: 3_000 }).catch(() => '');
+      const parsed = parseArsAmount(readback);
+      if (parsed === null || !arsAmountsEqual(parsed, amountArs)) {
+        throw new ExecutorError(
+          `the declared value does not match the approved amount: approved ${amountArs} ARS, the panel holds ${JSON.stringify(readback)}` +
+            (parsed === null ? ' (unreadable as an amount)' : ` (parsed ${parsed} ARS)`),
+          [
+            `approved declaredValueArs: ${amountArs}`,
+            `panel readback of [name="${name}"]: ${JSON.stringify(readback)}`,
+            'the run stops here: nothing was advanced and nothing was retried',
+            ...(await this.agencyScreenDiagnostics(frame)),
+            ...(await this.describe(frame)),
+          ],
+        );
+      }
+    } catch (error) {
+      if (error instanceof ExecutorError) throw error;
+      const details = [...(await this.fieldDiagnostics(frame, name)), ...(await this.describe(frame))];
+      throw new ExecutorError(`could not type into [name="${name}"]: ${messageOf(error)}`, details);
+    }
   }
 
   /** Reads back every screen-P field, exactly as the panel holds it. */

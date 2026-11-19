@@ -19,6 +19,7 @@
  * clicked. Nothing here opens a browser, touches a network or reads a secret.
  */
 import type { Frame, Locator, Page } from 'playwright';
+import { formatArsMask } from '../../src/executor/currency';
 import { ENVIO_NUBE_FRAME_HOST } from '../../src/executor/panel';
 
 const FRAME_ORIGIN = `https://${ENVIO_NUBE_FRAME_HOST}`;
@@ -39,6 +40,12 @@ export interface HarnessOptions {
   shipmentId?: string;
   /** Unit labels per screen-P measure field; override to simulate the unit trap. */
   units?: { height?: string; width?: string; depth?: string; weight?: string; declaredValue?: string };
+  /**
+   * Models a declared-value mask whose controlled state refuses typed input
+   * (the value never changes): used to prove the executor stops loudly on a
+   * masked readback that disagrees with the approved amount.
+   */
+  declaredValueFrozen?: boolean;
   /**
    * The frame route the fake session starts on — what a previous run left open.
    * Defaults to the agency screen; `/create-single-shipment` models the observed
@@ -86,6 +93,17 @@ class El {
   /** Panel-side validity gate; `null` means "enabled like any other control". */
   enabledWhen: (() => boolean) | null = null;
   onClick: (() => void) | null = null;
+  /**
+   * The declared-value input is currency-masked (Argentine format): every digit
+   * the mask sees — typed or written programmatically — is a **cent**, and the
+   * display is reformatted after each write (`"100000"` → `$ 1.000,00`). This is
+   * the observed live failure mode of a raw programmatic write.
+   */
+  currencyMask = false;
+  /** A frozen mask refuses typed input: the value never changes. */
+  maskFrozen = false;
+  /** The mask's internal digit accumulator (only meaningful when currencyMask). */
+  maskDigits = '';
 
   constructor(tag: string, attrs: Attrs = {}, text = '') {
     this.tag = tag;
@@ -293,16 +311,47 @@ class FakeLocator {
   }
 
   async fill(value: string): Promise<void> {
-    this.one().value = value;
+    const el = this.one();
+    if (el.currencyMask) {
+      // A programmatic write is what the real mask reinterprets (the observed
+      // live failure): the raw digits land as a cent amount — `fill("100000")`
+      // renders `$ 1.000,00`, not the approved 100000.
+      el.maskDigits = value.replace(/\D/g, '');
+      el.value = el.maskDigits === '' ? '' : formatArsMask(Number(el.maskDigits) / 100);
+      return;
+    }
+    el.value = value;
   }
 
   async pressSequentially(value: string): Promise<void> {
     const el = this.one();
-    el.value = el.value + value;
+    if (!el.currencyMask) {
+      el.value = el.value + value;
+      return;
+    }
+    if (el.maskFrozen) return;
+    // Real key events: every typed digit accumulates into the mask's cent
+    // amount and the display is reformatted — typing `"100000,00"` lands on
+    // `$ 100.000,00` (100000 ARS), while the bare `"100000"` lands on
+    // `$ 1.000,00` (1000 ARS), the observed live failure.
+    for (const char of value) {
+      if (/\d/.test(char)) el.maskDigits += char;
+    }
+    el.value = el.maskDigits === '' ? '' : formatArsMask(Number(el.maskDigits) / 100);
   }
 
-  async press(): Promise<void> {
-    // A blur/Tab is a no-op: the fake panel keeps every value it holds.
+  async press(key?: string): Promise<void> {
+    const el = this.one();
+    if (el.currencyMask && key === 'Backspace') {
+      // The executor only ever clears the masked field with select-all +
+      // Backspace (never a programmatic fill), so model exactly that: the
+      // digit accumulator empties and the display follows.
+      el.maskDigits = '';
+      el.value = '';
+      return;
+    }
+    // Any other key (the blur/Tab, the select-all) is a no-op: the fake panel
+    // keeps every value it holds.
   }
 
   async click(options: { trial?: boolean } = {}): Promise<void> {
@@ -572,10 +621,21 @@ function fieldDiv(label: string, name: string, value: string): El {
   return div;
 }
 
-function measureDiv(label: string, name: string, value: string, unit: string): El {
+function measureDiv(
+  label: string,
+  name: string,
+  value: string,
+  unit: string,
+  mask: { currency: boolean; frozen?: boolean } | null = null,
+): El {
   const div = new El('div', { class: 'field' });
   div.append(new El('label', {}, label));
-  div.append(new El('input', { name }, '', value));
+  const input = new El('input', { name }, '', value);
+  if (mask !== null && mask.currency) {
+    input.currencyMask = true;
+    input.maskFrozen = mask.frozen === true;
+  }
+  div.append(input);
   div.append(new El('button', {}, unit));
   return div;
 }
@@ -604,7 +664,12 @@ function buildScreenP(harness: Harness, options: HarnessOptions): El {
     measureDiv('Ancho', 'box.width', '', units.width),
     measureDiv('Profundidad', 'box.depth', '', units.depth),
     measureDiv('Peso', 'box.weight', '', units.weight),
-    measureDiv('Valor declarado', 'declaredValue', '', units.declaredValue),
+    // The real panel renders `Valor declarado` as a currency mask; the fake
+    // models it so the tests reproduce the live failure of a raw write.
+    measureDiv('Valor declarado', 'declaredValue', '', units.declaredValue, {
+      currency: true,
+      frozen: options.declaredValueFrozen === true,
+    }),
   );
 
   const required = ['customer.name', 'customer.surname', 'box.height', 'box.width', 'box.depth', 'box.weight', 'declaredValue'];
