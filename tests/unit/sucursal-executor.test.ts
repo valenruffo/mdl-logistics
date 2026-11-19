@@ -168,8 +168,8 @@ test('dry run: walks both screens, selects carrier and branch, and never clicks 
 
   const result = await sucursalDryRunAgainst(panel, REQUEST, APPROVED_HASH);
 
-  // The walk starts by direct URL navigation to the verified agency entry.
-  assert.deepEqual(harness.navigations, ['/agency-shipment'], 'the entry navigation mounted the agency route');
+  // The walk starts by the two-hop entry: dashboard first, then the agency hash.
+  assert.deepEqual(harness.navigations, ['/dashboard', '/agency-shipment'], 'the two-hop entry mounted the agency route');
 
   assert.equal(result.modality, 'sucursal');
   assert.equal(result.stoppedAt, 'agency-quotation', 'the terminal state is the selected branch, not a summary');
@@ -201,17 +201,18 @@ test('dry run: walks both screens, selects carrier and branch, and never clicks 
   assert.equal(result.journey.branch.selectedText, REAL_OPTIONS[0].text);
 });
 
-test('the walk enters by direct URL navigation to the agency route, never the domicilio entry', async () => {
+test('the walk enters by the two-hop navigation to the agency route, never the domicilio entry', async () => {
   const harness = buildSucursalHarness();
   const panel = newPanel(harness);
 
   await sucursalDryRunAgainst(panel, REQUEST, APPROVED_HASH);
 
-  // The only navigation the walk performs is the verified agency entry: the
-  // admin page goto whose hash mounts the app frame on `/agency-shipment` and
-  // shows Screen P directly (plan §4c, "Screen Entry — verified"). The shared
-  // domicilio URL (`#/create-single-shipment`) is never used here.
-  assert.deepEqual(harness.navigations, ['/agency-shipment']);
+  // The only navigations the walk performs are the two verified entry hops: the
+  // admin page goto to `#/dashboard` (a hash-only goto is a same-document
+  // navigation that only re-routes the SPA via the dashboard), then the goto to
+  // the agency hash `#/agency-shipment` that mounts Screen P (plan §4c). The
+  // shared domicilio URL (`#/create-single-shipment`) is never used here.
+  assert.deepEqual(harness.navigations, ['/dashboard', '/agency-shipment']);
   assert.ok(!harness.navigations.includes('/create-single-shipment'), 'the domicilio entry point was never used');
   assert.ok(!harness.navigations.some((path) => path.includes('create-single-shipment')));
 
@@ -219,7 +220,69 @@ test('the walk enters by direct URL navigation to the agency route, never the do
   const createHarness = buildSucursalHarness();
   const createPanel = newPanel(createHarness);
   await sucursalCreateAgainst(createPanel, REQUEST, APPROVED_HASH);
-  assert.deepEqual(createHarness.navigations, ['/agency-shipment'], 'one agency-entry navigation, then the gated create');
+  assert.deepEqual(createHarness.navigations, ['/dashboard', '/agency-shipment'], 'one two-hop entry, then the gated create');
+});
+
+test('two-hop entry: the dashboard hop re-routes a frame stranded on the domicilio screen', async () => {
+  // The observed live failure started exactly here: the app frame was stuck on
+  // the domicilio screen from a previous walk, and the admin hash changed to
+  // `#/agency-shipment` without the SPA re-routing the frame.
+  const harness = buildSucursalHarness({ initialPath: '/create-single-shipment' });
+  const panel = newPanel(harness);
+
+  const result = await sucursalDryRunAgainst(panel, REQUEST, APPROVED_HASH);
+
+  assert.deepEqual(harness.navigations, ['/dashboard', '/agency-shipment'], 'hop 1 mounted the dashboard, hop 2 the agency route');
+  assert.equal(harness.framePath(), '/agency-shipment/quotation');
+  assert.equal(result.stoppedAt, 'agency-quotation');
+  assert.equal(harness.createClickCount(), 0);
+});
+
+test('starting already on /agency-shipment (a previous run) still works', async () => {
+  // A previous run left the admin app open at `#/agency-shipment` with the frame
+  // on the agency route. The same-document gotos need to change nothing, so the
+  // walk must still land on Screen P and complete.
+  const harness = buildSucursalHarness();
+  const panel = newPanel(harness);
+
+  const result = await sucursalDryRunAgainst(panel, REQUEST, APPROVED_HASH);
+
+  assert.equal(result.stoppedAt, 'agency-quotation');
+  assert.equal(harness.framePath(), '/agency-shipment/quotation');
+  assert.equal(result.formMatchesApproval, true);
+  assert.equal(harness.createClickCount(), 0);
+});
+
+test('the live-failure shape: an ignored agency hash hop falls back to the dashboard UI once', async () => {
+  // Models the panel that did not re-route even from the dashboard: hop 1 works,
+  // hop 2 is a no-op. The executor must try the real UI path exactly once
+  // ("Agregar envío manual" → "A sucursal") and then land on Screen P.
+  const harness = buildSucursalHarness({
+    initialPath: '/create-single-shipment',
+    ignoredHashRoutes: ['/agency-shipment'],
+  });
+  const panel = newPanel(harness);
+
+  const result = await sucursalDryRunAgainst(panel, REQUEST, APPROVED_HASH);
+
+  // Hop 1 mounted the dashboard; hop 2 was ignored by the fake SPA (no route).
+  // The fallback's own navigation mounted the agency route.
+  assert.deepEqual(harness.navigations, ['/dashboard', '/agency-shipment']);
+  assert.equal(harness.clicks.filter((click) => click === 'Agregar envío manual').length, 1, 'the fallback clicked the real button once');
+  assert.equal(harness.clicks.filter((click) => click === 'A sucursal').length, 1, 'the fallback clicked the exact option once');
+  assert.equal(harness.framePath(), '/agency-shipment/quotation');
+  assert.equal(result.stoppedAt, 'agency-quotation');
+  assert.equal(harness.createClickCount(), 0);
+});
+
+test('the fallback never runs when the two-hop entry lands on /agency-shipment', async () => {
+  const harness = buildSucursalHarness({ initialPath: '/create-single-shipment' });
+  const panel = newPanel(harness);
+
+  await sucursalDryRunAgainst(panel, REQUEST, APPROVED_HASH);
+
+  assert.ok(!harness.clicks.includes('Agregar envío manual'), 'the dashboard UI path was never clicked');
+  assert.ok(!harness.clicks.includes('A sucursal'), 'the dropdown option was never clicked');
 });
 
 test('a weight shown in kg aborts screen P with nothing package-related filled', async () => {

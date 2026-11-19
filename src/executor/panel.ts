@@ -82,18 +82,22 @@ export function storeAdminUrl(): string {
 }
 
 /**
- * The verified sucursal entry, as an app-frame URL (plan §4c, "Sucursal — Screen Entry —
- * verified: direct URL navigation"): loading the store admin at the agency hash mounts
- * the app frame at this URL and shows Screen P directly. The `Agregar envío manual`
- * dropdown is **not** needed and is never automated. Fully constant: it carries no
- * store configuration, unlike the admin URLs below.
+ * The verified sucursal app-frame URL (plan §4c, "Sucursal — Screen Entry"): the
+ * app frame must sit here, showing Screen P, before anything is filled. Reaching
+ * it takes the session's **two-hop navigation** (`#/dashboard` → `#/agency-shipment`,
+ * `gotoAgencyEntry`): observed live, a single same-document goto to the agency
+ * hash changed the admin url but never re-routed the app SPA. Fully constant: it
+ * carries no store configuration, unlike the admin URLs below.
  */
 export const VERIFIED_AGENCY_PANEL_URL = `https://${ENVIO_NUBE_FRAME_HOST}/agency-shipment`;
 
 /**
  * Manual-sucursal entry point inside the store admin: the same app as
  * `storeAdminUrl`, at the verified agency hash (`#/agency-shipment`) that loads
- * Screen P directly. Resolved on demand, exactly like the domicilio entry.
+ * Screen P. Hop 2 of the sucursal entry (`gotoAgencyEntry`); hop 1 is the
+ * dashboard entry (`adminAppDashboardUrl`), because a same-document goto to the
+ * agency hash alone did not re-route the app SPA. Resolved on demand, exactly
+ * like the domicilio entry.
  */
 export function storeAdminAgencyUrl(): string {
   return `${resolveStoreOrigin()}${ENVIO_NUBE_APP_PATH}#/agency-shipment`;

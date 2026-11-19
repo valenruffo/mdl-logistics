@@ -167,6 +167,15 @@ const SUCURSAL_SELECT_FIELD = 'sucursal';
 export const SHIPMENT_DETAIL_ROUTE = '/shipping-details/';
 
 /**
+ * The verified dashboard anchor of the fallback sucursal entry (observed live:
+ * text on the dashboard frame). Used only when the two-hop goto entry failed.
+ */
+export const DASHBOARD_ADD_MANUAL_BUTTON = 'Agregar envío manual';
+
+/** The exact option text that opens the sucursal journey from that dropdown. */
+export const AGENCY_DROPDOWN_OPTION = 'A sucursal';
+
+/**
  * Bounded waits. A stuck screen must abort with evidence, not sit for minutes.
  * Route/heading waits are capped at 25 s, the "Continuar became enabled" gate at
  * 20 s, and the post-creation detail page at 45 s. All are env-overridable.
@@ -1295,25 +1304,85 @@ export class EnvioNube {
     return lines;
   }
 
-  // -------------------------------- sucursal entry: verified direct URL navigation
+  // -------------------------------- sucursal entry: two-hop navigation + one UI fallback
 
   /**
-   * Enters the sucursal journey by **direct URL navigation** (plan §4c, "Sucursal —
-   * Screen Entry — verified: direct URL navigation"): the session's admin page is
-   * loaded at the verified agency hash `#/agency-shipment`, which mounts the app
-   * frame at the verified panel URL and shows Screen P directly. The `Agregar envío
-   * manual` dropdown is **not** needed and is never automated — the dropdown branch
-   * is exactly what an entry through the shared domicilio URL would wrongly require.
+   * Enters the sucursal journey by **two-hop navigation** (plan §4c, "Sucursal —
+   * Screen Entry"): the session goes to the dashboard entry first and then to
+   * the agency hash `#/agency-shipment`, which mounts the app frame at the
+   * verified panel URL and shows Screen P.
+   *
+   * Why two hops: a goto whose only difference is the hash is a same-document
+   * navigation. Observed live, the admin url changed to `#/agency-shipment` but
+   * the Envío Nube SPA inside the iframe stayed on the previous screen — the
+   * app router only re-routes when the walk passes through the dashboard.
    *
    * The entry is proven before anything is filled: the frame must sit on the
    * `/agency-shipment` route **and** show the `Envío manual a sucursal` heading.
-   * Reuses the session layer's goto helper, the same one the domicilio entry uses.
+   * If the frame is still not on `/agency-shipment` after the two-hop goto, the
+   * real UI path is tried **once** — `Agregar envío manual`, then the option
+   * whose text is exactly `A sucursal` — and no more: one attempt, no loops.
+   * If the frame still has not landed, the run stops with the frame URL that
+   * was actually reached, never a silent retry.
    */
   async openAgencyEntry(): Promise<void> {
     await gotoAgencyEntry(this.page);
-    const frame = await this.waitForRoute(AGENCY_ROUTES.recipient);
+    let frame: Frame;
+    try {
+      frame = await this.waitForRoute(AGENCY_ROUTES.recipient);
+    } catch {
+      this.note(
+        'the two-hop entry (#/dashboard → #/agency-shipment) did not land the frame on /agency-shipment; one fallback attempt through the real dashboard UI',
+      );
+      await this.agencyEntryViaDashboardUi();
+      try {
+        frame = await this.waitForRoute(AGENCY_ROUTES.recipient);
+      } catch {
+        const reached = this.currentFrame()?.url() ?? '(no Envío Nube frame on the page)';
+        throw new ExecutorError(
+          `after the two-hop entry (#/dashboard → #/agency-shipment) and one dashboard-UI fallback, the app frame never reached "${AGENCY_ROUTES.recipient}" within ${this.timeoutMs}ms; the frame URL actually reached: ${reached}`,
+          await this.describe(),
+        );
+      }
+    }
     await this.waitForHeading(frame, HEADINGS.agency, 'sucursal screen P (#/agency-shipment)');
-    this.note(`entered the sucursal journey by direct navigation to ${VERIFIED_AGENCY_PANEL_URL} (admin hash #/agency-shipment)`);
+    this.note(
+      `entered the sucursal journey: the app frame sits on ${VERIFIED_AGENCY_PANEL_URL} (admin hash #/agency-shipment)`,
+    );
+  }
+
+  /**
+   * The single fallback entry, used only when the two-hop goto did not re-route
+   * the app frame (observed live). Clicks the real UI path once: the verified
+   * `Agregar envío manual` button on the dashboard frame, then the option whose
+   * text is exactly `A sucursal`. The caller's route assertion is the verdict;
+   * there is no second attempt and no loop.
+   */
+  private async agencyEntryViaDashboardUi(): Promise<void> {
+    const frame = await this.requireFrame();
+    const addManual = frame
+      .getByRole('button', { name: copyPattern(DASHBOARD_ADD_MANUAL_BUTTON, { exact: true }) })
+      .first();
+    try {
+      await addManual.click({ timeout: this.timeoutMs });
+      this.note('clicked "Agregar envío manual" on the Envío Nube frame');
+    } catch (error) {
+      throw new ExecutorError(
+        `the fallback entry could not click "${DASHBOARD_ADD_MANUAL_BUTTON}": ${messageOf(error)}`,
+        await this.describe(frame),
+      );
+    }
+    const agencyOption = frame.getByText(copyPattern(AGENCY_DROPDOWN_OPTION, { exact: true })).first();
+    try {
+      await agencyOption.waitFor({ state: 'visible', timeout: this.timeoutMs });
+      await agencyOption.click({ timeout: this.timeoutMs });
+      this.note(`clicked the "${AGENCY_DROPDOWN_OPTION}" option`);
+    } catch (error) {
+      throw new ExecutorError(
+        `the fallback entry could not click the "${AGENCY_DROPDOWN_OPTION}" option: ${messageOf(error)}`,
+        await this.describe(frame),
+      );
+    }
   }
 
   // -------------------------------- sucursal screen P: recipient + package

@@ -39,6 +39,18 @@ export interface HarnessOptions {
   shipmentId?: string;
   /** Unit labels per screen-P measure field; override to simulate the unit trap. */
   units?: { height?: string; width?: string; depth?: string; weight?: string; declaredValue?: string };
+  /**
+   * The frame route the fake session starts on — what a previous run left open.
+   * Defaults to the agency screen; `/create-single-shipment` models the observed
+   * live failure, where the frame was stranded on the domicilio screen.
+   */
+  initialPath?: string;
+  /**
+   * Hash routes the fake SPA refuses to re-route, modeling the observed live
+   * failure: a same-document goto changed the admin hash but never dispatched
+   * the app router, so the frame stayed on the previous screen.
+   */
+  ignoredHashRoutes?: readonly string[];
 }
 
 export interface SucursalHarness {
@@ -376,15 +388,31 @@ class FakeLocator {
 
 // ------------------------------------------------------------------ harness
 
+/** Path of the admin document that hosts the Envío Nube app. */
+const ADMIN_APP_PATH = '/admin/apps/envionube/ar';
+
+/** Frame route the app SPA mounts when the admin hash is `#/dashboard`. */
+const DASHBOARD_FRAME_ROUTE = '/dashboard';
+
 class Harness {
   readonly clicks: string[] = [];
   private readonly navigations: string[] = [];
   private readonly screens = new Map<string, El>();
+  /** Hash routes the SPA ignores, modeling the observed live panel failure. */
+  private readonly ignoredHashRoutes: ReadonlySet<string>;
   private currentPath = '';
   private createClicked = 0;
 
+  constructor(ignoredHashRoutes: readonly string[] = []) {
+    this.ignoredHashRoutes = new Set(ignoredHashRoutes);
+  }
+
   addScreen(path: string, body: El): void {
     this.screens.set(path, body);
+  }
+
+  hasScreen(path: string): boolean {
+    return this.screens.has(path);
   }
 
   navigate(path: string): void {
@@ -393,16 +421,54 @@ class Harness {
   }
 
   /**
-   * Resolves the screen a `goto` targets, mirroring the real panel: the admin
-   * hash is the app frame path (`#/agency-shipment` mounts `/agency-shipment`).
-   * A URL without a hash falls back to its pathname. Navigating to a screen
-   * that was never registered is a loud fake failure, as everywhere else.
+   * A UI action (a click, not a `goto`) that routes the SPA to `path`. Recorded
+   * in `navigations` like any other route change, so the entry evidence stays
+   * complete however the walk mounted the screen.
+   */
+  navigateViaUi(path: string): void {
+    this.navigations.push(path);
+    this.navigate(path);
+  }
+
+  /**
+   * Resolves the screen a `goto` targets, modeling the hash-routed SPA inside
+   * the admin app (the observed live behavior that stranded the frame):
+   *
+   * - a goto whose document path differs from the admin app is a fresh mount;
+   * - a goto to the same frame path is a same-document navigation that needs to
+   *   change nothing, so it is fine (a previous run left `#/agency-shipment` open);
+   * - a goto that changes only the hash re-routes the SPA **only** when the walk
+   *   hops via the dashboard: mounting `#/dashboard` (the app's home route), or
+   *   leaving `/dashboard` (from there the hash change dispatches the router —
+   *   exactly how the operator's manual walk worked);
+   * - any other hash-only goto is a no-op: the hash changes, the frame stays —
+   *   the observed live failure this harness exists to reproduce.
    */
   gotoFromUrl(url: string): void {
     const hashIndex = url.indexOf('#');
-    const path = hashIndex >= 0 ? url.slice(hashIndex + 1).split('?')[0] : new URL(url).pathname;
-    this.navigations.push(path);
-    this.navigate(path);
+    const beforeHash = hashIndex >= 0 ? url.slice(0, hashIndex) : url;
+    const targetPath = hashIndex >= 0 ? url.slice(hashIndex + 1).split('?')[0] : new URL(url).pathname;
+
+    let documentPath: string | null = null;
+    try {
+      documentPath = new URL(beforeHash).pathname;
+    } catch {
+      documentPath = null;
+    }
+    if (documentPath !== ADMIN_APP_PATH || hashIndex < 0) {
+      // A different document (or a direct frame URL): a full mount at the target.
+      this.navigations.push(targetPath);
+      this.navigate(targetPath);
+      return;
+    }
+
+    if (targetPath === this.currentPath) return;
+    const hopsViaDashboard = targetPath === DASHBOARD_FRAME_ROUTE || this.currentPath === DASHBOARD_FRAME_ROUTE;
+    if (hopsViaDashboard && !this.ignoredHashRoutes.has(targetPath)) {
+      this.navigations.push(targetPath);
+      this.navigate(targetPath);
+    }
+    // otherwise: no-op — the hash changed, the frame did not re-route.
   }
 
   body(): El {
@@ -480,7 +546,7 @@ class FakePage {
   constructor(private readonly harness: Harness, private readonly frame: FakeFrame) {}
 
   url(): string {
-    return `${ADMIN_ORIGIN}/admin/apps/envionube/ar${this.harness.state().framePath()}`;
+    return `${ADMIN_ORIGIN}${ADMIN_APP_PATH}#${this.harness.state().framePath()}`;
   }
 
   /** Same shape as `Page.goto`; the options are accepted and ignored. */
@@ -606,6 +672,36 @@ function buildScreenQ(harness: Harness, options: HarnessOptions): El {
   return body;
 }
 
+/**
+ * The Envío Nube dashboard (`#/dashboard`), the first hop of the two-hop entry.
+ * Carries the verified `Agregar envío manual` anchor and its dropdown option
+ * `A sucursal` — the real UI path of the fallback entry (plan §4c).
+ */
+function buildDashboard(harness: Harness): El {
+  const body = new El('body');
+  body.append(new El('h1', {}, 'Envío Nube'));
+  const addManual = new El('button', {}, 'Agregar envío manual');
+  const agencyOption = new El('button', {}, 'A sucursal');
+  agencyOption.visible = false;
+  agencyOption.onClick = () => harness.navigateViaUi('/agency-shipment');
+  addManual.onClick = () => {
+    agencyOption.visible = true;
+  };
+  body.append(addManual, agencyOption);
+  return body;
+}
+
+/**
+ * Stand-in for whatever screen a previous run left open. The default mirrors
+ * the observed live failure: the frame stranded on the domicilio screen, whose
+ * visible headings were "Envío manual a domicilio | Calcular costo de envío".
+ */
+function buildPreviousScreen(): El {
+  const body = new El('body');
+  body.append(new El('h1', {}, 'Envío manual a domicilio'), new El('h2', {}, 'Calcular costo de envío'));
+  return body;
+}
+
 function buildDetail(options: HarnessOptions): El {
   const body = new El('body');
   body.append(new El('h1', {}, options.shipmentId ?? '#EM1053'));
@@ -632,14 +728,18 @@ function buildDetail(options: HarnessOptions): El {
   return body;
 }
 
-/** Builds the harness with the two sucursal screens and the detail page pre-registered. */
+/** Builds the harness with the dashboard, the two sucursal screens and the detail page pre-registered. */
 export function buildSucursalHarness(options: HarnessOptions = {}): SucursalHarness {
-  const harness = new Harness();
+  const harness = new Harness(options.ignoredHashRoutes ?? []);
+  harness.addScreen('/dashboard', buildDashboard(harness));
   harness.addScreen('/agency-shipment', buildScreenP(harness, options));
   harness.addScreen('/agency-shipment/quotation', buildScreenQ(harness, options));
   const shipmentId = (options.shipmentId ?? '#EM1053').replace('#', '');
   harness.addScreen(`/shipping-details/${shipmentId}`, buildDetail(options));
-  harness.navigate('/agency-shipment');
+
+  const initialPath = options.initialPath ?? '/agency-shipment';
+  if (!harness.hasScreen(initialPath)) harness.addScreen(initialPath, buildPreviousScreen());
+  harness.navigate(initialPath);
 
   const frame = new FakeFrame(harness);
   const page = new FakePage(harness, frame);

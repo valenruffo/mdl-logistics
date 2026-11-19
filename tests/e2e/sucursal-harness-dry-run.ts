@@ -4,9 +4,10 @@
  * `sucursalDryRunAgainst` path the real dry run uses, over the recorded panel
  * structure of `tests/unit/sucursal-harness.ts`, and prints the same readback
  * shape the live `npm run sucursal-dry-run` prints — plus the click evidence
- * that `Crear envío` was never clicked. The walk starts by the verified
- * **direct URL navigation** to `#/agency-shipment`, so the printed entry is the
- * agency route, not the domicilio entry point.
+ * that `Crear envío` was never clicked. The walk enters by the verified
+ * **two-hop navigation** — the dashboard hash first, then the agency hash —
+ * because a single same-document goto to `#/agency-shipment` failed live to
+ * re-route the app SPA.
  *
  * Not part of `npm test`; run it with `npm run sucursal-harness-dry-run`.
  */
@@ -88,8 +89,8 @@ async function main(): Promise<number> {
   try {
     const result = await sucursalDryRunAgainst(panel, request, approvedPayloadHash);
 
-    section('Entry — verified: direct URL navigation (no Agregar envío manual dropdown)');
-    line('admin hash navigated', `#/agency-shipment`);
+    section('Entry — verified: two-hop navigation (dashboard hash, then the agency hash)');
+    line('admin hash navigated', '#/dashboard → #/agency-shipment (two-hop entry)');
     line('navigations recorded by the fake panel', harness.navigations);
     line('screen P frame url', result.journey.screen.url);
 
@@ -135,8 +136,14 @@ async function main(): Promise<number> {
       console.error('\nFAILED: the dry run clicked "Crear envío". That must be impossible.');
       return 1;
     }
-    if (harness.navigations.length !== 1 || harness.navigations[0] !== '/agency-shipment') {
-      console.error(`\nFAILED: the walk must enter by the agency route (navigations: ${JSON.stringify(harness.navigations)}).`);
+    if (
+      harness.navigations.length !== 2 ||
+      harness.navigations[0] !== '/dashboard' ||
+      harness.navigations[1] !== '/agency-shipment'
+    ) {
+      console.error(
+        `\nFAILED: the walk must enter by the two-hop navigation — dashboard first, then the agency route (navigations: ${JSON.stringify(harness.navigations)}).`,
+      );
       return 1;
     }
 

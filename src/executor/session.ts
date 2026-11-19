@@ -2,7 +2,12 @@ import { statSync } from 'node:fs';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import { readEnv, readEnvBool, readEnvInt } from './env';
 import { ExecutorError, messageOf } from './errors';
-import { storeAdminAgencyUrl, storeAdminUrl } from './panel';
+import {
+  adminAppDashboardUrl,
+  ENVIO_NUBE_FRAME_HOST,
+  storeAdminAgencyUrl,
+  storeAdminUrl,
+} from './panel';
 import { poll } from './wait';
 
 /**
@@ -307,22 +312,65 @@ async function gotoAppEntry(page: Page, target: string, timeoutMs: number, entry
   }
 }
 
+/**
+ * Frame route of the Envío Nube dashboard inside the app frame. The dashboard
+ * is the first hop of the sucursal entry: a hash-only goto re-routes the app
+ * SPA only when it mounts or leaves the dashboard (observed live failure:
+ * from another hash route the browser treats the goto as a same-document
+ * navigation and the app frame stays on the previous screen).
+ */
+const DASHBOARD_FRAME_ROUTE = '/dashboard';
+
+/**
+ * The URL of the Envío Nube frame when it sits on `route`, or `null`. One
+ * non-throwing probe for the bounded dashboard wait below.
+ */
+function envioNubeFrameUrlOnRoute(page: Page, route: string): string | null {
+  const frame = page.frames().find((candidate) => candidate.url().includes(ENVIO_NUBE_FRAME_HOST));
+  if (frame === undefined) return null;
+  try {
+    return new URL(frame.url()).pathname.endsWith(route) ? frame.url() : null;
+  } catch {
+    return null;
+  }
+}
+
 async function ensureAdminPage(page: Page, timeoutMs: number): Promise<void> {
   if (page.url().includes('/admin/apps/envionube')) return;
   await gotoAppEntry(page, storeAdminUrl(), timeoutMs, 'manual-shipment entry point');
 }
 
 /**
- * Navigates the already-open session to the **sucursal** entry point, reusing the
- * same goto helper as the domicilio entry (plan §4c, "Sucursal — Screen Entry —
- * verified: direct URL navigation"): the admin app at the verified agency hash
- * `#/agency-shipment`, which mounts the app frame on `/agency-shipment` and shows
- * Screen P directly. The `Agregar envío manual` dropdown is not needed and is
- * never automated. Unlike `ensureAdminPage`, this navigates even when the admin
- * app is already open: the domicilio entry hash must be replaced by the agency one.
+ * Navigates the already-open session to the **sucursal** entry point in two
+ * hops (plan §4c, "Sucursal — Screen Entry"). The direct goto to the agency
+ * hash alone failed live: the admin page url changed to `#/agency-shipment`
+ * but the Envío Nube SPA inside the iframe never re-routed — a goto whose only
+ * difference is the hash is a same-document navigation and does not mount a
+ * new app route. The operator's manual walk worked because they were on
+ * `#/dashboard` first, and from the dashboard the hash change dispatched the
+ * SPA router. So the walk is:
+ *
+ * 1. goto the dashboard entry (`<origin>/admin/apps/envionube/ar#/dashboard`,
+ *    the verified dashboard URL constant) and wait, bounded, for the app frame
+ *    to sit on `/dashboard`;
+ * 2. goto the agency hash (`#/agency-shipment`).
+ *
+ * Each hop is a single goto: no hop is ever retried. If the dashboard frame
+ * route never appears, the walk still performs the second hop once — the
+ * caller's `/agency-shipment` route assertion is the verdict, and its failure
+ * evidence carries the frame URL actually reached. Unlike `ensureAdminPage`,
+ * this navigates even when the admin app is already open: the current entry
+ * hash must be replaced by the dashboard one and then the agency one.
  */
 export async function gotoAgencyEntry(page: Page): Promise<void> {
   const timeoutMs = readEnvInt('MDL_WAIT_TIMEOUT_MS', 60_000);
+  // Hop 1 — the dashboard entry, which mounts the app frame on `/dashboard`.
+  await gotoAppEntry(page, adminAppDashboardUrl(), timeoutMs, 'dashboard entry point (#/dashboard)');
+  // Bounded wait for the dashboard frame route, reusing the poll machinery. It
+  // paces the two hops; it is not a gate — the second hop happens exactly once
+  // either way, and the agency route assertion decides the outcome.
+  await poll(() => Promise.resolve(envioNubeFrameUrlOnRoute(page, DASHBOARD_FRAME_ROUTE)), { timeoutMs });
+  // Hop 2 — the agency hash, which the SPA re-routes from the dashboard.
   await gotoAppEntry(page, storeAdminAgencyUrl(), timeoutMs, 'sucursal entry point (#/agency-shipment)');
 }
 
