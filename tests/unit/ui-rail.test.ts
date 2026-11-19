@@ -606,6 +606,124 @@ test('the session block keeps its dot, its word and a short "verificada" line', 
   }
 });
 
+// ------------------------------------- 8. the rail sticks to the viewport
+
+/** The `<style>` block of the page, where every layout rule lives. */
+function styleBlock(): string {
+  const start = PAGE_HTML.indexOf('<style>');
+  const end = PAGE_HTML.indexOf('</style>');
+  assert.ok(start >= 0 && end > start, 'the page carries its stylesheet inline');
+  return PAGE_HTML.slice(start, end);
+}
+
+/** The one media query that stacks the rail on top, on narrow screens. */
+function narrowMediaQuery(): string {
+  const match = styleBlock().match(/@media \(max-width:860px\)\{[\s\S]*?(?=\n  @media|\n<\/style>)/);
+  assert.ok(match, 'the narrow-screen media query exists');
+  return match[0];
+}
+
+/** Reads one custom property from a CSS block of custom properties. */
+function customProperty(block: string, name: string): string {
+  const match = block.match(new RegExp(`--${name}:#([0-9a-f]{6})`));
+  assert.ok(match, `--${name} is declared with a hex value`);
+  return match[1] as string;
+}
+
+/** WCAG contrast ratio of two hex colours, as the requirement counts them. */
+function contrast(foreground: string, background: string): number {
+  const channel = (hex: string): number => {
+    const value = parseInt(hex, 16) / 255;
+    return value <= 0.03928 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
+  };
+  const luminance = (hex: string): number => {
+    const r = channel(hex.slice(0, 2));
+    const g = channel(hex.slice(2, 4));
+    const b = channel(hex.slice(4, 6));
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const [lighter, darker] = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+test('the rail sticks to the viewport at one screen tall, and only corridas scrolls inside', () => {
+  const css = styleBlock();
+
+  // The rail itself: sticky, one viewport tall, nothing it carries can push it.
+  const railRule = css.match(/\.rail \{[^}]*\}/);
+  assert.ok(railRule, 'the .rail rule exists');
+  assert.match(railRule[0], /position:sticky/, 'the rail sticks to the viewport');
+  assert.match(railRule[0], /top:0/);
+  assert.match(railRule[0], /height:100vh/, 'the rail is exactly one screen tall');
+  assert.match(railRule[0], /overflow:hidden/, 'the rail never grows past the viewport');
+
+  // Corridas: the only internal scroll, capped so it can never stretch the rail.
+  const runsRule = css.match(/\.runs \{[^}]*\}/);
+  assert.ok(runsRule, 'the .runs rule exists');
+  assert.match(runsRule[0], /max-height:240px/, 'the runs list is capped');
+  assert.match(runsRule[0], /overflow-y:auto/, 'the runs list scrolls inside itself');
+
+  // The scrollbar styling is declared (thin, themed from the rail palette).
+  assert.match(css, /\.runs::-webkit-scrollbar \{/, 'a webkit scrollbar style exists');
+  assert.match(css, /\.runs::-webkit-scrollbar-thumb \{[^}]*background:var\(--rail-line\)/);
+  assert.match(css, /scrollbar-width:thin/, 'the Firefox scrollbar is styled too');
+
+  // The other blocks never scroll the rail: no other rail block declares a
+  // max-height + overflow-y pair.
+  const internalScrollers = [...css.matchAll(/\.(rail (?!runs)[a-z-]+)\s*\{[^}]*overflow-y:auto[^}]*\}/g)];
+  assert.equal(internalScrollers.length, 0, 'no rail block other than .runs scrolls');
+});
+
+test('the narrow-screen media query still stacks the rail, with the sticky behaviour reset there', () => {
+  const narrow = narrowMediaQuery();
+
+  // Stacking, as before: one column, the rail flowing with the page.
+  assert.match(narrow, /\.app \{ grid-template-columns:1fr; \}/);
+  assert.match(narrow, /flex-direction:row/, 'the rail blocks still lay out in a row');
+
+  // The wide-screen stickiness is explicitly reset, so a stacked rail is not
+  // stuck at 100vh on a phone.
+  const railReset = narrow.match(/\.rail \{[^}]*\}/);
+  assert.ok(railReset, 'the media query restates the .rail rule');
+  assert.match(railReset[0], /position:static/, 'no sticky on narrow screens');
+  assert.match(railReset[0], /height:auto/, 'no forced 100vh on narrow screens');
+  assert.match(railReset[0], /overflow:visible/, 'no clipping on narrow screens');
+
+  // And the reset lives inside the media query only: the wide-screen rule
+  // itself still carries position:sticky.
+  assert.match(styleBlock(), /\.rail \{[^}]*position:sticky/);
+});
+
+test('the scrolled runs text keeps at least 4.5:1 on the rail in both themes', () => {
+  const css = styleBlock();
+
+  // The rail palette is declared once, in :root, and never overridden — so the
+  // dark theme reads the same rail colours as the light one. Both the base
+  // block and the two dark-theme blocks must exist, and every one of them must
+  // keep the runs text above 4.5:1.
+  const root = css.match(/:root \{[\s\S]*?\n  \}/);
+  assert.ok(root, ':root declares the palette');
+  const darkStored = css.match(/html\[data-theme="dark"\] \{[\s\S]*?\n  \}/);
+  assert.ok(darkStored, 'the stored dark theme block exists');
+  const darkSystem = css.match(/html:not\(\[data-theme="light"\]\) \{[\s\S]*?\n  \}/);
+  assert.ok(darkSystem, 'the system dark theme block exists');
+
+  const rail = customProperty(root[0], 'rail');
+  const ink = customProperty(root[0], 'rail-ink');
+  const muted = customProperty(root[0], 'rail-muted');
+
+  // Every colour the runs list can paint: the run line itself (--rail-ink,
+  // inherited) and the time/meta line (--rail-muted). None of the dark blocks
+  // override them, so one palette check covers both themes — asserted.
+  for (const [name, block] of [['stored dark', darkStored[0]], ['system dark', darkSystem[0]]] as const) {
+    assert.doesNotMatch(block, new RegExp(`--rail:`), `${name} does not override the rail surface`);
+    assert.doesNotMatch(block, new RegExp(`--rail-ink|--rail-muted`), `${name} does not override the rail text colours`);
+  }
+
+  assert.ok(contrast(ink, rail) >= 4.5, `--rail-ink on --rail is ${contrast(ink, rail).toFixed(2)}:1`);
+  assert.ok(contrast(muted, rail) >= 4.5, `--rail-muted on --rail is ${contrast(muted, rail).toFixed(2)}:1`);
+});
+
 // ----------------------------------------------------- 7. the rail's trim
 
 test('the brand and the theme toggle share one discreet line, and focus stays visible', () => {

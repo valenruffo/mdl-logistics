@@ -96,8 +96,15 @@ export const PAGE_HTML = `<!doctype html>
              clip:rect(0 0 0 0); white-space:nowrap; border:0; }
   .app { display:grid; grid-template-columns:224px 1fr; min-height:100vh; }
 
-  /* compact rail */
-  .rail { background:var(--rail); color:var(--rail-ink); padding:16px 14px; display:flex; flex-direction:column; gap:18px; font-size:13px; }
+  /* The rail is furniture of the viewport, not of the page: it sticks beside
+     the scrolling work column at exactly one screen tall, so a long work
+     column can never stretch it into a giant half-empty sidebar. Only Corridas
+     scrolls, and only inside itself, so Sesión, Errores and the footer stay
+     visible without ever scrolling the rail. On narrow screens the media query
+     below resets the stickiness: there the rail stacks on top and flows with
+     the page, exactly as before. */
+  .rail { position:sticky; top:0; height:100vh; overflow:hidden;
+          background:var(--rail); color:var(--rail-ink); padding:16px 14px; display:flex; flex-direction:column; gap:18px; font-size:13px; }
   /* The brand and the theme toggle share one discreet line. */
   .rail-head { display:flex; align-items:baseline; justify-content:space-between; gap:8px; }
   .rail .brand { font-weight:650; font-size:14px; letter-spacing:-.01em; }
@@ -114,7 +121,18 @@ export const PAGE_HTML = `<!doctype html>
   .rail button.rail-toggle { width:auto; align-self:center; margin-top:0; padding:2px 6px; font-size:10.5px;
                              border-color:transparent; color:var(--rail-muted); font-weight:500; }
   .rail button.rail-toggle:hover { color:var(--rail-ink); }
-  .runs { list-style:none; margin:0; padding:0; }
+  /* Corridas is the one block that can grow (the last five runs, one line
+     each), so it gets the rail's only internal scroll: it caps at 240 px and
+     rolls inside itself instead of pushing the footer off the viewport. The
+     scrollbar is thin and quiet, painted from the rail's own palette in both
+     themes (the rail surface never changes with the theme), and the list text
+     keeps ≥4.5:1 on it: --rail-ink 13.4:1, --rail-muted 5.7:1 on --rail. */
+  .runs { list-style:none; margin:0; padding:0; max-height:240px; overflow-y:auto;
+          scrollbar-width:thin; scrollbar-color:var(--rail-line) transparent; }
+  .runs::-webkit-scrollbar { width:8px; }
+  .runs::-webkit-scrollbar-track { background:transparent; }
+  .runs::-webkit-scrollbar-thumb { background:var(--rail-line); border-radius:99px; }
+  .runs::-webkit-scrollbar-thumb:hover { background:var(--rail-edge); }
   .runs li { padding:6px 0; border-bottom:1px solid var(--rail-line); line-height:1.3; font-variant-numeric:tabular-nums; }
   .runs li:last-child { border-bottom:0; }
   .runs .meta { font-size:11px; display:inline; }
@@ -214,7 +232,11 @@ export const PAGE_HTML = `<!doctype html>
   .progress-steps li.pending { color:var(--muted); }
   .progress-percent { font-variant-numeric:tabular-nums; margin:10px 0 0; }
 
-  @media (max-width:860px){ .app { grid-template-columns:1fr; } .rail { flex-direction:row; flex-wrap:wrap; gap:14px; }
+  /* Narrow screens: the rail stacks on top of the work column and flows with
+     the page again — sticky, viewport height and overflow clipping are wide
+     -screen behaviour only. */
+  @media (max-width:860px){ .app { grid-template-columns:1fr; }
+    .rail { position:static; top:auto; height:auto; overflow:visible; flex-direction:row; flex-wrap:wrap; gap:14px; }
     .rail footer { margin:0; } .work { padding:22px 18px 40px; } .grid { grid-template-columns:1fr; } }
   @media (prefers-reduced-motion:reduce){ * { transition:none !important; animation:none !important; } }
 </style>
