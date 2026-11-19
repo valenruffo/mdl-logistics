@@ -45,6 +45,8 @@ export interface SucursalHarness {
   page: Page;
   /** Every clicked button/label text, in order — the "never clicked" evidence. */
   clicks: readonly string[];
+  /** Every screen path the fake page was navigated to, in order — the entry evidence. */
+  navigations: readonly string[];
   /** Current frame path (`/agency-shipment`, `/agency-shipment/quotation`, …). */
   framePath(): string;
   /** Values of every named input/select on the current screen. */
@@ -376,6 +378,7 @@ class FakeLocator {
 
 class Harness {
   readonly clicks: string[] = [];
+  private readonly navigations: string[] = [];
   private readonly screens = new Map<string, El>();
   private currentPath = '';
   private createClicked = 0;
@@ -387,6 +390,19 @@ class Harness {
   navigate(path: string): void {
     if (!this.screens.has(path)) throw new Error(`harness: no screen built for ${path}`);
     this.currentPath = path;
+  }
+
+  /**
+   * Resolves the screen a `goto` targets, mirroring the real panel: the admin
+   * hash is the app frame path (`#/agency-shipment` mounts `/agency-shipment`).
+   * A URL without a hash falls back to its pathname. Navigating to a screen
+   * that was never registered is a loud fake failure, as everywhere else.
+   */
+  gotoFromUrl(url: string): void {
+    const hashIndex = url.indexOf('#');
+    const path = hashIndex >= 0 ? url.slice(hashIndex + 1).split('?')[0] : new URL(url).pathname;
+    this.navigations.push(path);
+    this.navigate(path);
   }
 
   body(): El {
@@ -413,6 +429,7 @@ class Harness {
     return {
       framePath: (): string => this.currentPath,
       clicks: this.clicks as readonly string[],
+      navigations: this.navigations as readonly string[],
       inputValues: (): Record<string, string> => {
         // Merged across every screen: the walk ends on screen Q, but the screen-P
         // fills are part of the same run and the same fake panel.
@@ -466,6 +483,11 @@ class FakePage {
     return `${ADMIN_ORIGIN}/admin/apps/envionube/ar${this.harness.state().framePath()}`;
   }
 
+  /** Same shape as `Page.goto`; the options are accepted and ignored. */
+  async goto(url: string, _options?: { waitUntil?: string; timeout?: number }): Promise<void> {
+    this.harness.gotoFromUrl(url);
+  }
+
   frames(): Frame[] {
     return [this.frame as unknown as Frame];
   }
@@ -507,6 +529,7 @@ function buildScreenP(harness: Harness, options: HarnessOptions): El {
   const body = new El('body');
   const units = { height: 'cm', width: 'cm', depth: 'cm', weight: 'g', declaredValue: '$', ...options.units };
   body.append(
+    new El('h1', {}, 'Envío manual a sucursal'),
     fieldDiv('Nombre', 'customer.name', ''),
     fieldDiv('Apellido', 'customer.surname', ''),
     fieldDiv('Email (opcional)', 'customer.email', ''),
@@ -625,6 +648,9 @@ export function buildSucursalHarness(options: HarnessOptions = {}): SucursalHarn
     page: page as unknown as Page,
     get clicks(): readonly string[] {
       return harness.state().clicks;
+    },
+    get navigations(): readonly string[] {
+      return harness.state().navigations;
     },
     framePath: harness.state().framePath,
     inputValues: harness.state().inputValues,

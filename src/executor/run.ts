@@ -506,11 +506,21 @@ export function sucursalMismatches(request: SucursalShipmentRequest, journey: Su
   return mismatches;
 }
 
-/** Screens P → Q, stopping after the branch selection. The only click targets are `Continuar` and one carrier radio. */
+/**
+ * Screens P → Q, stopping after the branch selection. The only click targets are `Continuar` and one carrier radio.
+ *
+ * The walk **starts by direct URL navigation** to the verified agency entry
+ * (`EnvioNube.openAgencyEntry`): the session is loaded at `#/agency-shipment`, the
+ * `/agency-shipment` route and the `Envío manual a sucursal` heading are asserted,
+ * and only then is Screen P filled. Entering through the shared domicilio URL
+ * instead would land on `#/create-single-shipment` with the modal branch never
+ * selected — the failure the live dry run exposed.
+ */
 export async function walkSucursalToQuotation(
   panel: EnvioNube,
   request: SucursalShipmentRequest,
 ): Promise<SucursalJourneyReadback> {
+  await panel.openAgencyEntry();
   await panel.fillAgencyRecipient({ customer: request.customer });
   await panel.fillAgencyPackage(request.box);
   const screen = await panel.readAgencyScreen();

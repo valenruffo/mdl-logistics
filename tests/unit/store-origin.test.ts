@@ -17,9 +17,11 @@ import { ExecutorError } from '../../src/executor/errors';
 import {
   adminAppDashboardUrl,
   resolveStoreOrigin,
+  storeAdminAgencyUrl,
   storeAdminUrl,
   STORE_ORIGIN_EXPECTED_SHAPE,
   STORE_ORIGIN_VARIABLE,
+  VERIFIED_AGENCY_PANEL_URL,
 } from '../../src/executor/panel';
 
 /** Fictional origin (RFC 6761 `.test`). Never a real store. */
@@ -59,6 +61,18 @@ test('a configured origin composes both panel URLs from configuration alone', ()
     assert.equal(resolveStoreOrigin(), FICTIONAL_ORIGIN);
     assert.equal(storeAdminUrl(), `${FICTIONAL_ORIGIN}${APP_PATH}#/create-single-shipment`);
     assert.equal(adminAppDashboardUrl(), `${FICTIONAL_ORIGIN}${APP_PATH}#/dashboard`);
+    assert.equal(storeAdminAgencyUrl(), `${FICTIONAL_ORIGIN}${APP_PATH}#/agency-shipment`);
+  } finally {
+    restore();
+  }
+});
+
+test('the verified sucursal panel URL is a constant: it carries no store configuration', () => {
+  assert.equal(VERIFIED_AGENCY_PANEL_URL, 'https://services-ne-app-front-ar.nuvemshop.com.br/agency-shipment');
+  // Importing or reading it never needs the origin, unlike the admin URLs.
+  const restore = withOrigin(undefined);
+  try {
+    assert.equal(VERIFIED_AGENCY_PANEL_URL, 'https://services-ne-app-front-ar.nuvemshop.com.br/agency-shipment');
   } finally {
     restore();
   }

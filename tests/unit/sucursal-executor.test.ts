@@ -23,8 +23,24 @@ import {
   type BranchOption,
 } from '../../src/executor/envioNube';
 import { ExecutorError } from '../../src/executor/errors';
+import { STORE_ORIGIN_VARIABLE } from '../../src/executor/panel';
 import { sucursalCreateAgainst, sucursalDryRunAgainst } from '../../src/executor/run';
 import { buildSucursalHarness, type SucursalHarness } from './sucursal-harness';
+
+/**
+ * The sucursal walk now enters by **direct URL navigation**, which composes the
+ * admin entry URL from `MDL_STORE_ORIGIN`. The offline harness still runs without
+ * real configuration: a fictional `.test` origin (RFC 6761) covers the suite and
+ * is restored when it ends — the fake panel never sees the URL, only the fake
+ * page's `goto` does, and it resolves the screen from the hash alone.
+ */
+const FICTIONAL_STORE_ORIGIN = 'https://tienda-ejemplo.test';
+const previousStoreOrigin = process.env[STORE_ORIGIN_VARIABLE];
+process.env[STORE_ORIGIN_VARIABLE] = FICTIONAL_STORE_ORIGIN;
+test.after(() => {
+  if (previousStoreOrigin === undefined) delete process.env[STORE_ORIGIN_VARIABLE];
+  else process.env[STORE_ORIGIN_VARIABLE] = previousStoreOrigin;
+});
 
 /** The real branch option list observed for CP 1419 (plan §4c), UUID values stand in. */
 const REAL_OPTIONS: readonly BranchOption[] = [
@@ -152,6 +168,9 @@ test('dry run: walks both screens, selects carrier and branch, and never clicks 
 
   const result = await sucursalDryRunAgainst(panel, REQUEST, APPROVED_HASH);
 
+  // The walk starts by direct URL navigation to the verified agency entry.
+  assert.deepEqual(harness.navigations, ['/agency-shipment'], 'the entry navigation mounted the agency route');
+
   assert.equal(result.modality, 'sucursal');
   assert.equal(result.stoppedAt, 'agency-quotation', 'the terminal state is the selected branch, not a summary');
   assert.equal(result.formMatchesApproval, true, 'the panel readback hashes to the approved sucursal payload');
@@ -180,6 +199,27 @@ test('dry run: walks both screens, selects carrier and branch, and never clicks 
 
   // The dropdown's selected option text matches the approved name after normalization.
   assert.equal(result.journey.branch.selectedText, REAL_OPTIONS[0].text);
+});
+
+test('the walk enters by direct URL navigation to the agency route, never the domicilio entry', async () => {
+  const harness = buildSucursalHarness();
+  const panel = newPanel(harness);
+
+  await sucursalDryRunAgainst(panel, REQUEST, APPROVED_HASH);
+
+  // The only navigation the walk performs is the verified agency entry: the
+  // admin page goto whose hash mounts the app frame on `/agency-shipment` and
+  // shows Screen P directly (plan §4c, "Screen Entry — verified"). The shared
+  // domicilio URL (`#/create-single-shipment`) is never used here.
+  assert.deepEqual(harness.navigations, ['/agency-shipment']);
+  assert.ok(!harness.navigations.includes('/create-single-shipment'), 'the domicilio entry point was never used');
+  assert.ok(!harness.navigations.some((path) => path.includes('create-single-shipment')));
+
+  // The create walk shares the same entry, navigated exactly once.
+  const createHarness = buildSucursalHarness();
+  const createPanel = newPanel(createHarness);
+  await sucursalCreateAgainst(createPanel, REQUEST, APPROVED_HASH);
+  assert.deepEqual(createHarness.navigations, ['/agency-shipment'], 'one agency-entry navigation, then the gated create');
 });
 
 test('a weight shown in kg aborts screen P with nothing package-related filled', async () => {

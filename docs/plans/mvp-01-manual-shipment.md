@@ -240,6 +240,17 @@ Three facts that settle earlier open questions:
 `#/create-single-shipment` (cost) → `.../quotation` (carrier) → `.../customer` (recipient) →
 pending capture (confirmation, where the create button lives).
 
+### Sucursal — Screen Entry — verified: direct URL navigation
+
+**Resolved (2026-11-19):** navigating directly to the app frame URL
+`https://services-ne-app-front-ar.nuvemshop.com.br/agency-shipment` (admin hash
+`#/agency-shipment`) loads Screen P directly — the `Agregar envío manual` dropdown is **not**
+needed. Verified by the operator loading the admin URL in the browser. The executor enters the
+sucursal journey by navigating to that route and asserting the `Envío manual a sucursal` heading.
+
+The dropdown capture attempts failed twice (the menu unmounts before the dump), and the direct
+navigation makes them moot.
+
 ### Sucursal — Screen P — `#/agency-shipment` → recipient + package
 
 First sucursal screen. No address section at all — the destination is only a postal code, entered

@@ -2,7 +2,7 @@ import { statSync } from 'node:fs';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import { readEnv, readEnvBool, readEnvInt } from './env';
 import { ExecutorError, messageOf } from './errors';
-import { storeAdminUrl } from './panel';
+import { storeAdminAgencyUrl, storeAdminUrl } from './panel';
 import { poll } from './wait';
 
 /**
@@ -289,18 +289,41 @@ export async function openSession(): Promise<Session> {
   return session;
 }
 
-async function ensureAdminPage(page: Page, timeoutMs: number): Promise<void> {
-  if (page.url().includes('/admin/apps/envionube')) return;
-  const target = storeAdminUrl();
+/**
+ * Navigates the page to one Envío Nube app entry point inside the existing
+ * session. Shared by the domicilio entry (`ensureAdminPage`) and the sucursal
+ * entry (`gotoAgencyEntry`): the navigation is never retried, and a failure is
+ * a session problem for a human, not a mystery timeout.
+ */
+async function gotoAppEntry(page: Page, target: string, timeoutMs: number, entry: string): Promise<void> {
   try {
     await page.goto(target, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
   } catch (error) {
-    throw new SessionError('could not open the Envío Nube manual-shipment entry point', [
+    throw new SessionError(`could not open the Envío Nube ${entry}`, [
       `target: ${target}`,
       `error: ${messageOf(error)}`,
       'the run does not retry: an unusable session must be fixed by a human',
     ]);
   }
+}
+
+async function ensureAdminPage(page: Page, timeoutMs: number): Promise<void> {
+  if (page.url().includes('/admin/apps/envionube')) return;
+  await gotoAppEntry(page, storeAdminUrl(), timeoutMs, 'manual-shipment entry point');
+}
+
+/**
+ * Navigates the already-open session to the **sucursal** entry point, reusing the
+ * same goto helper as the domicilio entry (plan §4c, "Sucursal — Screen Entry —
+ * verified: direct URL navigation"): the admin app at the verified agency hash
+ * `#/agency-shipment`, which mounts the app frame on `/agency-shipment` and shows
+ * Screen P directly. The `Agregar envío manual` dropdown is not needed and is
+ * never automated. Unlike `ensureAdminPage`, this navigates even when the admin
+ * app is already open: the domicilio entry hash must be replaced by the agency one.
+ */
+export async function gotoAgencyEntry(page: Page): Promise<void> {
+  const timeoutMs = readEnvInt('MDL_WAIT_TIMEOUT_MS', 60_000);
+  await gotoAppEntry(page, storeAdminAgencyUrl(), timeoutMs, 'sucursal entry point (#/agency-shipment)');
 }
 
 export interface UsableSessionOptions {

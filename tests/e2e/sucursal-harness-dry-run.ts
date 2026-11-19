@@ -4,7 +4,9 @@
  * `sucursalDryRunAgainst` path the real dry run uses, over the recorded panel
  * structure of `tests/unit/sucursal-harness.ts`, and prints the same readback
  * shape the live `npm run sucursal-dry-run` prints — plus the click evidence
- * that `Crear envío` was never clicked.
+ * that `Crear envío` was never clicked. The walk starts by the verified
+ * **direct URL navigation** to `#/agency-shipment`, so the printed entry is the
+ * agency route, not the domicilio entry point.
  *
  * Not part of `npm test`; run it with `npm run sucursal-harness-dry-run`.
  */
@@ -12,8 +14,19 @@ import { computeSucursalApprovalHash } from '../../src/cli/gates';
 import { parseMessage } from '../../src/core/parse-message';
 import { EnvioNube } from '../../src/executor/envioNube';
 import { ExecutorError } from '../../src/executor/errors';
+import { STORE_ORIGIN_VARIABLE } from '../../src/executor/panel';
 import { sucursalDryRunAgainst } from '../../src/executor/run';
 import { buildSucursalHarness } from '../unit/sucursal-harness';
+
+/**
+ * The walk enters by direct URL navigation, which composes the admin entry URL
+ * from `MDL_STORE_ORIGIN`. This offline harness run carries a fictional `.test`
+ * origin (RFC 6761) — never a real store — and never overrides a value the
+ * operator already exported.
+ */
+if (process.env[STORE_ORIGIN_VARIABLE] === undefined) {
+  process.env[STORE_ORIGIN_VARIABLE] = 'https://tienda-ejemplo.test';
+}
 
 /**
  * Fictional message (R11) with the real branch name observed for CP 1419
@@ -75,6 +88,11 @@ async function main(): Promise<number> {
   try {
     const result = await sucursalDryRunAgainst(panel, request, approvedPayloadHash);
 
+    section('Entry — verified: direct URL navigation (no Agregar envío manual dropdown)');
+    line('admin hash navigated', `#/agency-shipment`);
+    line('navigations recorded by the fake panel', harness.navigations);
+    line('screen P frame url', result.journey.screen.url);
+
     section('Screen P — #/agency-shipment: recipient + package (read back from the panel)');
     line('frame url', result.journey.screen.url);
     line('units', result.journey.screen.units);
@@ -115,6 +133,10 @@ async function main(): Promise<number> {
     }
     if (harness.createClickCount() !== 0) {
       console.error('\nFAILED: the dry run clicked "Crear envío". That must be impossible.');
+      return 1;
+    }
+    if (harness.navigations.length !== 1 || harness.navigations[0] !== '/agency-shipment') {
+      console.error(`\nFAILED: the walk must enter by the agency route (navigations: ${JSON.stringify(harness.navigations)}).`);
       return 1;
     }
 

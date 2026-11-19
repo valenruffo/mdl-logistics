@@ -11,11 +11,8 @@ import { hashApprovalPayload, type ApprovalPayload } from './approval';
 import { copyPattern } from './copy';
 import { ExecutorError, UnknownOutcomeError, detailsOf, messageOf } from './errors';
 import { readEnvInt } from './env';
-import {
-  adminAppDashboardUrl,
-  BOT_CHALLENGE_FRAME_HOST,
-  ENVIO_NUBE_FRAME_HOST,
-} from './panel';
+import { adminAppDashboardUrl, BOT_CHALLENGE_FRAME_HOST, ENVIO_NUBE_FRAME_HOST, VERIFIED_AGENCY_PANEL_URL } from './panel';
+import { gotoAgencyEntry } from './session';
 import { poll, sleep } from './wait';
 
 export { ENVIO_NUBE_FRAME_HOST };
@@ -58,6 +55,7 @@ export const HEADINGS = {
   quotation: 'Seleccionar medio de envío',
   customer: 'Completar datos del destinatario',
   summary: 'Resumen del envío',
+  agency: 'Envío manual a sucursal',
 } as const;
 
 /** `CARRIER_NAME` (S8, `Andreani a domicilio`) lives in `core/carrier.ts`: the
@@ -1297,6 +1295,27 @@ export class EnvioNube {
     return lines;
   }
 
+  // -------------------------------- sucursal entry: verified direct URL navigation
+
+  /**
+   * Enters the sucursal journey by **direct URL navigation** (plan §4c, "Sucursal —
+   * Screen Entry — verified: direct URL navigation"): the session's admin page is
+   * loaded at the verified agency hash `#/agency-shipment`, which mounts the app
+   * frame at the verified panel URL and shows Screen P directly. The `Agregar envío
+   * manual` dropdown is **not** needed and is never automated — the dropdown branch
+   * is exactly what an entry through the shared domicilio URL would wrongly require.
+   *
+   * The entry is proven before anything is filled: the frame must sit on the
+   * `/agency-shipment` route **and** show the `Envío manual a sucursal` heading.
+   * Reuses the session layer's goto helper, the same one the domicilio entry uses.
+   */
+  async openAgencyEntry(): Promise<void> {
+    await gotoAgencyEntry(this.page);
+    const frame = await this.waitForRoute(AGENCY_ROUTES.recipient);
+    await this.waitForHeading(frame, HEADINGS.agency, 'sucursal screen P (#/agency-shipment)');
+    this.note(`entered the sucursal journey by direct navigation to ${VERIFIED_AGENCY_PANEL_URL} (admin hash #/agency-shipment)`);
+  }
+
   // -------------------------------- sucursal screen P: recipient + package
 
   /** Everything the panel holds on screen P, for a loud stop. */
@@ -1426,7 +1445,8 @@ export class EnvioNube {
     };
   }
 
-  /** Advances to screen Q, asserting the route change (screen P has no verified heading). */
+  /** Advances to screen Q, asserting the route change. Screen P's own heading
+   * (`Envío manual a sucursal`) was already asserted at entry (`openAgencyEntry`). */
   async continueFromAgencyRecipient(): Promise<void> {
     const frame = await this.waitForRoute(AGENCY_ROUTES.recipient);
     await this.clickContinue(frame, 'sucursal screen P (#/agency-shipment)');
