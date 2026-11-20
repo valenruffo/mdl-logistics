@@ -134,6 +134,8 @@ interface Harness {
   text(id: string): string;
   navigated: string[];
   runGate: RunGate;
+  /** Every URL the client fetched, in order (the rail re-fetch assertions read this). */
+  fetches: string[];
   /** Fires the progress card's interval callback once (the injected clock). */
   tick(): void;
   /** How many times the client cleared its interval. */
@@ -185,7 +187,9 @@ async function boot(modality: 'domicilio' | 'sucursal'): Promise<Harness> {
     reject: (status, body) => settleRun!(failResponse(status, body)),
   };
 
+  const fetchLog: string[] = [];
   const fetchStub = async (url: string) => {
+    fetchLog.push(url);
     if (url === '/api/console') return okResponse(CONSOLE_SNAPSHOT);
     if (url === '/api/analyze') return okResponse(analysis);
     if (url === '/api/run') return await runPromise;
@@ -253,6 +257,7 @@ async function boot(modality: 'domicilio' | 'sucursal'): Promise<Harness> {
     text: (id) => node(id).textContent,
     navigated,
     runGate,
+    fetches: fetchLog,
     tick: () => {
       assert.ok(intervalCallback, 'the progress timer should still be scheduled');
       assert.equal(intervalMs, 2000, 'the progress timer ticks every two seconds');
@@ -573,4 +578,69 @@ test('the client script still opens no native dialog and injects no markup', () 
   // The progress card and the error tiers are built with createElement/textContent.
   assert.match(CLIENT_JS, /createElement\('details'\)/, 'the technical block is a real <details>');
   assert.match(CLIENT_JS, /textContent/, 'every value is written as text');
+});
+
+// --------------------------------------------------------- 6. the queue loop
+
+/**
+ * The operator's request verbatim: "debería haber un sistema de encolación …
+ * pongo uno analizo lo mando, ahí se me debería limpiar, mando otro y así y
+ * abajo que se vayan encolando". After a confirmed `created` only the inputs
+ * reset — the result card keeps the `#EM` — and after any response the rail is
+ * re-fetched so the new run shows up below without a reload.
+ */
+
+function consoleReads(page: Harness): number {
+  return page.fetches.filter((url) => url === '/api/console').length;
+}
+
+test('after a created run the inputs reset and the confirmation stays on screen', async () => {
+  const page = await boot('domicilio');
+  const readsBeforeRun = consoleReads(page);
+
+  page.runGate.settle(CREATED_BODY);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  // The confirmation is not wiped: the result keeps the created #EM.
+  assert.match(page.text('result'), /Envío creado: #EM1055/);
+
+  // The inputs are empty again: the next message can be pasted right away.
+  assert.equal(page.node('message').value, '', 'the message textarea is cleared');
+  assert.equal(page.text('message-badge'), 'sin datos', 'the badge follows the emptied message');
+  assert.equal(
+    page.node('shipment-form').querySelectorAll('[data-key]').length, 0,
+    'the analyzed fields are gone from the form',
+  );
+  assert.equal(page.node('warnings').children.length, 0, 'the parser warnings are gone');
+  assert.equal(page.node('rejection').children.length, 0);
+  assert.equal(page.node('data-empty').hidden, false, 'the paste-a-message hint is back');
+  assert.match(page.text('data-badge'), /sin analizar/, 'the preview badge is reset');
+  assert.equal(page.node('create').disabled, true, 'create waits for the next analyze');
+  assert.match(page.text('analyze-status'), /pegá el siguiente mensaje/, 'the queue state is named on screen');
+
+  // The rail was re-fetched after the response: the new run shows below.
+  assert.ok(consoleReads(page) > readsBeforeRun, 'the rail data was re-fetched after the created response');
+});
+
+test('after a refused run the form stays as-is so the operator can fix and retry', async () => {
+  const page = await boot('domicilio');
+  const readsBeforeRun = consoleReads(page);
+
+  page.runGate.settle(UNRESOLVED_REFUSAL);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  // The refusal card is on screen.
+  assert.match(page.text('result'), /Este mensaje ya tiene una corrida sin resolver\./);
+
+  // Nothing was cleared: the message and the analyzed fields are untouched.
+  assert.equal(page.node('message').value, HAPPY_MESSAGE, 'the message is kept for a fix-and-retry');
+  assert.ok(
+    page.node('shipment-form').querySelectorAll('[data-key]').length > 0,
+    'the analyzed fields are still on the form',
+  );
+  assert.equal(page.node('data-empty').hidden, true, 'the analyzed preview stays (the hint stays hidden)');
+
+  // The rail was re-fetched even on a refusal.
+  assert.ok(consoleReads(page) > readsBeforeRun, 'the rail data was re-fetched after the refusal too');
 });

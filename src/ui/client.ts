@@ -13,6 +13,11 @@
  *   `Probar en seco` button is gone; the executor's dry run stays a dev-tool
  *   capability). It never computes or echoes an approval hash and there is no
  *   token input to fill: creating a shipment costs nothing (R10 as amended).
+ * - **A queue, not a one-shot.** A confirmed `created` resets only the inputs —
+ *   message, fields, preview — so the operator pastes the next message right
+ *   away; the result card keeps showing the created `#EM`. A failure or a
+ *   refusal keeps the form untouched for a fix-and-retry, and every run
+ *   response re-fetches the rail so the new run shows up without a reload.
  * - **No markup injection.** Every value shown comes from a server response and
  *   is written with `textContent`/`createElement`: pasted data, panel text, file
  *   names and record fields are never interpreted as HTML.
@@ -603,6 +608,10 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
 
     post('/api/run', { message: state.message, form: collect(), mode: 'create' }).then(function (data) {
       renderResult(data);
+      // The queue: only a confirmed creation clears the inputs; any other
+      // outcome keeps the form as-is for a fix-and-retry. Either way the rail
+      // is re-read so the new run shows up below without a reload.
+      if (data.status === 'created') resetForNextShipment();
       loadConsole(null);
     }).catch(function (error) {
       renderRunFailure(error);
@@ -612,6 +621,29 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
       state.busy = false;
       syncButtons();
     });
+  }
+
+  /**
+   * The queue step the operator asked for: after a confirmed creation only the
+   * inputs reset — message, fields, preview — so the next message can be pasted
+   * immediately. The result card is not touched: it keeps showing the created
+   * shipment id until the next analyze clears it. A failure or refusal never calls
+   * this: the operator fixes the form and retries without re-pasting.
+   */
+  function resetForNextShipment() {
+    state.message = '';
+    state.analyzed = false;
+    state.modalidad = null;
+    state.fieldsByModalidad = null;
+    byId('message').value = '';
+    updateMessageBadge();
+    clear(byId('shipment-form'));
+    clear(byId('warnings'));
+    clear(byId('rejection'));
+    show('data-empty', true);
+    setText('data-badge', 'sin analizar');
+    setStatus('analyze-status', 'En cola: pegá el siguiente mensaje y tocá Analizar.', null);
+    syncButtons();
   }
 
   /**
