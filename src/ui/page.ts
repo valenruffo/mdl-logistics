@@ -37,8 +37,23 @@ import { CARRIER_NAME } from '../core/carrier';
  * there; the page cannot know one without shelling out to `git` at runtime, so it
  * prints the package version instead. `tests/unit/ui-flow.test.ts` pins it to
  * `package.json`, so the two cannot drift apart.
+ *
+ * The standing rule: every deploy that ships changes bumps the minor version
+ * here and adds a line to `CHANGELOG` below, so the operator can tell from the
+ * sidebar whether the deployed page is the version of the change.
  */
-export const APP_VERSION = '0.1.0';
+export const APP_VERSION = '0.2.0';
+
+/**
+ * What each shipped version carried, newest first, maintained by hand. The
+ * rail's footer turns this into a CSS-only popover: tapping the version opens
+ * the list, so the operator reads what changed without a dialog or any script.
+ * Keep it to the last few versions.
+ */
+export const CHANGELOG: ReadonlyArray<{ readonly version: string; readonly note: string }> = [
+  { version: '0.2.0', note: 'sucursal punta a punta, cola de envíos, progreso por pasos, match por calle+número' },
+  { version: '0.1.0', note: 'MVP domicilio' },
+];
 
 export const PAGE_HTML = `<!doctype html>
 <html lang="es">
@@ -118,6 +133,23 @@ export const PAGE_HTML = `<!doctype html>
   .rail .rail-line { color:var(--rail-muted); font-size:11.5px; margin:8px 0 0; }
   .rail .inline-status { color:var(--rail-muted); font-size:11.5px; }
   .rail footer { margin-top:auto; font-size:11px; color:var(--rail-muted); display:flex; justify-content:space-between; gap:8px; }
+  /* The version popover: the operator taps the version in the footer and reads
+     what each recent version shipped. CSS only — a hidden checkbox toggled by
+     the label, shown on :checked and on keyboard focus, never a dialog and
+     never a line of script. The colours are the rail's own tokens, so the
+     measured contrast pairs hold in both themes. */
+  .ver { position:relative; }
+  .ver-toggle { position:absolute; width:1px; height:1px; padding:0; margin:0; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
+  .ver-label { cursor:pointer; }
+  .ver-label:hover { color:var(--rail-ink); }
+  .ver-toggle:focus-visible + .ver-label { outline:2px solid var(--rail-focus); outline-offset:2px; border-radius:4px; }
+  .ver-popover { display:none; position:absolute; right:0; bottom:calc(100% + 8px); width:240px; padding:10px 12px;
+                 background:var(--rail-hover); border:1px solid var(--rail-edge); border-radius:8px;
+                 color:var(--rail-ink); font-size:11.5px; line-height:1.45; z-index:10; }
+  .ver-toggle:checked ~ .ver-popover, .ver-toggle:focus-visible ~ .ver-popover { display:block; }
+  .ver-entry { display:block; }
+  .ver-entry + .ver-entry { margin-top:6px; }
+  .ver-entry strong { font-weight:650; }
   /* Small and quiet: one line in the corner, not a control that competes. */
   .rail button.rail-toggle { width:auto; align-self:center; margin-top:0; padding:2px 6px; font-size:10.5px;
                              border-color:transparent; color:var(--rail-muted); font-weight:500; }
@@ -279,7 +311,15 @@ export const PAGE_HTML = `<!doctype html>
       <div id="rail-warnings"></div>
     </section>
 
-    <footer><span id="rail-open">leyendo intentos…</span><span>v${APP_VERSION}</span></footer>
+    <footer><span id="rail-open">leyendo intentos…</span><span class="ver">\
+      <input type="checkbox" id="ver-changelog" class="ver-toggle" aria-label="Qué cambió en cada versión">\
+      <label for="ver-changelog" class="ver-label">v${APP_VERSION}</label>\
+      <span class="ver-popover" role="note" aria-label="Qué cambió en cada versión">\
+        ${CHANGELOG.map(
+          (entry) => `<span class="ver-entry"><strong>v${entry.version}</strong> — ${entry.note}</span>`,
+        ).join('\n        ')}\
+      </span>\
+    </span></footer>
     <button type="button" id="logout">Cerrar sesión</button>
   </aside>
 
