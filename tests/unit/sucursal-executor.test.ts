@@ -25,6 +25,7 @@ import {
 import { parseArsAmount } from '../../src/executor/currency';
 import { ExecutorError, PreClickAbortError } from '../../src/executor/errors';
 import { STORE_ORIGIN_VARIABLE } from '../../src/executor/panel';
+import { DASHBOARD_WAIT_VARIABLE, gotoAgencyEntry } from '../../src/executor/session';
 import { sucursalCreateAgainst, sucursalDryRunAgainst, walkSucursalToQuotation } from '../../src/executor/run';
 import { buildSucursalHarness, DEFAULT_BRANCHES, type HarnessOption, type SucursalHarness } from './sucursal-harness';
 
@@ -453,6 +454,42 @@ test('the fallback never runs when the two-hop entry lands on /agency-shipment',
 
   assert.ok(!harness.clicks.includes('Agregar envío manual'), 'the dashboard UI path was never clicked');
   assert.ok(!harness.clicks.includes('A sucursal'), 'the dropdown option was never clicked');
+});
+
+test('the dashboard wait is pacing: it never consumes the goto budget at the hop boundary (≤ 3 s)', async () => {
+  // Models the measured live cost: between the two entry gotos the executor
+  // waits for the dashboard frame route. The wait is pacing, not a gate — when
+  // the frame never mounts there (an ignored dashboard hash hop), the wait must
+  // cap at its short budget and hop 2 must still run exactly once, never
+  // burning the 60 s goto budget between the hops.
+  const previousWait = process.env[DASHBOARD_WAIT_VARIABLE];
+  process.env[DASHBOARD_WAIT_VARIABLE] = '250';
+  try {
+    const harness = buildSucursalHarness({
+      initialPath: '/create-single-shipment',
+      ignoredHashRoutes: ['/dashboard'],
+    });
+
+    await gotoAgencyEntry(harness.page);
+
+    assert.equal(harness.gotoTimes().length, 2, 'both entry hops ran exactly once despite the never-mounting dashboard');
+    const gap = (harness.gotoTimes()[1] ?? 0) - (harness.gotoTimes()[0] ?? 0);
+    assert.ok(gap <= 3_000, `the dashboard wait must not consume the goto budget (elapsed ${gap} ms between the hops)`);
+  } finally {
+    if (previousWait === undefined) delete process.env[DASHBOARD_WAIT_VARIABLE];
+    else process.env[DASHBOARD_WAIT_VARIABLE] = previousWait;
+  }
+
+  // And the very likely case — the frame is already on `/dashboard` after hop 1
+  // — must proceed to hop 2 immediately: the gap at the hop boundary stays far
+  // below the budget because the first probe already sees the mounted route.
+  const mountedHarness = buildSucursalHarness();
+  await gotoAgencyEntry(mountedHarness.page);
+
+  assert.equal(mountedHarness.gotoTimes().length, 2, 'both entry hops ran exactly once');
+  assert.deepEqual(mountedHarness.navigations, ['/dashboard', '/agency-shipment'], 'the two-hop entry still walks dashboard → agency');
+  const mountedGap = (mountedHarness.gotoTimes()[1] ?? 0) - (mountedHarness.gotoTimes()[0] ?? 0);
+  assert.ok(mountedGap <= 3_000, `a mounted dashboard proceeds to hop 2 immediately (elapsed ${mountedGap} ms)`);
 });
 
 test('a weight shown in kg aborts screen P with nothing package-related filled', async () => {

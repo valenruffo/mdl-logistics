@@ -81,6 +81,8 @@ export interface SucursalHarness {
   clicks: readonly string[];
   /** Every screen path the fake page was navigated to, in order — the entry evidence. */
   navigations: readonly string[];
+  /** Wall-clock ms timestamp of every fake goto, in order — the pacing evidence between the two entry hops. */
+  gotoTimes(): readonly number[];
   /** Current frame path (`/agency-shipment`, `/agency-shipment/quotation`, …). */
   framePath(): string;
   /** Values of every named input/select on the current screen. */
@@ -478,6 +480,8 @@ const QUOTATION_TICK_MS = 120;
 class Harness {
   readonly clicks: string[] = [];
   private readonly navigations: string[] = [];
+  /** Wall-clock ms timestamp of every goto, in order: the pacing evidence between hops. */
+  private readonly gotoTimes: number[] = [];
   private readonly screens = new Map<string, El>();
   /** Hash routes the SPA ignores, modeling the observed live panel failure. */
   private readonly ignoredHashRoutes: ReadonlySet<string>;
@@ -565,6 +569,11 @@ class Harness {
     this.createClicked += 1;
   }
 
+  /** Timestamps the pacing wait between the two entry hops: one stamp per fake goto. */
+  recordGoto(): void {
+    this.gotoTimes.push(Date.now());
+  }
+
   /**
    * Registers screen Q's deferred quotation reveal. `'tick'` reveals after a
    * short timer (unref'd, so it never holds the test process open); `'change'`
@@ -609,6 +618,7 @@ class Harness {
       framePath: (): string => this.currentPath,
       clicks: this.clicks as readonly string[],
       navigations: this.navigations as readonly string[],
+      gotoTimes: (): readonly number[] => this.gotoTimes,
       inputValues: (): Record<string, string> => {
         // Merged across every screen: the walk ends on screen Q, but the screen-P
         // fills are part of the same run and the same fake panel.
@@ -665,6 +675,7 @@ class FakePage {
 
   /** Same shape as `Page.goto`; the options are accepted and ignored. */
   async goto(url: string, _options?: { waitUntil?: string; timeout?: number }): Promise<void> {
+    this.harness.recordGoto();
     this.harness.gotoFromUrl(url);
   }
 
@@ -917,6 +928,7 @@ export function buildSucursalHarness(options: HarnessOptions = {}): SucursalHarn
       return harness.state().navigations;
     },
     framePath: harness.state().framePath,
+    gotoTimes: harness.state().gotoTimes,
     inputValues: harness.state().inputValues,
     selectedBranchValue: harness.state().selectedBranchValue,
     checkedFreightLabel: harness.state().checkedFreightLabel,

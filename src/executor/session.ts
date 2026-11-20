@@ -322,6 +322,20 @@ async function gotoAppEntry(page: Page, target: string, timeoutMs: number, entry
 const DASHBOARD_FRAME_ROUTE = '/dashboard';
 
 /**
+ * Default short budget (ms) for the dashboard frame-route wait between the two
+ * entry hops. The wait is **pacing, not a gate**: the frame mounts on
+ * `/dashboard` almost immediately, so a budget of the full goto timeout (60 s)
+ * just burned ~60 s doing nothing (measured live: the whole sucursal journey
+ * spent 61 s waiting between the hops). Three seconds is enough to let a slow
+ * mount land, and hop 2 runs either way — the `/agency-shipment` verdict of
+ * `openAgencyEntry` remains the real gate. Overridable for the offline tests.
+ */
+export const DASHBOARD_WAIT_MS = 3_000;
+
+/** Env switch that overrides the pacing budget; an unusable value falls back to the default. */
+export const DASHBOARD_WAIT_VARIABLE = 'MDL_DASHBOARD_WAIT_MS';
+
+/**
  * The URL of the Envío Nube frame when it sits on `route`, or `null`. One
  * non-throwing probe for the bounded dashboard wait below.
  */
@@ -351,8 +365,9 @@ async function ensureAdminPage(page: Page, timeoutMs: number): Promise<void> {
  * SPA router. So the walk is:
  *
  * 1. goto the dashboard entry (`<origin>/admin/apps/envionube/ar#/dashboard`,
- *    the verified dashboard URL constant) and wait, bounded, for the app frame
- *    to sit on `/dashboard`;
+ *    the verified dashboard URL constant) and wait, bounded to a **short pacing
+ *    budget** (`DASHBOARD_WAIT_MS`, not the goto timeout), for the app frame to
+ *    sit on `/dashboard`;
  * 2. goto the agency hash (`#/agency-shipment`).
  *
  * Each hop is a single goto: no hop is ever retried. If the dashboard frame
@@ -364,12 +379,16 @@ async function ensureAdminPage(page: Page, timeoutMs: number): Promise<void> {
  */
 export async function gotoAgencyEntry(page: Page): Promise<void> {
   const timeoutMs = readEnvInt('MDL_WAIT_TIMEOUT_MS', 60_000);
+  const dashboardWaitMs = readEnvInt(DASHBOARD_WAIT_VARIABLE, DASHBOARD_WAIT_MS);
   // Hop 1 — the dashboard entry, which mounts the app frame on `/dashboard`.
   await gotoAppEntry(page, adminAppDashboardUrl(), timeoutMs, 'dashboard entry point (#/dashboard)');
-  // Bounded wait for the dashboard frame route, reusing the poll machinery. It
-  // paces the two hops; it is not a gate — the second hop happens exactly once
-  // either way, and the agency route assertion decides the outcome.
-  await poll(() => Promise.resolve(envioNubeFrameUrlOnRoute(page, DASHBOARD_FRAME_ROUTE)), { timeoutMs });
+  // Short pacing wait for the dashboard frame route, reusing the poll machinery.
+  // It spaces the two hops; it is not a gate and never throws — if the frame did
+  // not mount on `/dashboard` within the short budget, hop 2 happens anyway
+  // (it re-routes from any state), and the agency route assertion decides the
+  // outcome. The budget is deliberately NOT the goto timeout: the frame mounts
+  // almost immediately, and a full-budget wait here is a dead wait.
+  await poll(() => Promise.resolve(envioNubeFrameUrlOnRoute(page, DASHBOARD_FRAME_ROUTE)), { timeoutMs: dashboardWaitMs });
   // Hop 2 — the agency hash, which the SPA re-routes from the dashboard.
   await gotoAppEntry(page, storeAdminAgencyUrl(), timeoutMs, 'sucursal entry point (#/agency-shipment)');
 }
