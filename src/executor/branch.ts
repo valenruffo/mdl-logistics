@@ -66,13 +66,26 @@ function stripDecorativeStreetPrefix(streetTokens: readonly string[]): string[] 
 }
 
 /**
- * Parses the `(street, number)` pair out of a branch text: the **last** digit
- * token is the street number and the run of non-digit tokens immediately before
- * it is the street (decorative prefixes stripped). Returns `null` when there is
- * no number, or the number leads the text with no street in front of it — a
- * number alone is never an identity, and a street alone is never a match.
+ * Leading dash-separated decoration of the panel's option text — the panel
+ * separates its own decoration from the address with a whitespace-dash
+ * separator (`Jujuy (Centro) - `, `Sucursal - `). A dash segment that carries
+ * no digit token can never hold the street number, so it is decoration and is
+ * dropped; the first digit-bearing segment is the address itself, dashes and
+ * all. Returns the text unchanged when there is no separator.
  */
-export function parseStreetNumberPair(text: string): StreetNumberPair | null {
+function stripDashSeparatedDecoration(text: string): string {
+  let rest = text;
+  for (;;) {
+    const separator = /\s[-–—]\s/.exec(rest);
+    if (separator === null) return rest;
+    const head = rest.slice(0, separator.index);
+    rest = rest.slice(separator.index + separator[0].length);
+    if (tokensOf(head).some((token) => /^\d+$/.test(token))) return text;
+  }
+}
+
+/** The token-level parse: the street run immediately before the last digit token. */
+function parsePairFromTokens(text: string): StreetNumberPair | null {
   const tokens = tokensOf(text);
   let numberIndex = -1;
   for (let index = tokens.length - 1; index >= 0; index--) {
@@ -89,6 +102,28 @@ export function parseStreetNumberPair(text: string): StreetNumberPair | null {
   const stripped = stripDecorativeStreetPrefix(street);
   if (stripped.length === 0) return null;
   return { street: stripped.join(' '), number: tokens[numberIndex]! };
+}
+
+/**
+ * Parses the `(street, number)` pair out of a branch text — the **one
+ * extraction** shared by the pair matcher and `branchIdentity`, so both sides
+ * of every comparison use the same adjacency: the street is the run of
+ * non-digit tokens immediately before the last digit token (the number), with
+ * decorative prefixes stripped. The panel's dash-separated decoration
+ * (`Jujuy (Centro) - Gral. San Martín, 979, …`) is dropped before the parse;
+ * if dropping it yields no pair, the full text parses instead, so a dash
+ * inside the address itself (`Av. X - 1234`) keeps its pair. Returns `null`
+ * when there is no number, or the number leads the text with no street in
+ * front of it — a number alone is never an identity, and a street alone is
+ * never a match.
+ */
+export function parseStreetNumberPair(text: string): StreetNumberPair | null {
+  const address = stripDashSeparatedDecoration(text);
+  if (address !== text) {
+    const pair = parsePairFromTokens(address);
+    if (pair !== null) return pair;
+  }
+  return parsePairFromTokens(text);
 }
 
 /** True when `tokens` contains `needle` as a contiguous token run. */
@@ -132,12 +167,15 @@ export function textContainsStreetNumberPair(text: string, pair: StreetNumberPai
 
 /**
  * The identity string used for every branch comparison (approval hash and
- * readback diff): `street #number` when a pair can be parsed, else the
- * normalized full text (a branch name with no number keeps exact-text
- * identity). The panel's `Sucursal - Gral. San Martin 979 San Salvador de
- * Jujuy, Jujuy` and the customer's `Gral. San Martin 979 San Salvador de Jujuy`
- * share one identity; two branches on the same street with different numbers
- * never do.
+ * readback diff): `street #number` when a pair can be parsed — by the **same
+ * extraction** the pair matcher uses (`parseStreetNumberPair`: same punctuation
+ * stripping, same adjacency, same decorative-prefix and dash-decoration
+ * stripping) — else the normalized full text (a branch name with no number
+ * keeps exact-text identity). The panel's `Sucursal - Gral. San Martin 979 San
+ * Salvador de Jujuy, Jujuy`, its echoed `Jujuy (Centro) - Gral. San Martín,
+ * 979, San Salvador De Jujuy, Jujuy` and the customer's `Gral. San Martin 979
+ * San Salvador de Jujuy` share one identity; two branches on the same street
+ * with different numbers never do.
  */
 export function branchIdentity(name: string): string {
   const pair = parseStreetNumberPair(name);

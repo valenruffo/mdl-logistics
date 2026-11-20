@@ -342,6 +342,35 @@ test('dry run: walks both screens, selects carrier and branch, and never clicks 
   assert.equal(result.journey.branch.selectedText, DEFAULT_BRANCHES[0].text);
 });
 
+test('the live readback failure end to end: the `Jujuy (Centro) - ` echoed option text verifies by identity', async () => {
+  // The observed live CP-4800 dropdown shape: the real branch carries the
+  // `Jujuy (Centro) - ` prefix and a comma before the number, and the panel
+  // echoes that decorated text back after the write. The walk must select it
+  // by street+number pair AND the post-write readback must agree by the same
+  // identity — select → readback → identity equal → success.
+  const branches: HarnessOption[] = [
+    { value: 'uuid-4600-real', text: 'Jujuy (Centro) - Gral. San Martín, 979, San Salvador De Jujuy, Jujuy' },
+    {
+      value: 'uuid-4600-hop',
+      text: 'Punto Andreani Hop Lamadrid 177 - Lamadrid, 177 Entrecalles gral san martin e independencia, San Salvador De Jujuy, Jujuy',
+    },
+  ];
+  const harness = buildSucursalHarness({ branches });
+  const panel = newPanel(harness);
+  const request = { ...REQUEST, zipCode: '4800', sucursal: 'Gral. San Martin 979 San Salvador de Jujuy' };
+  const result = await sucursalDryRunAgainst(panel, request, computeSucursalApprovalHash(request));
+
+  assert.equal(result.journey.branch.selectedValue, 'uuid-4600-real', 'the bare approved name pinned the decorated option');
+  assert.equal(
+    result.journey.branch.selectedText,
+    'Jujuy (Centro) - Gral. San Martín, 979, San Salvador De Jujuy, Jujuy',
+    'the readback is the panel\'s own decorated spelling, verified by identity, not rejected',
+  );
+  assert.equal(result.formMatchesApproval, true);
+  assert.deepEqual(result.mismatches, []);
+  assert.equal(harness.createClickCount(), 0, 'the dry run never creates the shipment');
+});
+
 test('the walk enters by the two-hop navigation to the agency route, never the domicilio entry', async () => {
   const harness = buildSucursalHarness();
   const panel = newPanel(harness);

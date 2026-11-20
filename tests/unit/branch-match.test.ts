@@ -81,6 +81,47 @@ test('the parsed pair is (street AND number); decorative tokens never participat
   assert.notEqual(branchIdentity('San Martin 979'), branchIdentity('San Martin 1327'));
 });
 
+test('the live CP-4800 readback: the panel\'s echoed `Jujuy (Centro) - ` option text shares the approved identity', () => {
+  // The observed live readback, verbatim: the panel echoed its own option text
+  // (`Jujuy (Centro) - ` prefix, comma before the number, trailing city) after
+  // the walk had selected it — and the readback check rejected the branch it
+  // had itself matched, because the identity extraction folded the decorative
+  // prefix into the street. One extraction for both sides: the identity of the
+  // readback is the identity of the approved bare name.
+  const approved = 'Gral. San Martin 979 San Salvador de Jujuy';
+  const readback = 'Jujuy (Centro) - Gral. San Martín, 979, San Salvador De Jujuy, Jujuy';
+  assert.equal(branchIdentity(readback), 'gral san martin #979');
+  assert.equal(branchIdentity(approved), 'gral san martin #979');
+  assert.equal(branchIdentity(readback), branchIdentity(approved), 'select → readback → identity equal');
+  assert.deepEqual(parseStreetNumberPair(readback), { street: 'gral san martin', number: '979' });
+
+  // Stacked decoration and the known `Sucursal - ` form parse to the same pair.
+  assert.deepEqual(
+    parseStreetNumberPair('Sucursal - Jujuy (Centro) - Gral. San Martín, 979, San Salvador De Jujuy, Jujuy'),
+    { street: 'gral san martin', number: '979' },
+  );
+});
+
+test('a dash inside the address itself never splits the pair', () => {
+  // A dash after the number (street number, then ` - ` + city): the address
+  // spans the dash, so the pair keeps the street tokens before the number.
+  assert.deepEqual(parseStreetNumberPair('Gral. San Martin 979 - San Salvador de Jujuy'), {
+    street: 'gral san martin',
+    number: '979',
+  });
+  // A dash between the street and the number (`Av. X - 1234`): dropping the
+  // dash prefix would leave a bare number (no street), so the full text parses.
+  assert.deepEqual(parseStreetNumberPair('Av. Almirante Brown - 1234'), {
+    street: 'av almirante brown',
+    number: '1234',
+  });
+  // A digit-bearing dash segment is part of the address, never decoration.
+  assert.deepEqual(parseStreetNumberPair('Sucursal 2 - Gral. San Martin 979, Jujuy'), {
+    street: 'gral san martin',
+    number: '979',
+  });
+});
+
 test('a name whose street+number pair matches nothing is a rejection listing all 13 options', () => {
   const match = matchSucursalBranch('Rivadavia 9999 San Salvador de Jujuy', JUJUY_OPTIONS);
   assert.equal(match.kind, 'none', 'zero candidates → rejection, never a guess');
