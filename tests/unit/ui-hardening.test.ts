@@ -458,21 +458,19 @@ test('a second browser request while one is running is a 409 that changes nothin
     await waitFor('the session check to start', () => runnerCalls === 1);
     assert.equal(browserLock.holder, 'session-check');
 
-    // The same lock guards the shipment route, both modes.
-    for (const mode of ['dry-run', 'create']) {
-      const refused = await authFetch(`${started.url}/api/run`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ mode }),
-      });
-      assert.equal(refused.status, 409, `POST /api/run (${mode}) must be refused while a check runs`);
-      const body = (await refused.json()) as { status: string; reason: string; heldBy: string };
-      assert.equal(body.status, 'busy');
-      assert.equal(body.reason, LOCK_BUSY_MESSAGE);
-      assert.match(body.reason, /un solo Chromium/, 'the message says why');
-      assert.match(body.reason, /no se cambió nada/, 'the message says nothing changed');
-      assert.equal(body.heldBy, 'session-check');
-    }
+    // The same lock guards the shipment route.
+    const refused = await authFetch(`${started.url}/api/run`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: 'create' }),
+    });
+    assert.equal(refused.status, 409, 'POST /api/run must be refused while a check runs');
+    const body = (await refused.json()) as { status: string; reason: string; heldBy: string };
+    assert.equal(body.status, 'busy');
+    assert.equal(body.reason, LOCK_BUSY_MESSAGE);
+    assert.match(body.reason, /un solo Chromium/, 'the message says why');
+    assert.match(body.reason, /no se cambió nada/, 'the message says nothing changed');
+    assert.equal(body.heldBy, 'session-check');
 
     // A second check is refused too, and it does not start a second browser.
     const secondCheck = await authFetch(`${started.url}/api/session-check`, { method: 'POST' });

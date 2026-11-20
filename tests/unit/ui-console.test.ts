@@ -407,54 +407,7 @@ test('an unresolved prior attempt for the same message refuses the creation', as
   assert.equal(fake.calls.length, 0, 'the panel is never driven for an unresolved message');
 });
 
-test('the same unresolved record does not block a dry run, which creates nothing', async () => {
-  const fake = fakeExecutor();
-  const d = await deps(fake.executor);
-
-  await writeAttemptRecord(d.recordDir, {
-    runId: '2026-01-01T00-00-00-000Z-bbbbbbbbbbbb',
-    recordedAt: '2026-01-01T00:00:00.000Z',
-    messageFile: '(pasted in the UI)',
-    messageHash: messageFingerprint(HAPPY_MESSAGE),
-    approvalHash: EXPECTED_HASH,
-    payload: approvalPayloadFromRequest(REQUEST, CARRIER_NAME),
-    confirmation: { expected: TOKEN, typed: TOKEN },
-    status: 'attempted-unresolved',
-    note: 'written before the click',
-  });
-
-  const result = await runAttempt(
-    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'dry-run' },
-    d,
-  );
-
-  assert.equal(result.status, 'dry-run');
-  if (result.status !== 'dry-run') return;
-  assert.ok(result.note !== null, 'the open prior attempt is still reported to the operator');
-  assert.match(result.note ?? '', /1 earlier run/);
-  assert.equal(fake.calls.length, 1);
-  assert.equal(fake.calls[0]?.kind, 'dry-run');
-});
-
 // --------------------------------------------------------------- 5. the outcome
-
-test('the dry run stops on the summary and reports the panel diff', async () => {
-  const fake = fakeExecutor();
-  const d = await deps(fake.executor);
-
-  const result = await runAttempt(
-    { message: HAPPY_MESSAGE, form: fixtureForm(), mode: 'dry-run' },
-    d,
-  );
-
-  assert.equal(result.status, 'dry-run');
-  if (result.status !== 'dry-run') return;
-  assert.equal(result.summaryReached, true);
-  assert.equal(result.formMatchesApproval, true);
-  assert.deepEqual(result.mismatches, []);
-  assert.match(result.payloadHash, /^[0-9a-f]{64}$/, 'the payload hash is the one the executor compares');
-  assert.equal(result.reportPath, 'artifacts/executor-fixture/dry-run.json');
-});
 
 test('a created shipment reports the id, the cost and the structural unpaid-label proof', async () => {
   const fake = fakeExecutor();
@@ -637,7 +590,7 @@ test('the server listens on 127.0.0.1 only and answers without CORS headers', as
     assert.match(html, /<textarea/, 'the page has the paste box');
     assert.match(html, /Analizar/);
     assert.match(html, /Crear envío/);
-    assert.match(html, /Probar en seco/);
+    assert.doesNotMatch(html, /Probar en seco/, 'the dry-run button is gone: create is the only run path');
     assert.doesNotMatch(html, /Aprobar estos datos/, 'the approval step is gone');
     assert.doesNotMatch(html, /Autorizar la creación/, 'the token step is gone');
   } finally {

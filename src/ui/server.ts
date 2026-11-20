@@ -428,21 +428,21 @@ export function createRoutes(deps: ActionDeps): Route[] {
     {
       method: 'POST',
       path: '/api/run',
-      purpose: 'recorre el panel en seco, o crea el envio: sin aprobacion ni token, solo el mensaje y los datos',
+      purpose: 'crea el envio: sin aprobacion ni token, solo el mensaje y los datos',
       public: false,
       handle: async (body) => {
         const parsed = parseBody(body);
         if (!parsed.ok) return json(400, { status: 'bad-request', reason: parsed.reason });
 
         const mode = textField(parsed.value, 'mode');
-        if (mode !== 'create' && mode !== 'dry-run') {
+        if (mode !== 'create') {
           return json(400, {
             status: 'bad-request',
-            reason: 'mode debe ser "dry-run" o "create"',
+            reason: 'mode debe ser "create"',
           });
         }
 
-        // Both modes drive the panel, so both take the one browser lock. The
+        // The run drives the panel, so it takes the one browser lock. The
         // duplicate check is read inside it too: it must not race a run that is
         // about to write its own record.
         const guarded = await withBrowserLock('run', async () =>

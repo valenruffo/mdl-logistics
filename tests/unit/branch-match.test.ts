@@ -63,13 +63,16 @@ test('the live Jujuy failure: the pasted bare name uniquely matches the decorate
   assert.equal(decorated.option.value, 'uuid-jujuy-01');
 });
 
-test('the parsed pair is (street AND number); decorative tokens never participate', () => {
+test('the parsed pair is the last word AND the number; decorative tokens never participate', () => {
+  // The operator's rule: within one CP addresses never repeat, so the last
+  // word before the number + the number is enough — the rest of the street
+  // name and the trailing city are decoration.
   const pair = parseStreetNumberPair('Gral. San Martin 979 San Salvador de Jujuy');
-  assert.deepEqual(pair, { street: 'gral san martin', number: '979' });
+  assert.deepEqual(pair, { street: 'martin', number: '979' });
 
   // The panel's decorated option text parses to the same identity.
   const decorated = parseStreetNumberPair('Sucursal - Gral. San Martin 979 San Salvador de Jujuy, Jujuy');
-  assert.deepEqual(decorated, { street: 'gral san martin', number: '979' }, 'the `Sucursal - ` prefix and trailing `, Jujuy` are stripped');
+  assert.deepEqual(decorated, { street: 'martin', number: '979' }, 'the `Sucursal - ` prefix and trailing `, Jujuy` are stripped');
 
   // The pair identity of both spellings is one string: what the approval hash
   // and the readback diff compare.
@@ -77,7 +80,7 @@ test('the parsed pair is (street AND number); decorative tokens never participat
     branchIdentity('Gral. San Martin 979 San Salvador de Jujuy'),
     branchIdentity('Sucursal - Gral. San Martin 979 San Salvador de Jujuy, Jujuy'),
   );
-  // ...and two branches on the same street with different numbers never share it.
+  // ...and two branches with different numbers never share it.
   assert.notEqual(branchIdentity('San Martin 979'), branchIdentity('San Martin 1327'));
 });
 
@@ -90,36 +93,77 @@ test('the live CP-4800 readback: the panel\'s echoed `Jujuy (Centro) - ` option 
   // readback is the identity of the approved bare name.
   const approved = 'Gral. San Martin 979 San Salvador de Jujuy';
   const readback = 'Jujuy (Centro) - Gral. San Martín, 979, San Salvador De Jujuy, Jujuy';
-  assert.equal(branchIdentity(readback), 'gral san martin #979');
-  assert.equal(branchIdentity(approved), 'gral san martin #979');
+  assert.equal(branchIdentity(readback), 'martin #979');
+  assert.equal(branchIdentity(approved), 'martin #979');
   assert.equal(branchIdentity(readback), branchIdentity(approved), 'select → readback → identity equal');
-  assert.deepEqual(parseStreetNumberPair(readback), { street: 'gral san martin', number: '979' });
+  assert.deepEqual(parseStreetNumberPair(readback), { street: 'martin', number: '979' });
 
   // Stacked decoration and the known `Sucursal - ` form parse to the same pair.
   assert.deepEqual(
     parseStreetNumberPair('Sucursal - Jujuy (Centro) - Gral. San Martín, 979, San Salvador De Jujuy, Jujuy'),
-    { street: 'gral san martin', number: '979' },
+    { street: 'martin', number: '979' },
   );
 });
 
 test('a dash inside the address itself never splits the pair', () => {
   // A dash after the number (street number, then ` - ` + city): the address
-  // spans the dash, so the pair keeps the street tokens before the number.
+  // spans the dash, so the pair keeps the last word before the number.
   assert.deepEqual(parseStreetNumberPair('Gral. San Martin 979 - San Salvador de Jujuy'), {
-    street: 'gral san martin',
+    street: 'martin',
     number: '979',
   });
   // A dash between the street and the number (`Av. X - 1234`): dropping the
-  // dash prefix would leave a bare number (no street), so the full text parses.
+  // dash prefix would leave a bare number (no word), so the full text parses.
   assert.deepEqual(parseStreetNumberPair('Av. Almirante Brown - 1234'), {
-    street: 'av almirante brown',
+    street: 'brown',
     number: '1234',
   });
   // A digit-bearing dash segment is part of the address, never decoration.
   assert.deepEqual(parseStreetNumberPair('Sucursal 2 - Gral. San Martin 979, Jujuy'), {
-    street: 'gral san martin',
+    street: 'martin',
     number: '979',
   });
+});
+
+test('the operator\'s beiro fixture: a bare `beiro 4470` matches the decorated Villa Beiró option', () => {
+  // The operator's example, verbatim: the customer writes `beiro 4470`, the
+  // panel offers the decorated option for the same address. The last word
+  // before the number + the number is the pair — `av`-style prefixes and the
+  // `Villa Beiró (Av Beiró)` panel decoration drop out by themselves.
+  const options: readonly BranchOption[] = [
+    {
+      index: 0,
+      value: 'uuid-beiro-real',
+      text: 'Villa Beiró (Av Beiró) - Av. Francisco Beiró, 4470, C.A.B.A., Buenos Aires',
+    },
+  ];
+  const match = matchSucursalBranch('beiro 4470', options);
+  assert.equal(match.kind, 'unique', 'the word+number pair pins the decorated option alone');
+  if (match.kind !== 'unique') throw new Error('unreachable');
+  assert.equal(match.rule, 'street-number-pair');
+  assert.equal(match.option.value, 'uuid-beiro-real');
+  assert.deepEqual(parseStreetNumberPair('beiro 4470'), { street: 'beiro', number: '4470' });
+  assert.equal(
+    branchIdentity('beiro 4470'),
+    branchIdentity('Villa Beiró (Av Beiró) - Av. Francisco Beiró, 4470, C.A.B.A., Buenos Aires'),
+    'the bare customer text and the panel option share one identity',
+  );
+
+  // The negative case: an option that mentions `beiro` with a DIFFERENT number
+  // is never a match — the pair is (word AND number).
+  const otherNumber: readonly BranchOption[] = [
+    {
+      index: 0,
+      value: 'uuid-beiro-4420',
+      text: 'Villa Beiró (Av Beiró) - Av. Francisco Beiró, 4420, C.A.B.A., Buenos Aires',
+    },
+  ];
+  const rejected = matchSucursalBranch('beiro 4470', otherNumber);
+  assert.equal(rejected.kind, 'none', 'same word, different number → rejection, never a guess');
+  if (rejected.kind !== 'none') throw new Error('unreachable');
+  assert.equal(rejected.rule, 'street-number-pair');
+  assert.equal(rejected.reason, 'street-without-number');
+  assert.deepEqual(rejected.nearMatches.map((option) => option.value), ['uuid-beiro-4420']);
 });
 
 test('a name whose street+number pair matches nothing is a rejection listing all 13 options', () => {
@@ -152,7 +196,7 @@ test('the live Jujuy CP-4600 failure: a street mention inside another option ent
   assert.equal(match.option.text, 'Jujuy (Centro) - Gral. San Martín, 979, San Salvador De Jujuy, Jujuy');
 });
 
-test('two options carrying the identical street+number pair are genuinely ambiguous; different numbers on the same street are not', () => {
+test('two options carrying the identical word+number pair are genuinely ambiguous; different numbers are not', () => {
   // Genuinely ambiguous: two options with the SAME pair — co-located duplicate
   // points. Rejection is the safe behavior.
   const duplicated: readonly BranchOption[] = [
@@ -207,8 +251,8 @@ test('no number in the approved name: the full-text fallback decides', () => {
   );
 });
 
-test('a street-only match with a different number never selects — the pair is (street AND number)', () => {
-  // `Balbin 1327`-style guard: the street matches but the number differs.
+test('a word-only match with a different number never selects — the pair is (word AND number)', () => {
+  // `Balbin 1327`-style guard: the word matches but the number differs.
   const options: readonly BranchOption[] = [
     { index: 0, value: 'uuid-1327', text: 'Sucursal - Gral. San Martin 1327, Jujuy' },
     { index: 1, value: 'uuid-otro', text: 'Sucursal - Corrientes 580, Jujuy' },

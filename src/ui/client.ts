@@ -9,7 +9,9 @@
  *   itself, in `#analyze-status`, `#run-status`, `#result` or the rail. The
  *   operator asked for that, and a test asserts it.
  * - **No creation ceremony.** The script posts the message, the values on screen
- *   and the mode. It never computes or echoes an approval hash and there is no
+ *   and the mode — always `create`: it is the only run path in the UI (the
+ *   `Probar en seco` button is gone; the executor's dry run stays a dev-tool
+ *   capability). It never computes or echoes an approval hash and there is no
  *   token input to fill: creating a shipment costs nothing (R10 as amended).
  * - **No markup injection.** Every value shown comes from a server response and
  *   is written with `textContent`/`createElement`: pasted data, panel text, file
@@ -310,7 +312,6 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
   function syncButtons() {
     var ready = state.analyzed && !state.busy;
     byId('create').disabled = !ready;
-    byId('dry-run').disabled = !ready;
     byId('analyze').disabled = state.busy;
   }
 
@@ -366,7 +367,7 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
    * second-to-last step and never marks the last one done — the response is the
    * only thing that can close the run, and renderResult snaps the card to it.
    */
-  function startProgressCard(mode, modality) {
+  function startProgressCard(modality) {
     progress.steps = stepsFor(modality).slice();
     progress.completed = 0;
     stopProgress();
@@ -374,11 +375,7 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
     var box = byId('result');
     clear(box);
     var card = make('div', 'result-card progress-card');
-    card.appendChild(make(
-      'p',
-      'progress-title',
-      mode === 'create' ? 'Creando el envío — progreso estimado' : 'Prueba en seco — progreso estimado'
-    ));
+    card.appendChild(make('p', 'progress-title', 'Creando el envío — progreso estimado'));
     card.appendChild(make('p', 'progress-note', 'El porcentaje es aproximado: los pasos duran parejo y el recuento es estimado.'));
     var list = document.createElement('ul');
     list.className = 'progress-steps';
@@ -590,7 +587,7 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
     syncButtons();
   }
 
-  function run(mode) {
+  function run() {
     if (!state.analyzed) {
       setStatus('run-status', 'Analizá el mensaje antes de continuar.', 'warn');
       return;
@@ -598,17 +595,13 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
 
     state.busy = true;
     syncButtons();
-    setStatus(
-      'run-status',
-      mode === 'create' ? 'Creando el envío: recorre el panel y hace un solo click en Crear envío…' : 'Recorriendo el panel hasta el resumen, sin crear nada…',
-      null
-    );
+    setStatus('run-status', 'Creando el envío: recorre el panel y hace un solo click en Crear envío…', null);
 
     // The POST answers only at the end, so the card is an estimate that runs on
     // a timer; renderResult snaps it to the response's real outcome.
-    startProgressCard(mode, state.modalidad);
+    startProgressCard(state.modalidad);
 
-    post('/api/run', { message: state.message, form: collect(), mode: mode }).then(function (data) {
+    post('/api/run', { message: state.message, form: collect(), mode: 'create' }).then(function (data) {
       renderResult(data);
       loadConsole(null);
     }).catch(function (error) {
@@ -649,28 +642,6 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
         note: null,
       });
       setStatus('run-status', 'El envío no se creó.', 'bad');
-      return;
-    }
-
-    if (data.status === 'dry-run') {
-      var box = byId('result');
-      clear(box);
-      var dryCard = make('div', 'result-card');
-      dryCard.appendChild(make('p', data.formMatchesApproval ? 'result-id ok' : 'result-id bad',
-        data.formMatchesApproval
-          ? 'Resumen alcanzado. No se creó nada y no se tocó la etiqueta.'
-          : 'El panel no tiene el payload que muestra la página. No se creó nada.'));
-      dryCard.appendChild(make('p', null, data.stoppedAt === 'summary'
-        ? 'El recorrido llegó hasta el resumen del panel.'
-        : 'El recorrido llegó hasta la sucursal seleccionada en el panel.'));
-      if (data.mismatches.length > 0) dryCard.appendChild(issueList(data.mismatches));
-      dryCard.appendChild(errorDetails(technicalLines([
-        data.payloadHash ? 'hash del payload: ' + data.payloadHash : '',
-        data.reportPath ? 'informe del recorrido: ' + data.reportPath : '',
-      ])));
-      if (data.note) dryCard.appendChild(make('p', 'note', data.note));
-      box.appendChild(dryCard);
-      setStatus('run-status', 'Prueba en seco terminada: nada se creó.', data.formMatchesApproval ? 'ok' : 'warn');
       return;
     }
 
@@ -992,8 +963,7 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
 
   byId('analyze').addEventListener('click', analyze);
   byId('message').addEventListener('input', updateMessageBadge);
-  byId('create').addEventListener('click', function () { run('create'); });
-  byId('dry-run').addEventListener('click', function () { run('dry-run'); });
+  byId('create').addEventListener('click', run);
   byId('session-check-run').addEventListener('click', runSessionCheck);
   byId('logout').addEventListener('click', logout);
 

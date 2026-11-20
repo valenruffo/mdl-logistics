@@ -2326,25 +2326,30 @@ function extractShipmentId(text: string): string | null {
 /**
  * The branch-name matching rule, as pure data so it can be tested offline.
  *
- * **Street + number is the identity of a branch** (the operator's agreed rule,
- * from the live CP 4800 Jujuy failure: the panel offered exactly
+ * **The address pair — last word + number — is the identity of a branch** (the
+ * operator's rule: within one postal code addresses never repeat, so one word
+ * and the number are enough; from the live CP 4800 Jujuy failure: the panel
+ * offered exactly
  * `"Sucursal - Gral. San Martin 979 San Salvador de Jujuy, Jujuy"` for an
  * approved `"Gral. San Martin 979 San Salvador de Jujuy"` — the same branch,
  * decorated). In priority order:
  *
- * 1. **Street+number pair (primary).** Parse `(street, number)` out of the
- *    approved name (last digit token = number, adjacent non-digit tokens =
- *    street, normalized in `./branch`). Every option whose text contains that
- *    same pair — street tokens **immediately followed by the number as a whole
- *    token** — is a candidate. An option that merely mentions the street (e.g.
- *    inside its own `entre calles` description: `Lamadrid, 177 Entrecalles gral
- *    san martin e independencia`) is **not** on that street and is never a
- *    candidate — the live CP 4600 Jujuy failure counted such a mention and
- *    produced a false ambiguity that blocked the real `Gral. San Martín, 979`
- *    branch. Prefixes (`Sucursal -`, `Punto Andreani Hop`), city names and
- *    schedule text are decoration and do not participate.
+ * 1. **Word+number pair (primary).** Parse `(word, number)` out of the approved
+ *    name (last digit token = number, the **last non-digit word immediately
+ *    before it** = word, normalized in `./branch`): `beiro 4470` and
+ *    `Av Beiro 4470` both parse to `(beiro, 4470)` — `av`-style street-type
+ *    prefixes drop out by themselves. Every option whose text contains that
+ *    same pair adjacent — the word **immediately followed by the number as a
+ *    whole token** — is a candidate. An option that merely mentions the word
+ *    without the number (e.g. inside its own `entre calles` description:
+ *    `Lamadrid, 177 Entrecalles gral san martin e independencia`) is **not** on
+ *    that address and is never a candidate — the live CP 4600 Jujuy failure
+ *    counted such a mention and produced a false ambiguity that blocked the
+ *    real `Gral. San Martín, 979` branch. Prefixes (`Sucursal -`,
+ *    `Punto Andreani Hop`), city names and schedule text are decoration and do
+ *    not participate.
  *    Exactly one candidate → `unique`. More than one option carrying the
- *    identical street+number pair (genuinely co-located duplicate points) →
+ *    identical word+number pair (genuinely co-located duplicate points) →
  *    `ambiguous`, naming both.
  * 2. **Full-text fallback (secondary).** Only when no pair can be parsed from
  *    the approved name (e.g. the customer wrote only a branch name with no
@@ -2352,7 +2357,7 @@ function extractShipmentId(text: string): string | null {
  *    every other panel text. Option `value`s are UUIDs and are never compared;
  *    there is no index and no fuzzy matching.
  *
- * Never a near match: every non-unique outcome is a rejection. A street-only
+ * Never a near match: every non-unique outcome is a rejection. A word-only
  * match whose number differs is reported as a near match and never selected —
  * choosing a nearby branch is a wrong shipment (R12).
  */
@@ -2362,10 +2367,10 @@ export function matchSucursalBranch(requested: string, options: readonly BranchO
     return { kind: 'none', options, nearMatches: [], rule: 'full-text', reason: 'empty-request', pair: null };
   }
 
-  // Primary rule: the physical address is the branch identity. A candidate is
-  // an option carrying the **full pair** — street tokens immediately followed
-  // by the number as a whole token. A street mention without the number (e.g.
-  // another option's `entre calles` description) is not on that street.
+  // Primary rule: the address pair is the branch identity. A candidate is an
+  // option carrying the **pair adjacent** — the word immediately followed by
+  // the number as a whole token. A word mention without the number (e.g.
+  // another option's `entre calles` description) is not on that address.
   const pair = parseStreetNumberPair(requested);
   if (pair !== null) {
     const pairCandidates = options.filter((option) => textContainsStreetNumberPair(option.text, pair));
@@ -2381,9 +2386,9 @@ export function matchSucursalBranch(requested: string, options: readonly BranchO
     if (pairCandidates.length === 1) {
       return { kind: 'unique', option: pairCandidates[0]!, rule: 'street-number-pair' };
     }
-    // Zero pair candidates: the street may still be mentioned (different
+    // Zero pair candidates: the word may still be mentioned (different
     // number, or decoration text) — report those as near matches, never
-    // selected; a street-only match is a different branch (R12).
+    // selected; a word-only match is a different branch (R12).
     const nearMatches = options.filter((option) => textContainsStreetTokens(option.text, pair.street));
     return {
       kind: 'none',
@@ -2395,7 +2400,7 @@ export function matchSucursalBranch(requested: string, options: readonly BranchO
     };
   }
 
-  // Fallback: no (street, number) pair could be parsed from the approved name
+  // Fallback: no (word, number) pair could be parsed from the approved name
   // (e.g. the customer wrote only a branch name with no number) → exact text.
   const exact = options.filter((option) => normalizeText(option.text) === wanted);
   if (exact.length === 1) return { kind: 'unique', option: exact[0]!, rule: 'full-text' };

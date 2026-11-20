@@ -25,7 +25,6 @@ import { CARRIER_NAME } from '../../src/core/carrier';
 import { computeApprovalHash, messageFingerprint } from '../../src/cli/gates';
 import { parseMessage } from '../../src/core/parse-message';
 import {
-  attemptRecordPath,
   outcomeRecordPath,
   writeAttemptRecord,
 } from '../../src/cli/runRecord';
@@ -267,39 +266,6 @@ test('an unresolved prior attempt for the same message is still refused', async 
       false,
       'no outcome is invented for the open record',
     );
-  } finally {
-    await started.close();
-    await cleanup(target);
-  }
-});
-
-// ----------------------------------------------- 4. the dry run has no side effects
-
-test('a dry run walks the panel and writes no record at all', async () => {
-  const target = await box('dry-run');
-  const { startUiServer } = await import('../../src/ui/server');
-  const started = await startUiServer({ port: 0, deps: deps(target), auth: TEST_AUTH });
-
-  try {
-    const response = await post(`${started.url}/api/run`, {
-      message: HAPPY_MESSAGE,
-      form: fixtureForm(),
-      mode: 'dry-run',
-    });
-    assert.equal(response.status, 200);
-    const body = (await response.json()) as { status: string; payloadHash: string };
-    assert.equal(body.status, 'dry-run');
-    assert.equal(body.payloadHash, PAYLOAD_HASH);
-
-    const entries = await readdir(target.recordDir).catch(() => [] as string[]);
-    assert.deepEqual(entries, [], 'the dry run writes nothing to the run-record directory');
-    assert.equal(
-      path.basename(target.recordDir),
-      'run-records',
-      'this is the directory the creation path writes to, so an empty one is the proof',
-    );
-    // Naming the path it would have written makes the assertion above explicit.
-    assert.equal(attemptRecordPath(target.recordDir, 'x').endsWith('x.json'), true);
   } finally {
     await started.close();
     await cleanup(target);

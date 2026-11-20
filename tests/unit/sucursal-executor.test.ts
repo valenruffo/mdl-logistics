@@ -146,8 +146,8 @@ test('the street+number rule: no option containing the pair is a rejection namin
       assert.match(error.message, /no sucursal option matches/);
       assert.match(error.message, /street\+number pair rule failed/, 'the rejection names which rule failed');
       assert.ok(
-        error.details.some((detail) => detail.includes('street "gral san martin"') && detail.includes('"979"')),
-        'the rejection names the parsed pair',
+        error.details.some((detail) => detail.includes('street "martin"') && detail.includes('"979"')),
+        'the rejection names the parsed pair — the last word before the number, per the operator\'s rule',
       );
       for (const option of DEFAULT_BRANCHES) {
         assert.ok(error.details.some((detail) => detail.includes(option.text)), `the rejection lists ${option.text}`);

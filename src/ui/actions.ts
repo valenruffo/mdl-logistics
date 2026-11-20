@@ -216,12 +216,14 @@ export function analyzeMessage(message: string): AnalyzeResponse {
 
 // ----------------------------------------------------------------------- run
 
-export type RunMode = 'dry-run' | 'create';
+export type RunMode = 'create';
 
 /**
  * What the page posts to `/api/run`.
  *
- * Just the message, the values on screen and the mode. No hash to echo back, no
+ * Just the message, the values on screen and the mode — `create`, the only run
+ * path in the UI (`Probar en seco` was removed: the executor's dry run remains
+ * a dev-tool/harness capability, never a page action). No hash to echo back, no
  * token to type: those were the creation ceremony, and creation costs nothing.
  */
 export interface RunInput {
@@ -238,21 +240,6 @@ export interface RefusedResponse {
   stage: RefusalStage;
   reason: string;
   details: string[];
-}
-
-export interface DryRunResponse {
-  status: 'dry-run';
-  /** True only when the terminal state is the domicilio summary; sucursal stops on the selected branch. */
-  summaryReached: boolean;
-  /** The dry run's terminal state, as the executor reported it. */
-  stoppedAt: 'summary' | 'agency-quotation';
-  /** The hash of the payload that was walked. */
-  payloadHash: string;
-  /** True when the panel's own readback hashes to the same payload. */
-  formMatchesApproval: boolean;
-  mismatches: string[];
-  reportPath: string;
-  note: string | null;
 }
 
 export interface CreatedResponse {
@@ -313,7 +300,6 @@ export interface FailedResponse {
 export type RunResponse =
   | { status: 'invalid-form'; errors: FormIssue[] }
   | RefusedResponse
-  | DryRunResponse
   | CreatedResponse
   | UnknownResponse
   | NotCreatedResponse
@@ -340,10 +326,9 @@ function recordNote(recordPath: string): string {
  * Order matters and mirrors the CLI minus its two human gates: rebuild the
  * payload from the values on screen, fingerprint the message, read the records,
  * refuse an unresolved or already-created attempt for that message, then write
- * the pre-click record and touch the panel.
- *
- * `Probar en seco` stops at the panel summary and writes no record at all: it is
- * the path with no side effects.
+ * the pre-click record and touch the panel. Create is the only run path in the
+ * UI: the executor's dry run serves the dev tools and the harness, never this
+ * route.
  */
 export async function runAttempt(input: RunInput, deps: ActionDeps): Promise<RunResponse> {
   const built = requestFromForm(input.form);
@@ -363,51 +348,14 @@ export async function runAttempt(input: RunInput, deps: ActionDeps): Promise<Run
     return refusalOf('prior-attempt', error);
   }
 
-  if (input.mode === 'create') {
-    try {
-      assertNoBlockingPriorAttempt(records, messageHash);
-    } catch (error) {
-      return refusalOf('prior-attempt', error);
-    }
+  try {
+    assertNoBlockingPriorAttempt(records, messageHash);
+  } catch (error) {
+    return refusalOf('prior-attempt', error);
   }
   const note = openPriorAttemptNote(records, messageHash);
 
-  if (input.mode === 'dry-run') return await dryRun(request, payloadHash, note, deps);
-
   return await create(request, messageHash, payloadHash, deps);
-}
-
-async function dryRun(
-  request: AnyShipmentRequest,
-  payloadHash: string,
-  note: string | null,
-  deps: ActionDeps,
-): Promise<RunResponse> {
-  let result: DryRunResult;
-  try {
-    result = await deps.executor.runDryRun({ request, approvedPayloadHash: payloadHash });
-  } catch (error) {
-    return {
-      status: 'failed',
-      reason: reasonOf(error),
-      details: detailsOf(error),
-      recordPath: null,
-      note: 'la prueba en seco no crea nada: no se escribió ningún registro de ejecución',
-    };
-  }
-
-  return {
-    status: 'dry-run',
-    // For sucursal the terminal state is the selected branch on screen Q — the
-    // form was filled, the carrier and branch hold, and nothing was created.
-    summaryReached: result.stoppedAt === 'summary',
-    stoppedAt: result.stoppedAt,
-    payloadHash,
-    formMatchesApproval: result.formMatchesApproval,
-    mismatches: [...result.mismatches],
-    reportPath: result.reportPath,
-    note: result.formMatchesApproval ? note : `el panel no tiene el payload que muestra la página. ${note ?? ''}`.trim(),
-  };
 }
 
 async function create(

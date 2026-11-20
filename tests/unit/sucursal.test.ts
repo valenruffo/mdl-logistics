@@ -447,35 +447,6 @@ const SUCURSAL_PAYLOAD = (() => {
   return built.value;
 })();
 
-function recordingDryRunExecutor(): { executor: UiExecutor; seen: unknown[] } {
-  const seen: unknown[] = [];
-  return {
-    seen,
-    executor: {
-      runDryRun: async (input) => {
-        seen.push(input.request);
-        return {
-          mode: 'dry-run',
-          modality: 'sucursal',
-          startedAt: '2026-01-01T00:00:00.000Z',
-          finishedAt: '2026-01-01T00:00:01.000Z',
-          approvedPayloadHash: 'a'.repeat(64),
-          formPayloadHash: 'a'.repeat(64),
-          formMatchesApproval: true,
-          mismatches: [],
-          journey: {},
-          stoppedAt: 'agency-quotation',
-          createButtonPresent: true,
-          reportPath: 'artifacts/fixture/dry-run.json',
-        } as never;
-      },
-      runCreate: async () => {
-        throw new Error('unreachable in the dry-run test');
-      },
-    },
-  };
-}
-
 function createdExecutor(): UiExecutor {
   return {
     runDryRun: async () => {
@@ -514,21 +485,6 @@ function createdExecutor(): UiExecutor {
     }) as never,
   };
 }
-
-test('a sucursal dry run reaches the executor and reports the sucursal terminal state', async () => {
-  const { executor, seen } = recordingDryRunExecutor();
-  const deps: ActionDeps = { executor, recordDir: '/nonexistent-run-records' };
-  const form = formValuesFromFields(analyzeMessage(SUCURSAL_MESSAGE).fieldsByModalidad.sucursal);
-  const response = await runAttempt({ message: SUCURSAL_MESSAGE, form, mode: 'dry-run' }, deps);
-
-  assert.equal(response.status, 'dry-run');
-  if (response.status !== 'dry-run') throw new Error('unreachable');
-  assert.equal(response.summaryReached, false, 'sucursal has no summary screen');
-  assert.equal(response.stoppedAt, 'agency-quotation');
-  assert.match(response.payloadHash, /^[0-9a-f]{64}$/);
-  assert.equal(seen.length, 1);
-  assert.equal((seen[0] as { modality: string }).modality, 'sucursal');
-});
 
 test('a sucursal create run executes under the same duplicate gates', async (t) => {
   const { mkdtemp, mkdir, rm, writeFile } = await import('node:fs/promises');

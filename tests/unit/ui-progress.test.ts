@@ -405,27 +405,6 @@ test('when the response arrives the card snaps to the created state and stops th
   assert.deepEqual(page.navigated, [], 'a created run does not navigate anywhere');
 });
 
-test('a dry run snaps to the summary-reached state, naming where the walk stopped', async () => {
-  const page = await boot('domicilio');
-  page.runGate.settle({
-    status: 'dry-run',
-    summaryReached: true,
-    stoppedAt: 'summary',
-    payloadHash: 'a'.repeat(64),
-    formMatchesApproval: true,
-    mismatches: [],
-    reportPath: 'executor-fixture/dry-run.json',
-    note: null,
-  });
-  await new Promise((resolve) => setTimeout(resolve, 20));
-
-  const text = page.text('result');
-  assert.match(text, /Resumen alcanzado\. No se creó nada/);
-  assert.match(text, /llegó hasta el resumen del panel/, 'the real step reached, from the response');
-  assert.equal(text.includes('aproximado'), false);
-  assert.equal(page.timerLive(), false);
-});
-
 // --------------------------------------------------- 3. the error tiers
 
 test('the unresolved refusal renders heading, action and collapsed details without the JSON recipe', async () => {

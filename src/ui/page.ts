@@ -12,8 +12,9 @@
  *   identifier, a number of days. No report text, no check output, no recipient
  *   data, no cookie value. The rail's dots always carry a word next to them, so no
  *   state is conveyed by colour alone.
- * - **The work column** is paste → `Analizar` → edit → `Crear envío`, plus the
- *   `Probar en seco` path that touches nothing. There is no approval hash and no
+ * - **The work column** is paste → `Analizar` → edit → `Crear envío`. Create is
+ *   the only run path (`Probar en seco` was removed; the executor's dry run
+ *   stays a dev-tool/harness capability). There is no approval hash and no
  *   typed token: creating a shipment costs nothing, so it needs no ceremony
  *   (R10 as amended). Buying the label does cost money, it stays forbidden, and
  *   nothing on this page names it.
@@ -314,7 +315,6 @@ export const PAGE_HTML = `<!doctype html>
 
         <div class="actions">
           <button class="primary" type="button" id="create" disabled>Crear envío</button>
-          <button class="ghost" type="button" id="dry-run" disabled>Probar en seco</button>
           <span class="note">Crear no cobra. La etiqueta se paga aparte.</span>
         </div>
 

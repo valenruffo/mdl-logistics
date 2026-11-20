@@ -435,7 +435,7 @@ test('every protected route is a 302 or a 401 without a session and works with o
       const ran = await fetch(`${started.url}/api/run`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', cookie },
-        body: JSON.stringify({ mode: 'dry-run' }),
+        body: JSON.stringify({ mode: 'create' }),
       });
       assert.equal(ran.status, 200);
       assert.equal(((await ran.json()) as { status: string }).status, 'invalid-form');
@@ -494,7 +494,7 @@ test('the console routes and the run route keep their behaviour once authenticat
       const busyRun = await fetch(`${started.url}/api/run`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', cookie },
-        body: JSON.stringify({ mode: 'dry-run' }),
+        body: JSON.stringify({ mode: 'create' }),
       });
       assert.equal(busyRun.status, 409);
       const busyBody = (await busyRun.json()) as { status: string };
