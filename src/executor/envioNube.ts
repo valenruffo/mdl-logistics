@@ -1757,7 +1757,7 @@ export class EnvioNube {
     if (match.kind === 'ambiguous') {
       const what =
         match.reason === 'street-shared-by-multiple-options'
-          ? `the sucursal dropdown matches the approved branch street more than once (${match.matches.length} options)`
+          ? `the sucursal dropdown matches the approved branch street+number pair more than once (${match.matches.length} options)`
           : `the sucursal dropdown matches the approved branch name more than once (${match.matches.length} options)`;
       throw new ExecutorError(what, [
         `approved branch: ${JSON.stringify(name)}`,
@@ -2335,11 +2335,16 @@ function extractShipmentId(text: string): string | null {
  * 1. **Street+number pair (primary).** Parse `(street, number)` out of the
  *    approved name (last digit token = number, adjacent non-digit tokens =
  *    street, normalized in `./branch`). Every option whose text contains that
- *    same pair — street tokens immediately followed by the number as a whole
- *    token — is a candidate; prefixes (`Sucursal -`, `Punto Andreani Hop`),
- *    city names and schedule text are decoration and do not participate.
- *    Exactly one candidate → `unique`. More than one option sharing the street
- *    (e.g. two branches on the same street with different numbers) →
+ *    same pair — street tokens **immediately followed by the number as a whole
+ *    token** — is a candidate. An option that merely mentions the street (e.g.
+ *    inside its own `entre calles` description: `Lamadrid, 177 Entrecalles gral
+ *    san martin e independencia`) is **not** on that street and is never a
+ *    candidate — the live CP 4600 Jujuy failure counted such a mention and
+ *    produced a false ambiguity that blocked the real `Gral. San Martín, 979`
+ *    branch. Prefixes (`Sucursal -`, `Punto Andreani Hop`), city names and
+ *    schedule text are decoration and do not participate.
+ *    Exactly one candidate → `unique`. More than one option carrying the
+ *    identical street+number pair (genuinely co-located duplicate points) →
  *    `ambiguous`, naming both.
  * 2. **Full-text fallback (secondary).** Only when no pair can be parsed from
  *    the approved name (e.g. the customer wrote only a branch name with no
@@ -2357,41 +2362,35 @@ export function matchSucursalBranch(requested: string, options: readonly BranchO
     return { kind: 'none', options, nearMatches: [], rule: 'full-text', reason: 'empty-request', pair: null };
   }
 
-  // Primary rule: the physical address is the branch identity.
+  // Primary rule: the physical address is the branch identity. A candidate is
+  // an option carrying the **full pair** — street tokens immediately followed
+  // by the number as a whole token. A street mention without the number (e.g.
+  // another option's `entre calles` description) is not on that street.
   const pair = parseStreetNumberPair(requested);
   if (pair !== null) {
-    const streetCandidates = options.filter((option) => textContainsStreetTokens(option.text, pair.street));
-    if (streetCandidates.length > 1) {
+    const pairCandidates = options.filter((option) => textContainsStreetNumberPair(option.text, pair));
+    if (pairCandidates.length > 1) {
       return {
         kind: 'ambiguous',
-        matches: streetCandidates,
+        matches: pairCandidates,
         rule: 'street-number-pair',
         reason: 'street-shared-by-multiple-options',
         pair,
       };
     }
-    if (streetCandidates.length === 1) {
-      const candidate = streetCandidates[0]!;
-      if (textContainsStreetNumberPair(candidate.text, pair)) {
-        return { kind: 'unique', option: candidate, rule: 'street-number-pair' };
-      }
-      // Street-only match: the number differs or is absent — a near match,
-      // reported, never selected.
-      return {
-        kind: 'none',
-        options,
-        nearMatches: [candidate],
-        rule: 'street-number-pair',
-        reason: 'street-without-number',
-        pair,
-      };
+    if (pairCandidates.length === 1) {
+      return { kind: 'unique', option: pairCandidates[0]!, rule: 'street-number-pair' };
     }
+    // Zero pair candidates: the street may still be mentioned (different
+    // number, or decoration text) — report those as near matches, never
+    // selected; a street-only match is a different branch (R12).
+    const nearMatches = options.filter((option) => textContainsStreetTokens(option.text, pair.street));
     return {
       kind: 'none',
       options,
-      nearMatches: [],
+      nearMatches,
       rule: 'street-number-pair',
-      reason: 'no-option-contains-street',
+      reason: nearMatches.length > 0 ? 'street-without-number' : 'no-option-contains-street',
       pair,
     };
   }
@@ -2447,7 +2446,7 @@ export function branchMatchFailureDetails(
       return [`matching rule that failed: ${label} — ${parsed}; no dropdown option contains the pair`];
     }
     return [
-      `matching rule that failed: ${label} — ${parsed}; ${match.matches.length} options share the street (different street numbers on the same street are listed together)`,
+      `matching rule that failed: ${label} — ${parsed}; ${match.matches.length} options carry the identical street+number pair (genuinely co-located duplicate points)`,
     ];
   }
   if (match.kind === 'ambiguous') {

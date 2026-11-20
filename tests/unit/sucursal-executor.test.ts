@@ -157,37 +157,62 @@ test('the street+number rule: no option containing the pair is a rejection namin
   );
 });
 
-test('two branches on the same street with different numbers: both candidates, ambiguity named', () => {
-  const branches: HarnessOption[] = [
+test('two options with the identical street+number pair are ambiguous; different numbers on the same street are not', async () => {
+  // Genuinely ambiguous: the SAME pair on two options (co-located duplicate
+  // points). Rejection is the safe behavior.
+  const duplicated: HarnessOption[] = [
+    { value: 'uuid-san-martin-979', text: 'Sucursal - Gral. San Martin 979, Jujuy' },
+    { value: 'uuid-san-martin-979-hop', text: 'Punto Andreani Hop - Gral. San Martin 979, Jujuy' },
+    { value: 'uuid-otra', text: 'Sucursal - Corrientes 580, Jujuy' },
+  ];
+  const ambiguous = matchSucursalBranch('Gral. San Martin 979', duplicated);
+  assert.equal(ambiguous.kind, 'ambiguous', 'two options carrying the identical pair are a real ambiguity; both are named');
+  if (ambiguous.kind !== 'ambiguous') throw new Error('unreachable');
+  assert.equal(ambiguous.rule, 'street-number-pair');
+  assert.equal(ambiguous.reason, 'street-shared-by-multiple-options');
+  assert.deepEqual(
+    ambiguous.matches.map((option) => option.value),
+    ['uuid-san-martin-979', 'uuid-san-martin-979-hop'],
+    'both identical-pair candidates are named',
+  );
+
+  // End to end: the rejection names both options and the street rule.
+  const duplicatedHarness = buildSucursalHarness({ branches: duplicated });
+  const duplicatedPanel = newPanel(duplicatedHarness);
+  const duplicatedRequest = { ...REQUEST, sucursal: 'Gral. San Martin 979' };
+  assert.rejects(
+    () => sucursalDryRunAgainst(duplicatedPanel, duplicatedRequest, computeSucursalApprovalHash(duplicatedRequest)),
+    (error: unknown) => {
+      assert.ok(error instanceof ExecutorError);
+      assert.match(error.message, /matches the approved branch street\+number pair more than once/);
+      assert.ok(error.details.some((detail) => detail.includes('uuid-san-martin-979')));
+      assert.ok(error.details.some((detail) => detail.includes('uuid-san-martin-979-hop')));
+      return true;
+    },
+  );
+
+  // Different numbers are different pairs: `979` pins one option — never an
+  // ambiguity, never a rejection.
+  const distinct: HarnessOption[] = [
     { value: 'uuid-san-martin-979', text: 'Sucursal - Gral. San Martin 979, Jujuy' },
     { value: 'uuid-san-martin-1327', text: 'Sucursal - Gral. San Martin 1327, Jujuy' },
     { value: 'uuid-otra', text: 'Sucursal - Corrientes 580, Jujuy' },
   ];
-  const match = matchSucursalBranch('Gral. San Martin 979', branches);
-  assert.equal(match.kind, 'ambiguous', 'both same-street branches are candidates; the number alone is trusted to pick between them only when the street pins one option');
-  if (match.kind !== 'ambiguous') throw new Error('unreachable');
-  assert.equal(match.rule, 'street-number-pair');
-  assert.equal(match.reason, 'street-shared-by-multiple-options');
-  assert.deepEqual(
-    match.matches.map((option) => option.value),
-    ['uuid-san-martin-979', 'uuid-san-martin-1327'],
-    'both same-street candidates are named',
-  );
+  const unique = matchSucursalBranch('Gral. San Martin 979', distinct);
+  assert.equal(unique.kind, 'unique', 'the number disambiguates same-street branches with different numbers');
+  if (unique.kind !== 'unique') throw new Error('unreachable');
+  assert.equal(unique.rule, 'street-number-pair');
+  assert.equal(unique.option.value, 'uuid-san-martin-979');
 
-  // End to end: the rejection names both options and the street rule.
-  const harness = buildSucursalHarness({ branches });
-  const panel = newPanel(harness);
-  const ambiguousRequest = { ...REQUEST, sucursal: 'Gral. San Martin 979' };
-  assert.rejects(
-    () => sucursalDryRunAgainst(panel, ambiguousRequest, computeSucursalApprovalHash(ambiguousRequest)),
-    (error: unknown) => {
-      assert.ok(error instanceof ExecutorError);
-      assert.match(error.message, /matches the approved branch street more than once/);
-      assert.ok(error.details.some((detail) => detail.includes('uuid-san-martin-979')));
-      assert.ok(error.details.some((detail) => detail.includes('uuid-san-martin-1327')));
-      return true;
-    },
-  );
+  // End to end: the same distinct list selects the pinned option through the
+  // page object, and `Crear envío` stays untouched.
+  const distinctHarness = buildSucursalHarness({ branches: distinct });
+  const distinctPanel = newPanel(distinctHarness);
+  const distinctRequest = { ...REQUEST, sucursal: 'Gral. San Martin 979' };
+  const distinctHash = computeSucursalApprovalHash(distinctRequest);
+  const result = await sucursalDryRunAgainst(distinctPanel, distinctRequest, distinctHash);
+  assert.equal(result.journey.branch.selectedValue, 'uuid-san-martin-979');
+  assert.equal(distinctHarness.createClickCount(), 0);
 });
 
 test('a street-only match whose number differs aborts naming the near match, never selecting it', () => {

@@ -94,21 +94,53 @@ test('a name whose street+number pair matches nothing is a rejection listing all
   );
 });
 
-test('two branches on the same street with different numbers: both candidates, ambiguity named', () => {
+test('the live Jujuy CP-4600 failure: a street mention inside another option entre-calles text is never a candidate', () => {
+  // The real dropdown texts observed for CP 4600, verbatim. Option 2's own
+  // street is Lamadrid 177; `gral san martin` appears only inside its
+  // `entre calles` description — counting it as a same-street candidate
+  // produced a false ambiguity that blocked the real shipment.
   const options: readonly BranchOption[] = [
+    { index: 0, value: 'uuid-4600-real', text: 'Jujuy (Centro) - Gral. San Martín, 979, San Salvador De Jujuy, Jujuy' },
+    { index: 1, value: 'uuid-4600-hop', text: 'Punto Andreani Hop Lamadrid 177 - Lamadrid, 177 Entrecalles gral san martin e independencia, San Salvador De Jujuy, Jujuy' },
+  ];
+  const match = matchSucursalBranch('Gral. San Martin 979 San Salvador de Jujuy', options);
+  assert.equal(match.kind, 'unique', 'the entre-calles mention is not a candidate; the real branch is pinned alone');
+  if (match.kind !== 'unique') throw new Error('unreachable');
+  assert.equal(match.rule, 'street-number-pair');
+  assert.equal(match.option.value, 'uuid-4600-real', 'the real branch — not the Hop point that merely mentions the street');
+  assert.equal(match.option.text, 'Jujuy (Centro) - Gral. San Martín, 979, San Salvador De Jujuy, Jujuy');
+});
+
+test('two options carrying the identical street+number pair are genuinely ambiguous; different numbers on the same street are not', () => {
+  // Genuinely ambiguous: two options with the SAME pair — co-located duplicate
+  // points. Rejection is the safe behavior.
+  const duplicated: readonly BranchOption[] = [
+    { index: 0, value: 'uuid-a', text: 'Sucursal - Gral. San Martin 979, Jujuy' },
+    { index: 1, value: 'uuid-b', text: 'Punto Andreani Hop - Gral. San Martin 979, Jujuy' },
+    { index: 2, value: 'uuid-c', text: 'Sucursal - Corrientes 580, Jujuy' },
+  ];
+  const ambiguous = matchSucursalBranch('Gral. San Martin 979', duplicated);
+  assert.equal(ambiguous.kind, 'ambiguous', 'two options with the identical pair are a real ambiguity; both are reported');
+  if (ambiguous.kind !== 'ambiguous') throw new Error('unreachable');
+  assert.equal(ambiguous.rule, 'street-number-pair');
+  assert.equal(ambiguous.reason, 'street-shared-by-multiple-options');
+  assert.deepEqual(
+    ambiguous.matches.map((option) => option.value),
+    ['uuid-a', 'uuid-b'],
+  );
+
+  // Different numbers are different pairs: `979` pins exactly one option —
+  // never an ambiguity, never a rejection.
+  const distinct: readonly BranchOption[] = [
     { index: 0, value: 'uuid-a', text: 'Sucursal - Gral. San Martin 979, Jujuy' },
     { index: 1, value: 'uuid-b', text: 'Sucursal - Gral. San Martin 1327, Jujuy' },
     { index: 2, value: 'uuid-c', text: 'Sucursal - Corrientes 580, Jujuy' },
   ];
-  const match = matchSucursalBranch('Gral. San Martin 979', options);
-  assert.equal(match.kind, 'ambiguous', 'the street alone names two branches; both are reported');
-  if (match.kind !== 'ambiguous') throw new Error('unreachable');
-  assert.equal(match.rule, 'street-number-pair');
-  assert.equal(match.reason, 'street-shared-by-multiple-options');
-  assert.deepEqual(
-    match.matches.map((option) => option.value),
-    ['uuid-a', 'uuid-b'],
-  );
+  const unique = matchSucursalBranch('Gral. San Martin 979', distinct);
+  assert.equal(unique.kind, 'unique', 'the number disambiguates same-street branches with different numbers');
+  if (unique.kind !== 'unique') throw new Error('unreachable');
+  assert.equal(unique.rule, 'street-number-pair');
+  assert.equal(unique.option.value, 'uuid-a');
 });
 
 test('no number in the approved name: the full-text fallback decides', () => {
