@@ -42,7 +42,7 @@ import { CARRIER_NAME } from '../core/carrier';
  * here and adds a line to `CHANGELOG` below, so the operator can tell from the
  * sidebar whether the deployed page is the version of the change.
  */
-export const APP_VERSION = '0.2.0';
+export const APP_VERSION = '0.3.0';
 
 /**
  * What each shipped version carried, newest first, maintained by hand. The
@@ -51,6 +51,7 @@ export const APP_VERSION = '0.2.0';
  * Keep it to the last few versions.
  */
 export const CHANGELOG: ReadonlyArray<{ readonly version: string; readonly note: string }> = [
+  { version: '0.3.0', note: 'duración de cada corrida, Analizar habilitado durante la corrida, panel de Corridas a la derecha' },
   { version: '0.2.0', note: 'sucursal punta a punta, cola de envíos, progreso por pasos, match por calle+número' },
   { version: '0.1.0', note: 'MVP domicilio' },
 ];
@@ -154,21 +155,9 @@ export const PAGE_HTML = `<!doctype html>
   .rail button.rail-toggle { width:auto; align-self:center; margin-top:0; padding:2px 6px; font-size:10.5px;
                              border-color:transparent; color:var(--rail-muted); font-weight:500; }
   .rail button.rail-toggle:hover { color:var(--rail-ink); }
-  /* Corridas is the one block that can grow (the last five runs, one line
-     each), so it gets the rail's only internal scroll: it caps at 240 px and
-     rolls inside itself instead of pushing the footer off the viewport. The
-     scrollbar is thin and quiet, painted from the rail's own palette in both
-     themes (the rail surface never changes with the theme), and the list text
-     keeps ≥4.5:1 on it: --rail-ink 13.4:1, --rail-muted 5.7:1 on --rail. */
-  .runs { list-style:none; margin:0; padding:0; max-height:240px; overflow-y:auto;
-          scrollbar-width:thin; scrollbar-color:var(--rail-line) transparent; }
-  .runs::-webkit-scrollbar { width:8px; }
-  .runs::-webkit-scrollbar-track { background:transparent; }
-  .runs::-webkit-scrollbar-thumb { background:var(--rail-line); border-radius:99px; }
-  .runs::-webkit-scrollbar-thumb:hover { background:var(--rail-edge); }
-  .runs li { padding:6px 0; border-bottom:1px solid var(--rail-line); line-height:1.3; font-variant-numeric:tabular-nums; }
-  .runs li:last-child { border-bottom:0; }
-  .runs .meta { font-size:11px; display:inline; }
+  /* Corridas moved to the workers panel on the right: the rail keeps Sesión,
+     Errores and the footer, still fixed to the viewport at one screen tall
+     with nothing inside it that scrolls. */
 
   /* The rail's blocks sit on the dark surface: they are not cards, so they get
      no fill, no border, no radius and no shadow. The section rule below belongs
@@ -184,7 +173,12 @@ export const PAGE_HTML = `<!doctype html>
 
   /* work */
   .work { padding:36px 40px 64px; }
-  .col { max-width:720px; margin:0 auto; }
+  /* The operator's desk: the message + fields + create column on the left, the
+     workers panel (Corridas) on the right. Two columns on wide screens, stacked
+     with the left column first on narrow ones. */
+  .desk { max-width:1080px; margin:0 auto; display:grid; grid-template-columns:minmax(0,720px) minmax(240px,1fr);
+          gap:32px; align-items:start; }
+  .col { min-width:0; }
   h1 { font-size:28px; line-height:1.2; letter-spacing:-.02em; margin:0 0 6px; }
   .sub { color:var(--muted); margin:0 0 26px; }
 
@@ -264,13 +258,37 @@ export const PAGE_HTML = `<!doctype html>
   .progress-steps li.current { font-weight:600; }
   .progress-steps li.pending { color:var(--muted); }
   .progress-percent { font-variant-numeric:tabular-nums; margin:10px 0 0; }
+  .result-duration { font-variant-numeric:tabular-nums; }
+
+  /* The workers panel: the runs executing or recently executed, each one
+     small card with its id, outcome word, start time and duration. The list
+     scrolls inside itself — the same honest cap the rail's Corridas block had,
+     now painted from the work column's own palette. */
+  .workers { min-width:0; }
+  .workers-list { list-style:none; margin:14px 0 0; padding:0; max-height:70vh; overflow-y:auto;
+                  scrollbar-width:thin; scrollbar-color:var(--line) transparent; }
+  .workers-list::-webkit-scrollbar { width:8px; }
+  .workers-list::-webkit-scrollbar-track { background:transparent; }
+  .workers-list::-webkit-scrollbar-thumb { background:var(--line); border-radius:99px; }
+  .workers-list li { padding:8px 0; border-bottom:1px solid var(--line); font-size:13px; line-height:1.35;
+                     font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+  .workers-list li:last-child { border-bottom:0; }
+  .workers-list .meta { color:var(--muted); font-size:11.5px; }
+  /* The in-flight run is the first worker card, with its live estimate. */
+  .worker.in-flight { border:1px solid var(--line); background:var(--field); border-radius:8px;
+                      padding:10px 12px; margin:0 0 4px; }
+  .worker-line { display:block; }
+  .worker-progress { display:block; font-size:12px; color:var(--muted); margin-top:4px;
+                     font-variant-numeric:tabular-nums; }
 
   /* Narrow screens: the rail stacks on top of the work column and flows with
      the page again — sticky, viewport height and overflow clipping are wide
-     -screen behaviour only. */
+     -screen behaviour only — and the desk stacks too: left column first, then
+     the workers panel. */
   @media (max-width:860px){ .app { grid-template-columns:1fr; }
     .rail { position:static; top:auto; height:auto; overflow:visible; flex-direction:row; flex-wrap:wrap; gap:14px; }
-    .rail footer { margin:0; } .work { padding:22px 18px 40px; } .grid { grid-template-columns:1fr; } }
+    .rail footer { margin:0; } .work { padding:22px 18px 40px; } .grid { grid-template-columns:1fr; }
+    .desk { grid-template-columns:1fr; gap:24px; } .workers-list { max-height:40vh; } }
   @media (prefers-reduced-motion:reduce){ * { transition:none !important; animation:none !important; } }
 </style>
 </head>
@@ -292,13 +310,6 @@ export const PAGE_HTML = `<!doctype html>
       <p class="rail-line" id="rail-expiry"></p>
       <button type="button" id="session-check-run">Verificar ahora</button>
       <p class="inline-status" id="session-check-status" role="status" aria-live="polite"></p>
-    </section>
-
-    <section aria-labelledby="rail-runs-heading">
-      <h2 id="rail-runs-heading">Corridas</h2>
-      <ul class="runs" id="rail-runs-list">
-        <li><span class="meta">leyendo los registros…</span></li>
-      </ul>
     </section>
 
     <section aria-labelledby="rail-errors-heading">
@@ -324,43 +335,55 @@ export const PAGE_HTML = `<!doctype html>
   </aside>
 
   <main class="work">
-    <div class="col">
-      <h1>Enviar un pedido</h1>
-      <p class="sub">Pegá el mensaje, revisá los datos, creá el envío. La etiqueta queda impaga.</p>
+    <div class="desk">
+      <div class="col">
+        <h1>Enviar un pedido</h1>
+        <p class="sub">Pegá el mensaje, revisá los datos, creá el envío. La etiqueta queda impaga.</p>
 
-      <section aria-labelledby="sec-mensaje">
-        <div class="sec-head"><h2 class="sec" id="sec-mensaje">Mensaje</h2><span class="badge" id="message-badge">sin datos</span></div>
-        <label class="field-wrap" for="message">
-          <span class="field-label">Mensaje estructurado</span>
-          <textarea id="message" spellcheck="false" autocomplete="off" placeholder="MDL - Datos de envío&#10;&#10;Destino&#10;Código postal: 1424&#10;Provincia: ..."></textarea>
-        </label>
-        <p class="hint">Los asteriscos se descartan solos. Si falta un dato, se rechaza y te dice cuál.</p>
-        <p class="inline-status" id="analyze-status" role="status" aria-live="polite"></p>
-        <div class="actions">
-          <button class="primary" type="button" id="analyze">Analizar</button>
-        </div>
-      </section>
+        <section aria-labelledby="sec-mensaje">
+          <div class="sec-head"><h2 class="sec" id="sec-mensaje">Mensaje</h2><span class="badge" id="message-badge">sin datos</span></div>
+          <label class="field-wrap" for="message">
+            <span class="field-label">Mensaje estructurado</span>
+            <textarea id="message" spellcheck="false" autocomplete="off" placeholder="MDL - Datos de envío&#10;&#10;Destino&#10;Código postal: 1424&#10;Provincia: ..."></textarea>
+          </label>
+          <p class="hint">Los asteriscos se descartan solos. Si falta un dato, se rechaza y te dice cuál.</p>
+          <p class="inline-status" id="analyze-status" role="status" aria-live="polite"></p>
+          <div class="actions">
+            <button class="primary" type="button" id="analyze">Analizar</button>
+          </div>
+        </section>
 
-      <section aria-labelledby="sec-datos">
-        <div class="sec-head"><h2 class="sec" id="sec-datos">Datos del envío</h2><span class="badge" id="data-badge">sin analizar</span></div>
-        <p class="hint" id="data-empty">Pegá el mensaje y tocá Analizar: acá aparecen los datos que se van a escribir en el panel, todos editables.</p>
-        <div id="rejection"></div>
-        <div id="warnings"></div>
-        <div class="grid" id="shipment-form"></div>
+        <section aria-labelledby="sec-datos">
+          <div class="sec-head"><h2 class="sec" id="sec-datos">Datos del envío</h2><span class="badge" id="data-badge">sin analizar</span></div>
+          <p class="hint" id="data-empty">Pegá el mensaje y tocá Analizar: acá aparecen los datos que se van a escribir en el panel, todos editables.</p>
+          <div id="rejection"></div>
+          <div id="warnings"></div>
+          <div class="grid" id="shipment-form"></div>
 
-        <div class="quote">
-          <span class="b ok" aria-hidden="true"></span>
-          <span id="quote-text">${CARRIER_NAME} · el costo y el plazo se leen del panel en el resumen</span>
-        </div>
+          <div class="quote">
+            <span class="b ok" aria-hidden="true"></span>
+            <span id="quote-text">${CARRIER_NAME} · el costo y el plazo se leen del panel en el resumen</span>
+          </div>
 
-        <div class="actions">
-          <button class="primary" type="button" id="create" disabled>Crear envío</button>
-          <span class="note">Crear no cobra. La etiqueta se paga aparte.</span>
-        </div>
+          <div class="actions">
+            <button class="primary" type="button" id="create" disabled>Crear envío</button>
+            <span class="note">Crear no cobra. La etiqueta se paga aparte.</span>
+          </div>
+          <p class="hint" id="single-flight-note">Una corrida a la vez: el panel maneja un solo navegador. Mientras una corre, Analizar sigue funcionando para preparar el siguiente mensaje.</p>
 
-        <p class="inline-status" id="run-status" role="status" aria-live="polite"></p>
-        <div class="inline-result" id="result" aria-live="polite"></div>
-      </section>
+          <p class="inline-status" id="run-status" role="status" aria-live="polite"></p>
+          <div class="inline-result" id="result" aria-live="polite"></div>
+        </section>
+      </div>
+
+      <aside class="workers" aria-label="Corridas recientes">
+        <section aria-labelledby="workers-heading">
+          <div class="sec-head"><h2 class="sec" id="workers-heading">Corridas</h2></div>
+          <ul class="workers-list" id="workers-list">
+            <li><span class="meta">leyendo los registros…</span></li>
+          </ul>
+        </section>
+      </aside>
     </div>
   </main>
 </div>

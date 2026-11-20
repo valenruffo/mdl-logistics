@@ -7,7 +7,10 @@
  * it — the process-runtime table, the two "where each datum comes from" notes, the
  * artifact listing and its SSH instructions, the health paragraph and the
  * duration in milliseconds — is gone, and this file asserts it is gone from the
- * page, from the client script and from the `/api/console` snapshot.
+ * page, from the client script and from the `/api/console` snapshot. Corridas
+ * has since moved out of the rail entirely, into the workers panel on the right
+ * of the operator's desk (its shape is asserted here; its durations, in
+ * ui-workers.test.ts).
  *
  * The rendering half runs the real `CLIENT_JS` against a tiny fake DOM and a
  * stubbed `fetch`, so the assertions are about the **text the operator sees**, not
@@ -325,8 +328,9 @@ test('the explanatory prose is gone from the page, the client script and the sna
     assert.doesNotMatch(PAGE_HTML, /<details/);
     assert.doesNotMatch(CLIENT_JS, /rail-artifacts|rail-runtime|rail-health|formatBytes/);
 
-    // No duration beside the last check: the client no longer reads the number.
-    assert.doesNotMatch(CLIENT_JS, /durationMs/);
+    // No duration beside the last check: the session block never renders the
+    // check's own number. A run's durationMs is a different, operator-asked-for
+    // fact, asserted in tests/unit/ui-workers.test.ts.
     assert.doesNotMatch(CLIENT_JS, /' ms'/);
   } finally {
     await cleanup(target);
@@ -347,9 +351,10 @@ test('the rail renders with no runs and no errors: three blocks, no invented num
     assert.equal(rail.text('rail-expiry'), 'vence: desconocido');
     assert.doesNotMatch(rail.className('rail-expiry'), /warn/, 'an unknown expiry is not marked as soon');
 
-    // CORRIDAS: one notice, no numbers.
-    assert.equal(rail.count('rail-runs-list'), 1);
-    assert.equal(rail.text('rail-runs-list'), 'no hay ningún run registrado todavía');
+    // CORRIDAS left the rail: the workers panel on the right shows the notice.
+    assert.equal(PAGE_HTML.includes('rail-runs-list'), false, 'the rail carries no Corridas block anymore');
+    assert.equal(rail.count('workers-list'), 1);
+    assert.equal(rail.text('workers-list'), 'no hay ningún run registrado todavía');
 
     // ERRORES: the word only.
     assert.equal(rail.text('rail-errors-text'), 'Ninguno');
@@ -411,10 +416,12 @@ test('the last five runs are one line each: #EM1055 · creada · 02:57', async (
     const snapshot = await readConsole(deps(target));
     const rail = await renderRail(snapshot);
 
-    assert.equal(rail.count('rail-runs-list'), 5, 'the rail shows five runs, not every record');
+    assert.equal(rail.count('workers-list'), 5, 'the workers panel shows five runs, not every record');
 
-    // Newest first, one line each: the identifier, the outcome word and the time.
-    assert.deepEqual(rail.lines('rail-runs-list'), [
+    // Newest first, one line each: the identifier, the outcome word and the time
+    // (and the duration, once the outcome record carries one — these fixtures
+    // predate the field, so the rows keep the old shape).
+    assert.deepEqual(rail.lines('workers-list'), [
       '— · sin desenlace · 05:00',
       '#EM1061 · creada · 04:01',
       '#EM1060 · creada · 04:00',
@@ -625,9 +632,13 @@ function narrowMediaQuery(): string {
 
 /** Reads one custom property from a CSS block of custom properties. */
 function customProperty(block: string, name: string): string {
-  const match = block.match(new RegExp(`--${name}:#([0-9a-f]{6})`));
+  const match = block.match(new RegExp(`--${name}:#([0-9a-f]{3,6})`));
   assert.ok(match, `--${name} is declared with a hex value`);
-  return match[1] as string;
+  const hex = match[1] as string;
+  // Short hex (#fff) is legal CSS: expand it so the contrast math sees six digits.
+  return hex.length === 3
+    ? hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2]
+    : hex;
 }
 
 /** WCAG contrast ratio of two hex colours, as the requirement counts them. */
@@ -646,7 +657,7 @@ function contrast(foreground: string, background: string): number {
   return (lighter + 0.05) / (darker + 0.05);
 }
 
-test('the rail sticks to the viewport at one screen tall, and only corridas scrolls inside', () => {
+test('the rail sticks to the viewport at one screen tall, and the workers list scrolls inside itself', () => {
   const css = styleBlock();
 
   // The rail itself: sticky, one viewport tall, nothing it carries can push it.
@@ -657,21 +668,21 @@ test('the rail sticks to the viewport at one screen tall, and only corridas scro
   assert.match(railRule[0], /height:100vh/, 'the rail is exactly one screen tall');
   assert.match(railRule[0], /overflow:hidden/, 'the rail never grows past the viewport');
 
-  // Corridas: the only internal scroll, capped so it can never stretch the rail.
-  const runsRule = css.match(/\.runs \{[^}]*\}/);
-  assert.ok(runsRule, 'the .runs rule exists');
-  assert.match(runsRule[0], /max-height:240px/, 'the runs list is capped');
-  assert.match(runsRule[0], /overflow-y:auto/, 'the runs list scrolls inside itself');
+  // Corridas moved to the workers panel on the right: the one list that can
+  // grow scrolls inside itself instead of stretching the page.
+  const runsRule = css.match(/\.workers-list \{[^}]*\}/);
+  assert.ok(runsRule, 'the .workers-list rule exists');
+  assert.match(runsRule[0], /max-height:/, 'the workers list is capped');
+  assert.match(runsRule[0], /overflow-y:auto/, 'the workers list scrolls inside itself');
 
-  // The scrollbar styling is declared (thin, themed from the rail palette).
-  assert.match(css, /\.runs::-webkit-scrollbar \{/, 'a webkit scrollbar style exists');
-  assert.match(css, /\.runs::-webkit-scrollbar-thumb \{[^}]*background:var\(--rail-line\)/);
+  // The scrollbar styling is declared (thin, themed from the work palette).
+  assert.match(css, /\.workers-list::-webkit-scrollbar \{/, 'a webkit scrollbar style exists');
+  assert.match(css, /\.workers-list::-webkit-scrollbar-thumb \{[^}]*background:var\(--line\)/);
   assert.match(css, /scrollbar-width:thin/, 'the Firefox scrollbar is styled too');
 
-  // The other blocks never scroll the rail: no other rail block declares a
-  // max-height + overflow-y pair.
+  // The rail never scrolls: no rail block declares a max-height + overflow-y pair.
   const internalScrollers = [...css.matchAll(/\.(rail (?!runs)[a-z-]+)\s*\{[^}]*overflow-y:auto[^}]*\}/g)];
-  assert.equal(internalScrollers.length, 0, 'no rail block other than .runs scrolls');
+  assert.equal(internalScrollers.length, 0, 'no rail block scrolls');
 });
 
 test('the narrow-screen media query still stacks the rail, with the sticky behaviour reset there', () => {
@@ -692,15 +703,18 @@ test('the narrow-screen media query still stacks the rail, with the sticky behav
   // And the reset lives inside the media query only: the wide-screen rule
   // itself still carries position:sticky.
   assert.match(styleBlock(), /\.rail \{[^}]*position:sticky/);
+
+  // The desk stacks too on narrow screens: left column first, then workers.
+  assert.match(narrow, /\.desk \{ grid-template-columns:1fr;/, 'the two-column desk stacks');
 });
 
-test('the scrolled runs text keeps at least 4.5:1 on the rail in both themes', () => {
+test('the workers list text keeps at least 4.5:1 on its surface in both themes', () => {
   const css = styleBlock();
 
-  // The rail palette is declared once, in :root, and never overridden — so the
-  // dark theme reads the same rail colours as the light one. Both the base
-  // block and the two dark-theme blocks must exist, and every one of them must
-  // keep the runs text above 4.5:1.
+  // The workers panel lives in the work column, on the themed surface. Both
+  // theme blocks must exist, and the two text colours the list uses — the run
+  // line (--ink) and its meta line (--muted, also the in-flight percentage) —
+  // must keep 4.5:1 on the surface in both.
   const root = css.match(/:root \{[\s\S]*?\n  \}/);
   assert.ok(root, ':root declares the palette');
   const darkStored = css.match(/html\[data-theme="dark"\] \{[\s\S]*?\n  \}/);
@@ -708,20 +722,24 @@ test('the scrolled runs text keeps at least 4.5:1 on the rail in both themes', (
   const darkSystem = css.match(/html:not\(\[data-theme="light"\]\) \{[\s\S]*?\n  \}/);
   assert.ok(darkSystem, 'the system dark theme block exists');
 
-  const rail = customProperty(root[0], 'rail');
-  const ink = customProperty(root[0], 'rail-ink');
-  const muted = customProperty(root[0], 'rail-muted');
+  assert.ok(contrast(customProperty(root[0], 'ink'), customProperty(root[0], 'surface')) >= 4.5,
+    'light --ink on --surface clears 4.5:1');
+  assert.ok(contrast(customProperty(root[0], 'muted'), customProperty(root[0], 'surface')) >= 4.5,
+    'light --muted on --surface clears 4.5:1');
 
-  // Every colour the runs list can paint: the run line itself (--rail-ink,
-  // inherited) and the time/meta line (--rail-muted). None of the dark blocks
-  // override them, so one palette check covers both themes — asserted.
   for (const [name, block] of [['stored dark', darkStored[0]], ['system dark', darkSystem[0]]] as const) {
-    assert.doesNotMatch(block, new RegExp(`--rail:`), `${name} does not override the rail surface`);
-    assert.doesNotMatch(block, new RegExp(`--rail-ink|--rail-muted`), `${name} does not override the rail text colours`);
+    assert.match(block, new RegExp('--ink:'), `${name} restates the ink colour`);
+    assert.match(block, new RegExp('--muted:'), `${name} restates the muted colour`);
+    assert.match(block, new RegExp('--surface:'), `${name} restates the surface colour`);
+    assert.ok(
+      contrast(customProperty(block, 'ink'), customProperty(block, 'surface')) >= 4.5,
+      `${name}: --ink on --surface clears 4.5:1`,
+    );
+    assert.ok(
+      contrast(customProperty(block, 'muted'), customProperty(block, 'surface')) >= 4.5,
+      `${name}: --muted on --surface clears 4.5:1`,
+    );
   }
-
-  assert.ok(contrast(ink, rail) >= 4.5, `--rail-ink on --rail is ${contrast(ink, rail).toFixed(2)}:1`);
-  assert.ok(contrast(muted, rail) >= 4.5, `--rail-muted on --rail is ${contrast(muted, rail).toFixed(2)}:1`);
 });
 
 // ----------------------------------------------------- 7. the rail's trim

@@ -18,6 +18,21 @@
  *   away; the result card keeps showing the created `#EM`. A failure or a
  *   refusal keeps the form untouched for a fix-and-retry, and every run
  *   response re-fetches the rail so the new run shows up without a reload.
+ *   One refinement the operator asked for: `Analizar` never locks, so the next
+ *   message can be analyzed *while* the current one runs — the preview is pure
+ *   parsing, no browser. When the response then arrives, that analyzed message
+ *   stays on screen and `Crear envío` is enabled again immediately; a preview
+ *   prepared during the run is never wiped by the queue reset.
+ * - **One run at a time, said out loud.** The executor is single-flight (one
+ *   Chromium, one session), so `Crear envío` disables while a run is in flight
+ *   and the page says why next to it: `Una corrida a la vez: el panel maneja un
+ *   solo navegador.` A second create attempt is refused by the server's 409,
+ *   and the refusal is shown in the page as always.
+ * - **Every run has a duration.** The run response carries `durationMs`,
+ *   measured where the journey begins and ends, persisted in the outcome record
+ *   and shown three ways: the created card's `Duración: 19,4 s` line, the
+ *   workers panel's rows (`#EM1068 · creada · 02:07 · 19s`), and as the final
+ *   line of the real post-run card that snaps over the estimate.
  * - **No markup injection.** Every value shown comes from a server response and
  *   is written with `textContent`/`createElement`: pasted data, panel text, file
  *   names and record fields are never interpreted as HTML.
@@ -58,7 +73,14 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
     fieldsByModalidad: null,
     provinces: [],
     busy: false,
-    consoleBusy: false
+    consoleBusy: false,
+    // True when the operator analyzed a NEW message while a run was in flight:
+    // that preview is the queue, and the created-run reset must not wipe it.
+    preparedNext: false,
+    // The in-flight run's own start instant, for its worker card.
+    runStartedAt: null,
+    // The last console snapshot, so the workers panel can re-render between reads.
+    lastConsole: null
   };
 
   function byId(id) { return document.getElementById(id); }
@@ -124,6 +146,27 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
   }
 
   function pad2(value) { return value < 10 ? '0' + value : String(value); }
+
+  /**
+   * A run duration as the created card prints it: seconds with one decimal and
+   * a comma, "Duración: 19,4 s". null when the response carried no usable
+   * duration — the line is then omitted, never invented.
+   */
+  function durationText(ms) {
+    if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) return null;
+    return 'Duración: ' + (ms / 1000).toFixed(1).replace('.', ',') + ' s';
+  }
+
+  /**
+   * The same duration as a workers-panel row prints it: rounded seconds
+   * ("19s"), or minutes and seconds once it passes a minute ("2m 05s").
+   */
+  function durationShort(ms) {
+    if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) return null;
+    var seconds = Math.round(ms / 1000);
+    if (seconds < 60) return seconds + 's';
+    return Math.floor(seconds / 60) + 'm ' + pad2(seconds % 60) + 's';
+  }
 
   /** A wall-clock label for an ISO timestamp; the raw value when it is not one. */
   function timeOf(iso) {
@@ -317,7 +360,9 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
   function syncButtons() {
     var ready = state.analyzed && !state.busy;
     byId('create').disabled = !ready;
-    byId('analyze').disabled = state.busy;
+    // Analizar never locks: parsing is pure and never touches the executor's
+    // browser lock, so the operator prepares the next message during a run.
+    byId('analyze').disabled = false;
   }
 
   // ----------------------------------------------------- the progress estimate
@@ -395,6 +440,8 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
       if (progress.completed < progress.steps.length - 1) {
         progress.completed += 1;
         renderProgressList(list, percentNode);
+        // The worker card's live percentage rides on the same tick.
+        renderWorkersFromState();
       }
     }, PROGRESS_TICK_MS);
   }
@@ -454,6 +501,10 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
     card.appendChild(make('p', 'error-action', 'Qué podés hacer: ' + parts.action));
     if (parts.lines.length > 0) card.appendChild(errorDetails(parts.lines));
     if (parts.note) card.appendChild(make('p', 'note', parts.note));
+    // The real duration, when the run measured one — the final word on how
+    // long the attempt actually took, over whatever the estimate claimed.
+    var duration = durationText(parts.durationMs);
+    if (duration !== null) card.appendChild(make('p', 'note result-duration', duration));
     box.appendChild(card);
   }
 
@@ -506,7 +557,9 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
     state.analyzed = false;
     syncButtons();
     setStatus('analyze-status', 'Analizando el mensaje…', null);
-    clear(byId('result'));
+    // The in-flight progress card is not the preview's to close: analyzing the
+    // next message while a run is going leaves it exactly where it was.
+    if (!state.busy) clear(byId('result'));
     clear(byId('warnings'));
     clear(byId('rejection'));
     setText('data-badge', 'analizando');
@@ -587,8 +640,14 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
     show('data-empty', false);
     setText('data-badge', 'editable');
     setText('quote-text', data.carrier + ' · el costo y el plazo se leen del panel en el resumen');
-    clear(byId('result'));
-    setStatus('run-status', '', null);
+    if (state.busy) {
+      // This message was analyzed while another run is in flight: it is the
+      // prepared next step of the queue, and the reset below must keep it.
+      state.preparedNext = true;
+    } else {
+      clear(byId('result'));
+      setStatus('run-status', '', null);
+    }
     syncButtons();
   }
 
@@ -599,19 +658,29 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
     }
 
     state.busy = true;
+    state.preparedNext = false;
+    state.runStartedAt = new Date().toISOString();
     syncButtons();
     setStatus('run-status', 'Creando el envío: recorre el panel y hace un solo click en Crear envío…', null);
 
     // The POST answers only at the end, so the card is an estimate that runs on
-    // a timer; renderResult snaps it to the response's real outcome.
+    // a timer; renderResult snaps it to the response's real outcome. The same
+    // instant puts the run's worker card at the top of the workers panel.
     startProgressCard(state.modalidad);
+    renderWorkersFromState();
 
     post('/api/run', { message: state.message, form: collect(), mode: 'create' }).then(function (data) {
       renderResult(data);
-      // The queue: only a confirmed creation clears the inputs; any other
-      // outcome keeps the form as-is for a fix-and-retry. Either way the rail
-      // is re-read so the new run shows up below without a reload.
-      if (data.status === 'created') resetForNextShipment();
+      // The queue: only a confirmed creation clears the inputs — and never a
+      // preview the operator analyzed while this run was in flight: that is
+      // already the next step, and wiping it would throw prepared work away.
+      if (data.status === 'created') {
+        if (state.preparedNext) {
+          setStatus('analyze-status', 'Envío anterior creado: el mensaje que analizaste ya está listo para crear.', null);
+        } else {
+          resetForNextShipment();
+        }
+      }
       loadConsole(null);
     }).catch(function (error) {
       renderRunFailure(error);
@@ -620,6 +689,10 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
     }).then(function () {
       state.busy = false;
       syncButtons();
+      // The in-flight worker card goes away the moment the response arrives.
+      // A console read in flight renders the fresh list itself; when there is
+      // none, this re-render is what removes the card honestly.
+      if (!state.consoleBusy) renderWorkersFromState();
     });
   }
 
@@ -693,6 +766,10 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
         if (data.labelUnpaid.problem) card.appendChild(make('p', 'bad', data.labelUnpaid.problem));
         if (data.labelUnpaid.details.length > 0) card.appendChild(issueList(data.labelUnpaid.details));
       }
+      // The true duration, measured by the run itself: the final line the
+      // estimate card was always going to be replaced by.
+      var duration = durationText(data.durationMs);
+      if (duration !== null) card.appendChild(make('p', 'result-duration', duration));
       card.appendChild(errorDetails(technicalLines([
         data.recordPath ? 'registro previo al click: ' + data.recordPath : '',
         data.outcomePath ? 'desenlace: ' + data.outcomePath : '',
@@ -716,6 +793,7 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
           data.outcomePath ? 'desenlace: ' + data.outcomePath : '',
         ]),
         note: data.note,
+        durationMs: data.durationMs,
       });
       setStatus('run-status', 'Hay que conciliar a mano antes de repetir este mensaje.', 'warn');
       return;
@@ -733,6 +811,7 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
           data.outcomePath ? 'desenlace escrito: ' + data.outcomePath : '',
         ]),
         note: data.note,
+        durationMs: data.durationMs,
       });
       setStatus('run-status', 'El envío no se creó. La corrida quedó resuelta: podés reintentar.', 'warn');
       return;
@@ -749,6 +828,7 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
         data.recordPath ? 'registro a inspeccionar: ' + data.recordPath : '',
       ]),
       note: data.note,
+      durationMs: data.durationMs,
     });
     setStatus('run-status', 'La corrida no se completó.', 'bad');
   }
@@ -810,24 +890,45 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
     return 'sin desenlace';
   }
 
-  function renderRunsRail(data) {
-    var list = byId('rail-runs-list');
+  function renderWorkers(data) {
+    var list = byId('workers-list');
+    if (!list) return;
     clear(list);
 
-    var rows = data.runs.rows.slice(0, 5);
+    // The in-flight run is always the first worker card, with its live estimate
+    // straight from the same progress machinery the result card uses.
+    if (state.busy) {
+      var inFlight = document.createElement('li');
+      inFlight.className = 'worker in-flight';
+      inFlight.appendChild(make('span', 'worker-line', '— · en curso · ' + timeOf(state.runStartedAt)));
+      inFlight.appendChild(make('span', 'worker-progress',
+        'Progreso estimado: ' + approximatePercent(progress.completed, progress.steps.length) + ' % (aproximado)'));
+      list.appendChild(inFlight);
+    }
+
+    var rows = (data && data.runs && data.runs.rows ? data.runs.rows : []).slice(0, 5);
     if (rows.length === 0) {
-      var empty = document.createElement('li');
-      empty.appendChild(make('span', 'meta', 'no hay ningún run registrado todavía'));
-      list.appendChild(empty);
+      if (!state.busy) {
+        var empty = document.createElement('li');
+        empty.appendChild(make('span', 'meta', 'no hay ningún run registrado todavía'));
+        list.appendChild(empty);
+      }
       return;
     }
 
     rows.forEach(function (row) {
       var item = document.createElement('li');
-      item.textContent =
-        textOr(row.shipmentId, '—') + ' · ' + outcomeWord(row) + ' · ' + timeOf(row.recordedAt);
+      var line = textOr(row.shipmentId, '—') + ' · ' + outcomeWord(row) + ' · ' + timeOf(row.recordedAt);
+      var duration = durationShort(row.durationMs);
+      if (duration !== null) line += ' · ' + duration;
+      item.textContent = line;
       list.appendChild(item);
     });
+  }
+
+  /** Re-renders the workers panel over the last console snapshot, in-flight card included. */
+  function renderWorkersFromState() {
+    renderWorkers(state.lastConsole);
   }
 
   function renderErrorsRail(data) {
@@ -866,7 +967,6 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
 
   function renderRail(data) {
     renderSessionRail(data);
-    renderRunsRail(data);
     renderErrorsRail(data);
     renderOpenAttempts(data);
   }
@@ -889,11 +989,16 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
       if (!response.ok) throw new Error('/api/console respondió ' + response.status);
       return response.json();
     }).then(function (data) {
+      state.lastConsole = data;
       renderRail(data);
+      renderWorkers(data);
       if (statusId) setStatus(statusId, 'Leído a las ' + timeOf(data.readAt) + '.', 'ok');
     }).catch(function (error) {
       var reason = error && error.message ? error.message : String(error);
       renderRailFailure(reason);
+      // The workers panel follows the same truth: with busy already false, the
+      // in-flight card is dropped and the last known rows stay.
+      renderWorkersFromState();
       if (statusId) setStatus(statusId, 'No se pudo leer: ' + reason, 'bad');
     }).then(function () {
       state.consoleBusy = false;
@@ -909,7 +1014,9 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
     setStatus('session-check-status', 'Corriendo el chequeo: abre un navegador y puede tardar uno o dos minutos.', null);
 
     post('/api/session-check', {}).then(function (data) {
+      state.lastConsole = data;
       renderRail(data);
+      renderWorkers(data);
       setStatus('session-check-status',
         'Chequeo terminado: ' + data.check.result +
         ' (' + (data.check.exitCode === null ? 'sin código de salida' : 'código ' + data.check.exitCode) + ').',

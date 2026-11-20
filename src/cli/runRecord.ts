@@ -73,6 +73,13 @@ export interface RunOutcomeRecord {
    * written by humans and on `created`/`unknown` records.
    */
   reason?: string | null;
+  /**
+   * The run's wall-clock duration in milliseconds, measured where the journey
+   * begins and ends (the executor, or the caller that dispatched it). Optional:
+   * records written before the field existed and records written by hand do not
+   * carry it, and every reader treats a missing or unusable value as unknown.
+   */
+  durationMs?: number | null;
 }
 
 export function attemptRecordPath(dir: string, runId: string): string {

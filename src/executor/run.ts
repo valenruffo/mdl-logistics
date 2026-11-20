@@ -120,6 +120,12 @@ interface CreateRunBase {
   journey: Journey;
   detailScreenshot: string | null;
   reportPath: string;
+  /**
+   * The journey's own wall-clock duration, start to finish, measured here where
+   * it begins and ends — so it includes the real panel time. `null` only in the
+   * base before a terminal state is known.
+   */
+  durationMs: number | null;
 }
 
 export type CreateRunResult =
@@ -409,6 +415,7 @@ async function runDomicilioCreate(input: RunOptions, request: ShipmentRequest): 
       journey,
       detailScreenshot: null,
       reportPath: `${artifactsDir}/create-run.json`,
+      durationMs: null,
     };
 
     let shipment: ShipmentDetailReadback;
@@ -431,9 +438,11 @@ async function runDomicilioCreate(input: RunOptions, request: ShipmentRequest): 
         recipientName,
       });
 
+      const finishedAt = new Date().toISOString();
       const result: CreateRunResult = {
         ...base,
-        finishedAt: new Date().toISOString(),
+        finishedAt,
+        durationMs: Date.parse(finishedAt) - Date.parse(startedAt),
         outcome: 'unknown',
         shipment: null,
         reconciliation,
@@ -448,9 +457,11 @@ async function runDomicilioCreate(input: RunOptions, request: ShipmentRequest): 
     const screenshotPath = `${artifactsDir}/shipment-detail.png`;
     const captured = await panel.captureEvidence(screenshotPath);
 
+    const finishedAt = new Date().toISOString();
     const result: CreateRunResult = {
       ...base,
-      finishedAt: new Date().toISOString(),
+      finishedAt,
+      durationMs: Date.parse(finishedAt) - Date.parse(startedAt),
       outcome: 'created',
       shipment,
       reconciliation: null,
@@ -703,6 +714,7 @@ export async function sucursalCreateAgainst(
     journey,
     detailScreenshot: null,
     reportPath: artifactsDir === undefined ? '' : `${artifactsDir}/create-run.json`,
+    durationMs: null,
   };
 
   let shipment: ShipmentDetailReadback;
@@ -722,9 +734,11 @@ export async function sucursalCreateAgainst(
       recipientName: sucursalRecipientName(request),
     });
 
+    const finishedAt = new Date().toISOString();
     const result: CreateRunResult = {
       ...base,
-      finishedAt: new Date().toISOString(),
+      finishedAt,
+      durationMs: Date.parse(finishedAt) - Date.parse(startedAt),
       outcome: 'unknown',
       shipment: null,
       reconciliation,
@@ -736,9 +750,11 @@ export async function sucursalCreateAgainst(
   const screenshotPath = artifactsDir === undefined ? null : `${artifactsDir}/shipment-detail.png`;
   const captured = screenshotPath === null ? false : await panel.captureEvidence(screenshotPath);
 
+  const finishedAt = new Date().toISOString();
   const result: CreateRunResult = {
     ...base,
-    finishedAt: new Date().toISOString(),
+    finishedAt,
+    durationMs: Date.parse(finishedAt) - Date.parse(startedAt),
     outcome: 'created',
     shipment,
     reconciliation: null,

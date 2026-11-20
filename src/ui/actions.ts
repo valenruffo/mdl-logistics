@@ -89,6 +89,7 @@ function refusalOf(stage: RefusalStage, error: unknown): RunResponse {
     details: detailsOf(error),
     recordPath: null,
     note: 'the run stopped before anything was written',
+    durationMs: null,
   };
 }
 
@@ -258,6 +259,8 @@ export interface CreatedResponse {
   detailScreenshot: string | null;
   recordPath: string;
   outcomePath: string;
+  /** Wall-clock duration of the run in ms, from the journey's own start to finish. */
+  durationMs: number | null;
 }
 
 export interface UnknownResponse {
@@ -269,6 +272,8 @@ export interface UnknownResponse {
   recordPath: string;
   outcomePath: string;
   note: string;
+  /** Wall-clock duration of the run in ms, from the journey's own start to finish. */
+  durationMs: number | null;
 }
 
 /**
@@ -285,6 +290,8 @@ export interface NotCreatedResponse {
   recordPath: string;
   outcomePath: string;
   note: string;
+  /** Wall-clock duration of the run in ms, up to and including the abort. */
+  durationMs: number | null;
 }
 
 export interface FailedResponse {
@@ -295,6 +302,8 @@ export interface FailedResponse {
   /** The record file to inspect, when one was already written. */
   recordPath: string | null;
   note: string;
+  /** Wall-clock duration of the run in ms, or `null` when nothing ran to time. */
+  durationMs: number | null;
 }
 
 export type RunResponse =
@@ -310,6 +319,26 @@ const DETAIL_SHIPMENT_CARD = 'Datos del envío';
 
 function cardText(cards: readonly CardReadback[], title: string): string | null {
   return cards.find((card) => card.title === title)?.text ?? null;
+}
+
+/**
+ * The run's own wall-clock duration, in milliseconds, measured where the journey
+ * begins and ends: the executor reports it, so it includes the real panel time.
+ * A fallback derives it from the executor's own timestamps; when neither exists
+ * (a fixture, or an executor that never returned), `null`.
+ */
+function executorDurationMs(result: CreateRunResult): number | null {
+  if (typeof result.durationMs === 'number' && Number.isFinite(result.durationMs) && result.durationMs >= 0) {
+    return result.durationMs;
+  }
+  const ms = Date.parse(result.finishedAt) - Date.parse(result.startedAt);
+  return Number.isFinite(ms) && ms >= 0 ? ms : null;
+}
+
+/** Elapsed since `runAttempt` began — the honest number when the executor threw. */
+function elapsedMs(startedAtMs: number): number | null {
+  const ms = Date.now() - startedAtMs;
+  return Number.isFinite(ms) && ms >= 0 ? ms : null;
 }
 
 function stamp(): string {
@@ -331,6 +360,9 @@ function recordNote(recordPath: string): string {
  * route.
  */
 export async function runAttempt(input: RunInput, deps: ActionDeps): Promise<RunResponse> {
+  // The wall clock for the whole attempt starts before anything is dispatched,
+  // so even a run that never reaches the executor reports how long it took.
+  const startedAtMs = Date.now();
   const built = requestFromForm(input.form);
   if (!built.ok) return { status: 'invalid-form', errors: built.errors };
 
@@ -355,7 +387,7 @@ export async function runAttempt(input: RunInput, deps: ActionDeps): Promise<Run
   }
   const note = openPriorAttemptNote(records, messageHash);
 
-  return await create(request, messageHash, payloadHash, deps);
+  return await create(request, messageHash, payloadHash, deps, startedAtMs);
 }
 
 async function create(
@@ -363,6 +395,7 @@ async function create(
   messageHash: string,
   payloadHash: string,
   deps: ActionDeps,
+  startedAtMs: number,
 ): Promise<RunResponse> {
   const runId = `${stamp()}-${messageHash.slice(0, 12)}`;
   const recordPath = attemptRecordPath(deps.recordDir, runId);
@@ -391,6 +424,7 @@ async function create(
       details: [],
       recordPath: null,
       note: `revisá los permisos de ${deps.recordDir}`,
+      durationMs: null,
     };
   }
 
@@ -399,6 +433,7 @@ async function create(
     result = await deps.executor.runCreate({ request, approvedPayloadHash: payloadHash });
   } catch (error) {
     if (error instanceof UnknownOutcomeError) {
+      const durationMs = elapsedMs(startedAtMs);
       await writeOutcome(deps, {
         runId,
         finishedAt: new Date().toISOString(),
@@ -410,6 +445,7 @@ async function create(
         reconciliation: null,
         reportPath: '',
         recordedBy: 'executor',
+        durationMs,
       });
       return {
         status: 'unknown',
@@ -420,6 +456,7 @@ async function create(
         recordPath,
         outcomePath,
         note: `compará a mano la lista de envíos con el registro ${recordPath}. No se reintenta nada.`,
+        durationMs,
       };
     }
 
@@ -428,6 +465,7 @@ async function create(
       // shipment, so an abort before it resolves itself as `not-created`. The
       // pre-click record stays on disk (crash visibility); only the resolution
       // is automatic, and the message can run again with no human step.
+      const durationMs = elapsedMs(startedAtMs);
       await writeOutcome(deps, {
         runId,
         finishedAt: new Date().toISOString(),
@@ -440,6 +478,7 @@ async function create(
         reportPath: '',
         recordedBy: 'executor',
         reason: `aborted before the create click, at: ${error.stage}`,
+        durationMs,
       });
       return {
         status: 'not-created',
@@ -449,6 +488,7 @@ async function create(
         recordPath,
         outcomePath,
         note: 'no se hizo ningún click: nada se creó. La corrida quedó resuelta como «sin crear» y este mensaje se puede repetir.',
+        durationMs,
       };
     }
 
@@ -458,11 +498,13 @@ async function create(
       details: detailsOf(error),
       recordPath,
       note: recordNote(recordPath),
+      durationMs: elapsedMs(startedAtMs),
     };
   }
 
   if (result.outcome === 'unknown') {
     const reconciliation = result.reconciliation;
+    const durationMs = executorDurationMs(result);
     await writeOutcome(deps, {
       runId,
       finishedAt: result.finishedAt,
@@ -474,6 +516,7 @@ async function create(
       reconciliation,
       reportPath: result.reportPath,
       recordedBy: 'executor',
+      durationMs,
     });
     return {
       status: 'unknown',
@@ -484,10 +527,12 @@ async function create(
       recordPath,
       outcomePath,
       note: `una sola lectura de conciliación es evidencia, no un veredicto. Revisá la lista de envíos y resolvé ${outcomePath} a mano.`,
+      durationMs,
     };
   }
 
   const shipment = result.shipment;
+  const durationMs = executorDurationMs(result);
   // Only the domicilio journey has a summary screen; sucursal goes from screen
   // Q straight to the detail page, so its summary cost card does not exist.
   const cost = {
@@ -506,6 +551,7 @@ async function create(
     reconciliation: null,
     reportPath: result.reportPath,
     recordedBy: 'executor',
+    durationMs,
   });
 
   const problem = labelUnpaidProblem(shipment);
@@ -524,6 +570,7 @@ async function create(
     detailScreenshot: result.detailScreenshot,
     recordPath,
     outcomePath,
+    durationMs,
   };
 }
 

@@ -495,6 +495,12 @@ export interface RunRow {
   outcomeFinishedAt: string | null;
   /** The `#EM<number>` the panel printed, when the run recorded one. */
   shipmentId: string | null;
+  /**
+   * The run's wall-clock duration in ms, when the outcome record carried one.
+   * `null` when the record predates the field, was written by hand, or the
+   * value is unusable — the page then shows the row without a duration.
+   */
+  durationMs: number | null;
   /** Artifact directory, relative to the artifacts root; `null` when unknown. */
   artifactDir: string | null;
   /** True when this record blocks the create path: no outcome, or an unknown one. */
@@ -613,6 +619,7 @@ async function readRawRun(deps: ConsoleDeps, name: string, runId: string, proble
     outcome: null,
     outcomeFinishedAt: null,
     shipmentId: null,
+    durationMs: null,
     artifactDir: null,
     unresolved: true,
     resolution: null,
@@ -667,6 +674,9 @@ async function readOutcome(
   row.outcome = status as RecordedOutcomeStatus;
   row.outcomeFinishedAt = textOf(parsed, 'finishedAt');
   row.shipmentId = textOf(parsed, 'shipmentId');
+
+  const duration = parsed['durationMs'];
+  row.durationMs = typeof duration === 'number' && Number.isFinite(duration) && duration >= 0 ? duration : null;
 
   const reportPath = textOf(parsed, 'reportPath');
   raw.reportPath = reportPath === null || reportPath.trim() === '' ? null : reportPath;
