@@ -19,6 +19,7 @@ import { copyPattern } from './copy';
 import { arsAmountsEqual, formatArsTyping, parseArsAmount } from './currency';
 import { ExecutorError, UnknownOutcomeError, asPreClickAbort, detailsOf, messageOf } from './errors';
 import { readEnvInt } from './env';
+import { digitsMasked } from './mask';
 import { adminAppDashboardUrl, BOT_CHALLENGE_FRAME_HOST, ENVIO_NUBE_FRAME_HOST, VERIFIED_AGENCY_PANEL_URL } from './panel';
 import { gotoAgencyEntry } from './session';
 import { poll, sleep } from './wait';
@@ -175,6 +176,18 @@ const AGENCY_PACKAGE_FIELDS = {
 } as const;
 
 const AGENCY_ZIP_FIELD = 'address.zipCode';
+
+/**
+ * Inputs whose `mask` attribute makes the panel hold the typed text in a normal
+ * form of its own (observed live, Posadas 2026-11-25: the phone input carries
+ * `mask="999999999999999"` and an approved `"376 463-4364"` reads back
+ * `"3764634364"`). The drift check must compare those fields by the mask's
+ * form: a byte-for-byte comparison against the approved spelling reports a
+ * false drift, the one refill pass would then re-type the field — the doubled
+ * `customer.phoneNumber` write the Posadas trace captured — and the walk would
+ * abort on the mask's own normalization before the package fill ever ran.
+ */
+const MASKED_INPUT_FIELDS: ReadonlySet<string> = new Set([AGENCY_RECIPIENT_FIELDS.phoneNumber]);
 const FREIGHT_OPTION_FIELD = 'freight-option';
 const SUCURSAL_SELECT_FIELD = 'sucursal';
 
@@ -1239,9 +1252,22 @@ export class EnvioNube {
         .first()
         .inputValue({ timeout: 3_000 })
         .catch(() => '<unreadable>');
-      if (actual !== field.value) drift.push({ name: field.name, expected: field.value, actual });
+      // A masked input normalizes what it holds (the panel's phone keeps only
+      // digits). The mask's own form is never drift: `digitsMasked` compares
+      // it as the mask holds it. A value the mask did NOT keep — an empty
+      // readback, different digits, a panel that dropped the write — still
+      // reports drift, and the run stops after its one refill.
+      if (actual !== field.value && !this.maskHoldsApproval(field.name, field.value, actual)) {
+        drift.push({ name: field.name, expected: field.value, actual });
+      }
     }
     return drift;
+  }
+
+  /** True when a masked input's value is the mask's own form of the approved value. */
+  private maskHoldsApproval(name: string, expected: string, actual: string): boolean {
+    if (!MASKED_INPUT_FIELDS.has(name)) return false;
+    return digitsMasked(expected) === digitsMasked(actual);
   }
 
   /** Everything the panel holds on screen 3 plus its own hint texts, for a loud stop. */

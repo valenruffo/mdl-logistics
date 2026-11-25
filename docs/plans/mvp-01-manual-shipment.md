@@ -253,6 +253,17 @@ navigation makes them moot.
 
 ### Sucursal — Screen P — `#/agency-shipment` → recipient + package
 
+**Bug real encontrado (Posadas, 2026-11-25):** el trace del executor muestra el phone field
+fill+type **dos veces** y **cero writes de los campos del paquete** (box.height/width/depth/weight/
+declaredValue) — the recipient fill ran twice and the package fill never ran, so screen P had an
+empty package with "Ingresá el alto" and the walk aborted pre-click (auto-resolved, retry-free).
+
+**Known trigger pattern:** both observed failures came from the **queue path** (two consecutive
+dequeued sucursal runs, `sin crear · 14s/16s`), while the interactive Jujuy run succeeded. Working
+hypothesis: the queue's second journey reuses a page/frame state left by the first, and the fill
+sequence short-circuits (the phone's double write is the fingerprint). The fix must eliminate the
+double write and make the fill order observable per step (fill log assertions in the harness).
+
 First sucursal screen. No address section at all — the destination is only a postal code, entered
 on the next screen.
 

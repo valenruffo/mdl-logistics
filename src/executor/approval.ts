@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { canonicalArsAmount } from './currency';
 import { branchIdentity } from './branch';
+import { maskedPhoneOf } from './mask';
 import type { ShipmentRequest, SucursalShipmentRequest } from '../core/types';
 import type { AgencyScreenReadback } from './envioNube';
 import type { CarrierReadback, CostReadback, RecipientReadback } from './envioNube';
@@ -160,7 +161,10 @@ export function sucursalApprovalPayloadFromRequest(
       name: request.customer.name,
       surname: request.customer.lastName ?? '',
       email: request.customer.email ?? '',
-      phone: request.customer.phone ?? '',
+      // The panel's phone input is masked and holds the approved text's digits:
+      // the payload is the mask's form, so the hash compares what the panel can
+      // hold ("376 463-4364" approved, "3764634364" hashed). See ./mask.
+      phone: maskedPhoneOf(request.customer.phone),
     },
   };
 }
@@ -197,7 +201,9 @@ export function sucursalApprovalPayloadFromReadback(readback: {
       name: readback.screen.name,
       surname: readback.screen.surname,
       email: readback.screen.email,
-      phone: readback.screen.phone,
+      // Same mask rule as the request side: compare the digits the panel's
+      // phone mask holds, never the spelling the message carried.
+      phone: maskedPhoneOf(readback.screen.phone),
     },
   };
 }

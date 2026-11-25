@@ -31,6 +31,7 @@ import {
 } from './envioNube';
 import { arsAmountsEqual, parseArsAmount } from './currency';
 import { branchIdentity } from './branch';
+import { maskedPhoneOf } from './mask';
 import { ExecutorError, PreClickAbortError, UnknownOutcomeError, asPreClickAbort, detailsOf, messageOf } from './errors';
 import { openSession } from './session';
 
@@ -484,7 +485,9 @@ export function sucursalScreenPairs(
     // The request's `lastName` fills the panel's `customer.surname` anchor.
     { label: 'customer.surname', expected: request.customer.lastName ?? '', actual: screen.surname },
     { label: 'customer.email', expected: request.customer.email ?? '', actual: screen.email },
-    { label: 'customer.phoneNumber', expected: request.customer.phone ?? '', actual: screen.phone },
+    // The panel's phone input is masked and holds the approved text's digits:
+    // diff the mask's form (see ./mask), never the message's spelling.
+    { label: 'customer.phoneNumber', expected: maskedPhoneOf(request.customer.phone), actual: screen.phone },
     { label: 'box.height (cm)', expected: String(request.box.heightCm), actual: screen.height },
     { label: 'box.width (cm)', expected: String(request.box.widthCm), actual: screen.width },
     { label: 'box.depth (cm)', expected: String(request.box.depthCm), actual: screen.depth },
@@ -586,7 +589,15 @@ export async function walkSucursalToQuotation(
   request: SucursalShipmentRequest,
 ): Promise<SucursalJourneyReadback> {
   await panel.openAgencyEntry();
-  await panel.fillAgencyRecipient({ customer: request.customer });
+  // The phone is written in the panel's own masked form (see ./mask): the mask
+  // keeps the typed digits unchanged, so this is one write, and the drift
+  // check after the block has nothing to refill.
+  await panel.fillAgencyRecipient({
+    customer: {
+      ...request.customer,
+      phone: request.customer.phone === null ? null : maskedPhoneOf(request.customer.phone),
+    },
+  });
   await panel.fillAgencyPackage(request.box);
   const screen = await panel.readAgencyScreen();
   assertFormStillHolds('sucursal screen P (#/agency-shipment)', sucursalScreenPairs(request, screen));

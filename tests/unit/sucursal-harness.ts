@@ -31,6 +31,15 @@ export interface HarnessOption {
   text: string;
 }
 
+export interface HarnessWrite {
+  /** The written input's `name` attribute (the selector the executor targets). */
+  name: string;
+  /** `fill` for a programmatic value write, `type` for a typed text sequence. */
+  kind: 'fill' | 'type';
+  /** The value the write tried to land (as the executor passed it). */
+  value: string;
+}
+
 export interface HarnessOptions {
   /** Sucursal dropdown options; defaults to the observed CP 1419 list (plan §4c). */
   branches?: HarnessOption[];
@@ -46,6 +55,12 @@ export interface HarnessOptions {
    * masked readback that disagrees with the approved amount.
    */
   declaredValueFrozen?: boolean;
+  /**
+   * Models a phone mask whose controlled state refuses typed input (the value
+   * stays digits-empty): used to prove the executor still stops loudly when a
+   * masked field genuinely drops the approved value — one refill, then a stop.
+   */
+  phoneMaskFrozen?: boolean;
   /**
    * The frame route the fake session starts on — what a previous run left open.
    * Defaults to the agency screen; `/create-single-shipment` models the observed
@@ -91,7 +106,11 @@ export interface SucursalHarness {
   checkedFreightLabel(): string | null;
   /** How many times the create button was actually clicked. */
   createClickCount(): number;
-  /** Whether the deferred quotation section of screen Q has rendered. */
+  /** Writes per input name (derived from the harness's write log). */
+  writeCounts(): Record<string, number>;
+  /** The fill log itself, in walk order. */
+  writes(): readonly HarnessWrite[];
+  /** The screen Q section reveal state. */
   quotationSectionRevealed(): boolean;
 }
 
@@ -123,6 +142,13 @@ class El {
   maskFrozen = false;
   /** The mask's internal digit accumulator (only meaningful when currencyMask). */
   maskDigits = '';
+  /**
+   * A digit-masked input (`mask="999999999999999"` and friends): every typed
+   * character the mask keeps is a digit, so the panel normalizes the typed
+   * text to its digits — the phone field's observed live shape (Posadas
+   * 2026-11-25 trace: `"376 463-4364"` reads back `"3764634364"`).
+   */
+  digitMask = false;
   /** Change/blur hook (the deferred-quotation zip trigger); otherwise unused. */
   onChange: (() => void) | null = null;
 
@@ -333,6 +359,7 @@ class FakeLocator {
 
   async fill(value: string): Promise<void> {
     const el = this.one();
+    this.harness.recordWrite(el, 'fill', value);
     if (el.currencyMask) {
       // A programmatic write is what the real mask reinterprets (the observed
       // live failure): the raw digits land as a cent amount — `fill("100000")`
@@ -341,24 +368,43 @@ class FakeLocator {
       el.value = el.maskDigits === '' ? '' : formatArsMask(Number(el.maskDigits) / 100);
       return;
     }
+    if (el.digitMask) {
+      // The digit mask keeps only what it accepts: a programmatic write lands
+      // as its digits, exactly like the real input's mask. A frozen mask
+      // refuses everything: the value never changes.
+      if (!el.maskFrozen) el.value = value.replace(/[^0-9]/g, '');
+      return;
+    }
     el.value = value;
   }
 
   async pressSequentially(value: string): Promise<void> {
     const el = this.one();
-    if (!el.currencyMask) {
+    this.harness.recordWrite(el, 'type', value);
+    if (!el.currencyMask && !el.digitMask) {
       el.value = el.value + value;
       return;
     }
-    if (el.maskFrozen) return;
-    // Real key events: every typed digit accumulates into the mask's cent
-    // amount and the display is reformatted — typing `"100000,00"` lands on
-    // `$ 100.000,00` (100000 ARS), while the bare `"100000"` lands on
-    // `$ 1.000,00` (1000 ARS), the observed live failure.
-    for (const char of value) {
-      if (/\d/.test(char)) el.maskDigits += char;
+    if (el.currencyMask) {
+      if (el.maskFrozen) return;
+      // Real key events: every typed digit accumulates into the mask's cent
+      // amount and the display is reformatted — typing `"100000,00"` lands on
+      // `$ 100.000,00` (100000 ARS), while the bare `"100000"` lands on
+      // `$ 1.000,00` (1000 ARS), the observed live failure.
+      for (const char of value) {
+        if (/\d/.test(char)) el.maskDigits += char;
+      }
+      el.value = el.maskDigits === '' ? '' : formatArsMask(Number(el.maskDigits) / 100);
+      return;
     }
-    el.value = el.maskDigits === '' ? '' : formatArsMask(Number(el.maskDigits) / 100);
+    // Digit mask: every character the mask keeps is a digit — `"376 463-4364"
+    // (the approved spelling) is held as `"3764634364"` (the mask's own form),
+    // the observed live normalization the Posadas trace captured. A frozen
+    // mask refuses the typed input: the value never changes.
+    if (el.maskFrozen) return;
+    for (const char of value) {
+      if (/[0-9]/.test(char)) el.value += char;
+    }
   }
 
   async press(key?: string): Promise<void> {
@@ -479,6 +525,10 @@ const QUOTATION_TICK_MS = 120;
 
 class Harness {
   readonly clicks: string[] = [];
+  /** The fill log: one entry per value write (a fill with a value, a typed
+   * sequence); clears (`fill("")`, the masked field's Backspace) are part of
+   * a write's cycle, not writes of their own. */
+  readonly writeLog: HarnessWrite[] = [];
   private readonly navigations: string[] = [];
   /** Wall-clock ms timestamp of every goto, in order: the pacing evidence between hops. */
   private readonly gotoTimes: number[] = [];
@@ -569,6 +619,22 @@ class Harness {
     this.createClicked += 1;
   }
 
+  /** Counts a write only when it carries a value into a named input. */
+  recordWrite(el: El, kind: HarnessWrite['kind'], value: string): void {
+    const name = el.attrs['name'];
+    if (name === undefined || value === '') return;
+    this.writeLog.push({ name, kind, value });
+  }
+
+  /** Writes per input name, in walk order — indexed by the panel anchor. */
+  writeCounts(): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const write of this.writeLog) {
+      counts[write.name] = (counts[write.name] ?? 0) + 1;
+    }
+    return counts;
+  }
+
   /** Timestamps the pacing wait between the two entry hops: one stamp per fake goto. */
   recordGoto(): void {
     this.gotoTimes.push(Date.now());
@@ -642,6 +708,8 @@ class Harness {
       },
       createClickCount: (): number => this.createClicked,
       quotationSectionRevealed: (): boolean => this.quotationRevealed,
+      writeCounts: (): Record<string, number> => this.writeCounts(),
+      writes: (): readonly HarnessWrite[] => this.writeLog,
     };
   }
 }
@@ -697,6 +765,23 @@ function fieldDiv(label: string, name: string, value: string): El {
   return div;
 }
 
+/**
+ * The phone field exactly as the real panel renders it: an input masked with
+ * `mask="999999999999999"` (Posadas 2026-11-25 trace) — the mask keeps only
+ * the typed digits, so the panel normalizes an approved `"376 463-4364"` to
+ * `"3764634364"`. This is the trait that made the drift check report a false
+ * mismatch and double-write the field.
+ */
+function maskedPhoneField(options: HarnessOptions): El {
+  const div = new El('div', { class: 'field' });
+  div.append(new El('label', {}, 'Teléfono (opcional)'));
+  const input = new El('input', { name: 'customer.phoneNumber', mask: '999999999999999' });
+  input.digitMask = true;
+  input.maskFrozen = options.phoneMaskFrozen === true;
+  div.append(input);
+  return div;
+}
+
 function measureDiv(
   label: string,
   name: string,
@@ -743,7 +828,7 @@ function buildScreenP(harness: Harness, options: HarnessOptions): El {
     fieldDiv('Nombre', 'customer.name', ''),
     fieldDiv('Apellido', 'customer.surname', ''),
     fieldDiv('Email (opcional)', 'customer.email', ''),
-    fieldDiv('Teléfono (opcional)', 'customer.phoneNumber', ''),
+    maskedPhoneField(options),
     measureDiv('Alto', 'box.height', '', units.height),
     measureDiv('Ancho', 'box.width', '', units.width),
     measureDiv('Profundidad', 'box.depth', '', units.depth),
@@ -933,6 +1018,8 @@ export function buildSucursalHarness(options: HarnessOptions = {}): SucursalHarn
     selectedBranchValue: harness.state().selectedBranchValue,
     checkedFreightLabel: harness.state().checkedFreightLabel,
     createClickCount: harness.state().createClickCount,
+    writeCounts: harness.state().writeCounts,
+    writes: harness.state().writes,
     quotationSectionRevealed: harness.state().quotationSectionRevealed,
   };
 }
