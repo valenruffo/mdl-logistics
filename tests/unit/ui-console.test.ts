@@ -608,6 +608,7 @@ test('the routes are the page, its script, the shipment actions and the console 
     [
       'GET /',
       'GET /api/console',
+      'GET /api/queue',
       'GET /app.js',
       'GET /login',
       'POST /api/analyze',
@@ -728,11 +729,18 @@ test('candidate purchase paths are 404 and grant nothing', async () => {
   }
 });
 
-test('the HTTP layer creates without ceremony and still refuses a duplicate', async () => {
+test('the HTTP layer stacks without ceremony and the queue still refuses a duplicate', async () => {
   const fake = fakeExecutor();
   const { startUiServer } = await import('../../src/ui/server');
   const d = await deps(fake.executor);
   const started = await startUiServer({ port: 0, deps: d, auth: TEST_AUTH });
+
+  /** The queue snapshot, read through the route like the page does. */
+  const queueGet = async (): Promise<Record<string, unknown>> => {
+    const response = await authFetch(`${started.url}/api/queue`);
+    assert.equal(response.status, 200);
+    return (await response.json()) as Record<string, unknown>;
+  };
 
   try {
     const rejected = await post(`${started.url}/api/analyze`, { message: withoutLine(HAPPY_MESSAGE, 'Calle') });
@@ -743,16 +751,30 @@ test('the HTTP layer creates without ceremony and still refuses a duplicate', as
     const form = formValuesFromFields(analyzed.fields);
 
     // The whole creation request: the message, the values on screen and the mode.
-    const created = await post(`${started.url}/api/run`, { message: HAPPY_MESSAGE, form, mode: 'create' });
-    assert.equal(created.status, 'created');
-    assert.equal(created.shipmentId, '#EM9999');
-    assert.equal(fake.calls.length, 1);
+    // It answers at once — the approved payload went into the queue, the panel
+    // was never touched by the POST itself.
+    const enqueued = await post(`${started.url}/api/run`, { message: HAPPY_MESSAGE, form, mode: 'create' });
+    assert.equal(enqueued.status, 'enqueued');
+    assert.match(String(enqueued.queueId), /^\d{6}-[0-9a-f]{12}$/);
 
-    // The same message again is the duplicate the gate exists to stop.
+    const drained = await waitDrained(queueGet);
+    const first = drained.entries[0];
+    assert.equal(first.state, 'creada');
+    assert.equal(first.shipmentId, '#EM9999');
+    assert.equal(fake.calls.length, 1, 'the executor ran exactly once, from the worker');
+
+    // The same message again: nothing was refused at the POST — the gate runs
+    // when the entry reaches the head of the queue — and the queue refuses it
+    // there, with the panel naming the reason.
     const duplicate = await post(`${started.url}/api/run`, { message: HAPPY_MESSAGE, form, mode: 'create' });
-    assert.equal(duplicate.status, 'refused');
-    assert.equal(duplicate.stage, 'prior-attempt');
-    assert.equal(fake.calls.length, 1, 'the second request never reached the panel');
+    assert.equal(duplicate.status, 'enqueued');
+    assert.equal(fake.calls.length, 1, 'the second request reached neither the POST nor the panel: the gate is later');
+
+    const reDrained = await waitDrained(queueGet);
+    const refused = reDrained.entries[0];
+    assert.equal(refused.state, 'rechazada', 'the duplicate never drove the panel: the queue refused it at execution');
+    assert.match(String(refused.reason), /already created a shipment/i);
+    assert.equal(fake.calls.length, 1, 'one shipment, never two');
 
     const badUser = await authFetch(`${started.url}/api/run`, { method: 'POST', body: 'not json' });
     assert.equal(badUser.status, 400);
@@ -760,6 +782,19 @@ test('the HTTP layer creates without ceremony and still refuses a duplicate', as
     await started.close();
   }
 });
+
+/** Polls `/api/queue` until nothing is waiting or running. */
+async function waitDrained(queueGet: () => Promise<Record<string, unknown>>): Promise<Record<string, unknown>> {
+  let snapshot: Record<string, unknown> = {};
+  const startedAt = Date.now();
+  for (;;) {
+    snapshot = await queueGet();
+    const entries = (snapshot['entries'] ?? []) as Array<Record<string, unknown>>;
+    if (snapshot['pending'] === 0 && entries.length > 0) return snapshot;
+    if (Date.now() - startedAt > 30_000) throw new Error('the queue never drained');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
 
 async function post(url: string, body: unknown): Promise<Record<string, unknown>> {
   const response = await authFetch(url, {

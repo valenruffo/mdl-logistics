@@ -113,6 +113,24 @@ function post(url: string, body: unknown): Promise<Response> {
   });
 }
 
+/** Reads the queue snapshot the way the page does. */
+async function queueGet(url: string): Promise<{ entries: unknown[]; pending: number }> {
+  const response = await fetch(`${url}/api/queue`, { headers: { cookie: sessionCookieHeader() } });
+  assert.equal(response.status, 200);
+  return (await response.json()) as { entries: unknown[]; pending: number };
+}
+
+/** Polls `/api/queue` until the entry drained; the budget tolerates a busy suite. */
+async function waitDrained(url: string): Promise<{ entries: unknown[]; pending: number }> {
+  const startedAt = Date.now();
+  for (;;) {
+    const snapshot = await queueGet(url);
+    if (snapshot.pending === 0 && snapshot.entries.length > 0) return snapshot;
+    if (Date.now() - startedAt > 30_000) throw new Error('the queue never drained');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 // ------------------------------------------------------- 1. no native dialog
 
 test('neither the page nor the client script can open a native dialog', async () => {
@@ -157,15 +175,23 @@ test('create mode works without an approval hash or a token, and records no conf
     const form = formValuesFromFields(analysis.fields);
 
     // The whole request: message, the values on screen, mode. Nothing else.
+    // It is answered at once: the approved payload went into the queue.
     const created = await post(`${started.url}/api/run`, { message: HAPPY_MESSAGE, form, mode: 'create' });
     assert.equal(created.status, 200);
-    const body = (await created.json()) as { status: string; shipmentId: string; recordPath: string };
-    assert.equal(body.status, 'created', 'no ceremony stands between the click and the shipment');
-    assert.equal(body.shipmentId, '#EM9999');
+    const body = (await created.json()) as { status: string; queueId: string; position: number };
+    assert.equal(body.status, 'enqueued', 'no ceremony stands between the click and the queue');
+    assert.match(body.queueId, /^\d{6}-[0-9a-f]{12}$/);
+    assert.equal(body.position, 1);
 
-    // The pre-click record exists, and it carries no typed confirmation: there is
-    // no token on this surface to record.
-    const record = JSON.parse(await readFile(body.recordPath, { encoding: 'utf8' })) as Record<string, unknown>;
+    // The worker drains it through the same executor path, and the pre-click
+    // record exists, carrying no typed confirmation: there is no token on this
+    // surface to record.
+    const entries = (await waitDrained(started.url)).entries as Array<Record<string, unknown>>;
+    assert.equal(entries[0]['state'], 'creada');
+    assert.equal(entries[0]['shipmentId'], '#EM9999');
+    const record = JSON.parse(
+      await readFile(String(entries[0]['recordPath']), { encoding: 'utf8' }),
+    ) as Record<string, unknown>;
     assert.equal(record['messageHash'], messageFingerprint(HAPPY_MESSAGE));
     assert.equal(record['approvalHash'], PAYLOAD_HASH, 'the payload hash is the server-computed one');
     assert.equal('confirmation' in record, false, 'the UI path has no token to record');
@@ -212,21 +238,28 @@ test('a message that already created a shipment is still refused, with nothing c
       { encoding: 'utf8' },
     );
 
+    // The POST answers at once; the refusal happens when the entry reaches the
+    // head of the queue, so the panel carries it.
     const response = await post(`${started.url}/api/run`, {
       message: HAPPY_MESSAGE,
       form: fixtureForm(),
       mode: 'create',
     });
     assert.equal(response.status, 200);
-    const body = (await response.json()) as { status: string; stage: string; reason: string; details: string[] };
-    assert.equal(body.status, 'refused');
-    assert.equal(body.stage, 'prior-attempt');
-    assert.match(body.reason, /already created a shipment/i);
-    assert.match(body.details.join('\n'), /#EM1053/, 'the existing shipment is named');
+    const body = (await response.json()) as { status: string };
+    assert.equal(body.status, 'enqueued', 'the gate is at execution time, not in the POST');
 
-    // Nothing new was written: the only files are the seeded pair.
-    const entries = await readdir(target.recordDir);
-    assert.deepEqual(entries.sort(), [`${runId}.json`, `${runId}.outcome.json`].sort());
+    const entries = (await waitDrained(started.url)).entries as Array<Record<string, unknown>>;
+    assert.equal(entries.length, 1, 'the refused entry stays on the panel');
+    assert.equal(entries[0]['state'], 'rechazada');
+    const reason = String(entries[0]['reason']);
+    assert.match(reason, /already created a shipment/i);
+    assert.match(reason, /#EM1053/, 'the existing shipment is named');
+    assert.equal(entries[0]['shipmentId'], null, 'nothing was created by the refused entry');
+
+    // Nothing new was written on the records: the gate refuses before any file.
+    const files = await readdir(target.recordDir);
+    assert.deepEqual(files.sort(), [`${runId}.json`, `${runId}.outcome.json`].sort());
   } finally {
     await started.close();
     await cleanup(target);
@@ -251,16 +284,21 @@ test('an unresolved prior attempt for the same message is still refused', async 
       note: 'written before the click',
     });
 
+    // The POST answers at once; the unresolved-record gate runs at execution.
     const response = await post(`${started.url}/api/run`, {
       message: HAPPY_MESSAGE,
       form: fixtureForm(),
       mode: 'create',
     });
     assert.equal(response.status, 200);
-    const body = (await response.json()) as { status: string; stage: string; details: string[] };
-    assert.equal(body.status, 'refused');
-    assert.equal(body.stage, 'prior-attempt');
-    assert.match(body.details.join('\n'), /\.outcome\.json/, 'the operator is told which record to resolve');
+    const body = (await response.json()) as { status: string };
+    assert.equal(body.status, 'enqueued');
+
+    const entries = (await waitDrained(started.url)).entries as Array<Record<string, unknown>>;
+    assert.equal(entries[0]['state'], 'rechazada');
+    const reason = String(entries[0]['reason']);
+    assert.match(reason, /attempted-unresolved/, 'the open attempt is named');
+    assert.equal(entries[0]['recordPath'], null, 'the refusal happened before any record was written');
     assert.equal(
       (await readdir(target.recordDir)).includes(`${runId}.outcome.json`),
       false,

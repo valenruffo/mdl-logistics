@@ -31,6 +31,7 @@ import {
   type AuthConfig,
 } from './auth';
 import { DEFAULT_PORT, startUiServer } from './server';
+import { QUEUE_DIR, queueFor } from './queue';
 import { SESSION_CHECK_HISTORY_PATH, runSessionCheckScript } from './sessionCheck';
 
 const executor: UiExecutor = {
@@ -47,6 +48,10 @@ const deps: ActionDeps = {
     sessionCheckRunner: runSessionCheckScript,
   },
 };
+
+// The queue starts with the process, not with the first request: entries stacked
+// before a restart are recovered and drained as soon as the console is up.
+queueFor(deps);
 
 function usage(): string {
   return [
@@ -133,6 +138,7 @@ if (args.error !== null) {
   console.log('  uso local: entrá por el proxy TLS o por un tunel SSH (ver env.example); no hay forma de apagar Secure.');
   console.log('  un solo password se verifica a la vez; los intentos se cuentan por cliente, no por el proxy.');
   console.log(`  registros de ejecucion: ${RUN_RECORD_DIR}`);
+  console.log(`  cola de envios: ${QUEUE_DIR} (persistente: sobrevive reinicios, se crea de a uno)`);
   console.log(`  artefactos: ${ARTIFACTS_DIR} (se listan en la pagina; no se sirven por HTTP)`);
   console.log(`  historial del chequeo de sesion: ${SESSION_CHECK_HISTORY_PATH}`);
   console.log('  el chequeo de sesion abre un navegador: solo corre con el boton de la pagina.');

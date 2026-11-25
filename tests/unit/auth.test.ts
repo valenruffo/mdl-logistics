@@ -484,11 +484,13 @@ test('the console routes and the run route keep their behaviour once authenticat
     const started = await start(target);
     const cookie = sessionCookieHeader();
     try {
-      // Two browser-taking routes still collide on the one lock: the 409 is the
-      // lock's, not the auth layer's, so an authenticated request is never turned
-      // into a 401 by the new gate.
-      const holder = await import('../../src/ui/lock');
-      const lease = holder.browserLock.tryAcquire('session-check');
+      // Two browser-taking routes and the lock: POST /api/run no longer takes
+      // the browser lock (v0.4.0), so an authenticated run POST is answered even
+      // while a check runs — here with the invalid-form verdict, since this
+      // request carries no message or values — never a 401, and never a second
+      // Chromium. The lock collision itself now lives on /api/session-check.
+      const holder = import('../../src/ui/lock');
+      const lease = (await holder).browserLock.tryAcquire('session-check');
       assert.equal(lease.ok, true);
 
       const busyRun = await fetch(`${started.url}/api/run`, {
@@ -496,9 +498,17 @@ test('the console routes and the run route keep their behaviour once authenticat
         headers: { 'content-type': 'application/json', cookie },
         body: JSON.stringify({ mode: 'create' }),
       });
-      assert.equal(busyRun.status, 409);
-      const busyBody = (await busyRun.json()) as { status: string };
+      assert.equal(busyRun.status, 200, 'the run route answers while the lock is held elsewhere');
+      const busyRunBody = (await busyRun.json()) as { status: string };
+      assert.equal(busyRunBody.status, 'invalid-form', 'nothing was stacked without values');
+
+      // The second browser request while one is running is still a 409 whose
+      // answer carries the lock's sentence, not the auth layer's.
+      const busyCheck = await fetch(`${started.url}/api/session-check`, { method: 'POST', headers: { cookie } });
+      assert.equal(busyCheck.status, 409);
+      const busyBody = (await busyCheck.json()) as { status: string; reason: string; heldBy: string };
       assert.equal(busyBody.status, 'busy');
+      assert.equal(busyBody.heldBy, 'session-check');
 
       if (lease.ok) lease.release();
       assert.equal(browserLock.free, true);

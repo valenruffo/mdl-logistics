@@ -52,6 +52,16 @@ declare module 'node:fs' {
   export function accessSync(path: string, mode?: number): void;
 }
 
+/**
+ * One extra `node:fs/promises` export the queue needs, merged into the ambient
+ * module declaration `src/executor/globals.d.ts` already provides. The queue
+ * writes each entry file through a temp file plus an atomic rename, so a
+ * concurrent `/api/queue` snapshot can never read a half-written entry.
+ */
+declare module 'node:fs/promises' {
+  export function rename(from: string, to: string): Promise<void>;
+}
+
 declare module 'node:child_process' {
   export interface ChildOutput {
     setEncoding(encoding: string): void;

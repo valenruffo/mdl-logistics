@@ -42,7 +42,7 @@ import { CARRIER_NAME } from '../core/carrier';
  * here and adds a line to `CHANGELOG` below, so the operator can tell from the
  * sidebar whether the deployed page is the version of the change.
  */
-export const APP_VERSION = '0.3.0';
+export const APP_VERSION = '0.4.0';
 
 /**
  * What each shipped version carried, newest first, maintained by hand. The
@@ -51,6 +51,7 @@ export const APP_VERSION = '0.3.0';
  * Keep it to the last few versions.
  */
 export const CHANGELOG: ReadonlyArray<{ readonly version: string; readonly note: string }> = [
+  { version: '0.4.0', note: 'cola de envíos persistente: encolá varios y se crean solos, uno por uno' },
   { version: '0.3.0', note: 'duración de cada corrida, Analizar habilitado durante la corrida, panel de Corridas a la derecha' },
   { version: '0.2.0', note: 'sucursal punta a punta, cola de envíos, progreso por pasos, match por calle+número' },
   { version: '0.1.0', note: 'MVP domicilio' },
@@ -175,9 +176,16 @@ export const PAGE_HTML = `<!doctype html>
   .work { padding:36px 40px 64px; }
   /* The operator's desk: the message + fields + create column on the left, the
      workers panel (Corridas) on the right. Two columns on wide screens, stacked
-     with the left column first on narrow ones. */
+     with the left column first on narrow ones. The operator's red sketch (v0.4.0):
+     the two columns must top-align — same top edge, the workers panel sitting
+     beside the message column, never floating above-right. The placement is
+     therefore pinned explicitly: both columns are grid item 1 of row 1
+     (align-self:start), so no auto-placement order or column stretching can
+     ever offset them again. */
   .desk { max-width:1080px; margin:0 auto; display:grid; grid-template-columns:minmax(0,720px) minmax(240px,1fr);
           gap:32px; align-items:start; }
+  .desk > .col { grid-column:1; grid-row:1; align-self:start; min-width:0; }
+  .desk > .workers { grid-column:2; grid-row:1; align-self:start; margin:0; min-width:0; }
   .col { min-width:0; }
   h1 { font-size:28px; line-height:1.2; letter-spacing:-.02em; margin:0 0 6px; }
   .sub { color:var(--muted); margin:0 0 26px; }
@@ -260,10 +268,10 @@ export const PAGE_HTML = `<!doctype html>
   .progress-percent { font-variant-numeric:tabular-nums; margin:10px 0 0; }
   .result-duration { font-variant-numeric:tabular-nums; }
 
-  /* The workers panel: the runs executing or recently executed, each one
-     small card with its id, outcome word, start time and duration. The list
-     scrolls inside itself — the same honest cap the rail's Corridas block had,
-     now painted from the work column's own palette. */
+  /* The workers panel: the queue entries, each one a small card with its id,
+     state, start time and duration. The list scrolls inside itself — the same
+     honest cap the rail's Corridas block had, now painted from the work
+     column's own palette. */
   .workers { min-width:0; }
   .workers-list { list-style:none; margin:14px 0 0; padding:0; max-height:70vh; overflow-y:auto;
                   scrollbar-width:thin; scrollbar-color:var(--line) transparent; }
@@ -274,12 +282,15 @@ export const PAGE_HTML = `<!doctype html>
                      font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
   .workers-list li:last-child { border-bottom:0; }
   .workers-list .meta { color:var(--muted); font-size:11.5px; }
-  /* The in-flight run is the first worker card, with its live estimate. */
-  .worker.in-flight { border:1px solid var(--line); background:var(--field); border-radius:8px;
+  /* The entry being created is the first worker card, with its step checklist
+     and its approximate percentage; a waiting entry carries the same card
+     styling, so the stack reads as a queue. */
+  .worker.in-flight, .worker.waiting { border:1px solid var(--line); background:var(--field); border-radius:8px;
                       padding:10px 12px; margin:0 0 4px; }
   .worker-line { display:block; }
   .worker-progress { display:block; font-size:12px; color:var(--muted); margin-top:4px;
                      font-variant-numeric:tabular-nums; }
+  .worker .progress-steps { margin-top:6px; }
 
   /* Narrow screens: the rail stacks on top of the work column and flows with
      the page again — sticky, viewport height and overflow clipping are wide
@@ -369,7 +380,7 @@ export const PAGE_HTML = `<!doctype html>
             <button class="primary" type="button" id="create" disabled>Crear envío</button>
             <span class="note">Crear no cobra. La etiqueta se paga aparte.</span>
           </div>
-          <p class="hint" id="single-flight-note">Una corrida a la vez: el panel maneja un solo navegador. Mientras una corre, Analizar sigue funcionando para preparar el siguiente mensaje.</p>
+          <p class="hint" id="single-flight-note">Los envíos se crean de a uno (un solo navegador): podés encolar varios seguidos y el agente los crea solo, en orden.</p>
 
           <p class="inline-status" id="run-status" role="status" aria-live="polite"></p>
           <div class="inline-result" id="result" aria-live="polite"></div>

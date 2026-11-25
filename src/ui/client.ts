@@ -13,26 +13,27 @@
  *   `Probar en seco` button is gone; the executor's dry run stays a dev-tool
  *   capability). It never computes or echoes an approval hash and there is no
  *   token input to fill: creating a shipment costs nothing (R10 as amended).
- * - **A queue, not a one-shot.** A confirmed `created` resets only the inputs —
- *   message, fields, preview — so the operator pastes the next message right
- *   away; the result card keeps showing the created `#EM`. A failure or a
- *   refusal keeps the form untouched for a fix-and-retry, and every run
- *   response re-fetches the rail so the new run shows up without a reload.
- *   One refinement the operator asked for: `Analizar` never locks, so the next
- *   message can be analyzed *while* the current one runs — the preview is pure
- *   parsing, no browser. When the response then arrives, that analyzed message
- *   stays on screen and `Crear envío` is enabled again immediately; a preview
- *   prepared during the run is never wiped by the queue reset.
- * - **One run at a time, said out loud.** The executor is single-flight (one
- *   Chromium, one session), so `Crear envío` disables while a run is in flight
- *   and the page says why next to it: `Una corrida a la vez: el panel maneja un
- *   solo navegador.` A second create attempt is refused by the server's 409,
- *   and the refusal is shown in the page as always.
- * - **Every run has a duration.** The run response carries `durationMs`,
- *   measured where the journey begins and ends, persisted in the outcome record
- *   and shown three ways: the created card's `Duración: 19,4 s` line, the
- *   workers panel's rows (`#EM1068 · creada · 02:07 · 19s`), and as the final
- *   line of the real post-run card that snaps over the estimate.
+ * - **The queue answers at once.** `Crear envío` posts the approved submission
+ *   and the server answers `enqueued` immediately (`POST /api/run`, v0.4.0): the
+ *   payload is stored server-side, so the form clears the moment the entry is
+ *   stacked — nothing to re-paste — and the workers panel shows the new entry as
+ *   `en espera`. The server's worker drains the queue one entry at a time with
+ *   the existing gates (duplicate message, unresolved prior attempt) run at
+ *   execution time; an entry whose gates refuse shows as `rechazada` with its
+ *   reason, never retried.
+ * - **Honest progress on the worker card.** While a queue entry is `en proceso`
+ *   the card carries the journey's step checklist and an approximate percentage
+ *   (the same `JOURNEY_STEPS` estimate as before), computed from the entry's own
+ *   start instant: the server runs on, the page polls whose turn is done.
+ *   While any entry is `en espera` or `en proceso` the page polls
+ *   `GET /api/queue` every ~3 s; when the queue empties the interval stops.
+ *   Nothing says "creado" before the poll actually reports it.
+ * - **Every run has a duration.** The drained journey measures its own
+ *   wall-clock duration, the entry persists it, and the panel row and the
+ *   post-run card show it (`creada · 19s`, `Duración: 19,4 s`).
+ * - **The desk top-aligns.** The workers panel sits beside the message column
+ *   at the same top edge: the desk grid pins both columns to row 1, so the
+ *   panel never floats above-right (the operator's red sketch, v0.4.0).
  * - **No markup injection.** Every value shown comes from a server response and
  *   is written with `textContent`/`createElement`: pasted data, panel text, file
  *   names and record fields are never interpreted as HTML.
@@ -74,12 +75,18 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
     provinces: [],
     busy: false,
     consoleBusy: false,
-    // True when the operator analyzed a NEW message while a run was in flight:
-    // that preview is the queue, and the created-run reset must not wipe it.
+    // True when the operator analyzed a NEW message while a POST was in flight:
+    // that preview is the next stacking, and the enqueued reset must not wipe it.
     preparedNext: false,
-    // The in-flight run's own start instant, for its worker card.
-    runStartedAt: null,
-    // The last console snapshot, so the workers panel can re-render between reads.
+    // The entry the operator stacked last: the page announces its outcome on
+    // screen the moment a poll reports it finished.
+    lastQueuedId: null,
+    announcedLast: true,
+    // The latest /api/queue snapshot: the workers panel's data since v0.4.0.
+    queue: [],
+    queueFetchBusy: false,
+    // The last console snapshot, so the panel can keep showing the legacy rows
+    // before anything was ever stacked.
     lastConsole: null
   };
 
@@ -365,85 +372,66 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
     byId('analyze').disabled = false;
   }
 
-  // ----------------------------------------------------- the progress estimate
+  // -------------------------------------------------- the queue: poll + cards
 
   var PROGRESS_TICK_MS = 2000;
-  var progress = { timer: null, steps: [], completed: 0 };
+  var QUEUE_POLL_MS = 3000;
+  var queuePollTimer = null;
+  var progressTimer = null;
 
   function stepsFor(modality) {
     return JOURNEY_STEPS[modality === 'sucursal' ? 'sucursal' : 'domicilio'];
   }
 
-  /** Completed steps to a percentage, capped below 100: only the response can say "done". */
+  /** Completed steps to a percentage, capped below 100: only a poll can say "done". */
   function approximatePercent(completed, total) {
     if (total <= 0) return 0;
     var capped = Math.max(0, Math.min(completed, total - 1));
     return Math.round((capped / total) * 100);
   }
 
-  function stopProgress() {
-    if (progress.timer !== null) {
-      clearTimer(progress.timer);
-      progress.timer = null;
-    }
-  }
-
-  function renderProgressList(list, percentNode) {
-    clear(list);
-    progress.steps.forEach(function (label, index) {
-      var marker;
-      var cls;
-      if (index < progress.completed) {
-        marker = '✓';
-        cls = 'done';
-      } else if (index === progress.completed) {
-        marker = '⏳';
-        cls = 'current';
-      } else {
-        marker = '·';
-        cls = 'pending';
-      }
-      list.appendChild(make('li', cls, marker + ' ' + label));
-    });
-    // Approximate by nature: the steps last about the same, the clock is a
-    // guess, and the wording on screen says so.
-    percentNode.textContent =
-      'Progreso estimado: ' + approximatePercent(progress.completed, progress.steps.length) + ' % (aproximado)';
+  function terminalState(word) {
+    return word !== 'en-espera' && word !== 'en-proceso';
   }
 
   /**
-   * The in-flight card: the step checklist for this modality, a current step
-   * advancing on a timer, and an approximate percentage. The timer stops at the
-   * second-to-last step and never marks the last one done — the response is the
-   * only thing that can close the run, and renderResult snaps the card to it.
+   * Completed steps of an 'en proceso' entry, from its own start instant: one
+   * step per tick over the known journey — the same estimate the in-flight card
+   * used, now computed instead of ticked, so it survives reloads.
    */
-  function startProgressCard(modality) {
-    progress.steps = stepsFor(modality).slice();
-    progress.completed = 0;
-    stopProgress();
+  function completedStepsOf(entry) {
+    var started = Date.parse(String(entry.startedAt === null || entry.startedAt === undefined || entry.startedAt === '' ? '' : entry.startedAt));
+    if (isNaN(started)) return 0;
+    var elapsed = Date.now() - started;
+    if (!isFinite(elapsed) || elapsed < 0) return 0;
+    return Math.floor(elapsed / PROGRESS_TICK_MS);
+  }
 
-    var box = byId('result');
-    clear(box);
-    var card = make('div', 'result-card progress-card');
-    card.appendChild(make('p', 'progress-title', 'Creando el envío — progreso estimado'));
-    card.appendChild(make('p', 'progress-note', 'El porcentaje es aproximado: los pasos duran parejo y el recuento es estimado.'));
-    var list = document.createElement('ul');
-    list.className = 'progress-steps';
-    card.appendChild(list);
-    var percentNode = make('p', 'progress-percent', '');
-    card.appendChild(percentNode);
-    box.appendChild(card);
+  /**
+    * Two timers, honestly armed from the snapshot itself: the poll refreshes
+    * the queue while any entry is 'en espera' or 'en proceso' (~3 s), and the
+    * progress card of an 'en proceso' entry advances roughly every 2 s. Both
+    * stop the moment the queue has nothing left in them — otherwise the panel
+    * renders once per poll and stays still.
+    */
+  function scheduleQueueTimers() {
+    var waiting = state.queue.some(function (entry) {
+      return entry.state === 'en-espera' || entry.state === 'en-proceso';
+    });
+    if (waiting && queuePollTimer === null) queuePollTimer = setTimer(pollQueue, QUEUE_POLL_MS);
+    if (!waiting && queuePollTimer !== null) {
+      clearTimer(queuePollTimer);
+      queuePollTimer = null;
+    }
 
-    renderProgressList(list, percentNode);
-
-    progress.timer = setTimer(function () {
-      if (progress.completed < progress.steps.length - 1) {
-        progress.completed += 1;
-        renderProgressList(list, percentNode);
-        // The worker card's live percentage rides on the same tick.
-        renderWorkersFromState();
-      }
-    }, PROGRESS_TICK_MS);
+    var running = state.queue.some(function (entry) { return entry.state === 'en-proceso'; });
+    if (running && progressTimer === null) {
+      progressTimer = setTimer(function () { renderWorkersFromState(); }, PROGRESS_TICK_MS);
+    }
+    if (!running && progressTimer !== null) {
+      clearTimer(progressTimer);
+      progressTimer = null;
+    }
   }
 
   // ------------------------------------------------------------ the error card
@@ -492,7 +480,6 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
    * card, so long paths wrap instead of pushing the layout wide.
    */
   function renderErrorCard(parts) {
-    stopProgress();
     var box = byId('result');
     clear(box);
     var card = make('div', 'result-card is-bad');
@@ -525,23 +512,25 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
   /** An HTTP-level failure (the run POST itself failed): the same tiers, honestly worded. */
   function renderRunFailure(error) {
     var reason = error && error.message ? error.message : String(error);
-    if (error && error.status === 409) {
+    if (error && error.status === 409 && String(reason).indexOf('cola') !== -1) {
       renderErrorCard({
-        heading: 'Hay otra corrida en curso.',
-        sub: null,
-        action: 'Esperá a que termine y volvé a intentar; no se cambió nada.',
+        heading: 'La cola de envíos está llena.',
+        sub: 'Nada se perdió: este envío no llegó a encolarse.',
+        action: 'Esperá a que se liberen lugares — los que cargaste se crean solos, de a uno — y volvé a crear este envío.',
         lines: [reason],
         note: null,
       });
+      setStatus('run-status', 'No se encoló: la cola está llena.', 'bad');
       return;
     }
     renderErrorCard({
-      heading: 'No se pudo completar la corrida.',
+      heading: 'No se pudo encolar el envío.',
       sub: null,
       action: 'Podés volver a intentar; si vuelve a fallar, avisá con los detalles de abajo.',
       lines: ['código HTTP: ' + (error && error.status ? error.status : '(desconocido)'), reason],
       note: null,
     });
+    setStatus('run-status', 'La corrida no se completó.', 'bad');
   }
 
   // ------------------------------------------------------------- the actions
@@ -659,40 +648,40 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
 
     state.busy = true;
     state.preparedNext = false;
-    state.runStartedAt = new Date().toISOString();
     syncButtons();
-    setStatus('run-status', 'Creando el envío: recorre el panel y hace un solo click en Crear envío…', null);
+    setStatus('run-status', 'Encolando el envío…', null);
 
-    // The POST answers only at the end, so the card is an estimate that runs on
-    // a timer; renderResult snaps it to the response's real outcome. The same
-    // instant puts the run's worker card at the top of the workers panel.
-    startProgressCard(state.modalidad);
-    renderWorkersFromState();
-
+    // v0.4.0: the POST answers 'enqueued' at once — the approved payload is
+    // stored server-side, so nothing long waits on the browser here. The queue
+    // worker creates the shipment when the entry's turn arrives, and the poll
+    // announces its outcome in #result.
     post('/api/run', { message: state.message, form: collect(), mode: 'create' }).then(function (data) {
-      renderResult(data);
-      // The queue: only a confirmed creation clears the inputs — and never a
-      // preview the operator analyzed while this run was in flight: that is
-      // already the next step, and wiping it would throw prepared work away.
-      if (data.status === 'created') {
+      if (data.status === 'enqueued') {
+        state.lastQueuedId = data.queueId;
+        state.announcedLast = false;
+        setStatus('run-status',
+          'Encolado en el lugar ' + data.position + ': se crea solo cuando le toque. Podés seguir cargando los siguientes.',
+          null);
+        // The operator asked for exactly this: as soon as the payload is on the
+        // server, the form clears — the values live there now, nothing to re-paste.
         if (state.preparedNext) {
-          setStatus('analyze-status', 'Envío anterior creado: el mensaje que analizaste ya está listo para crear.', null);
+          setStatus('analyze-status', 'Envío anterior en cola: el mensaje que analizaste ya está listo para encolar.', null);
         } else {
           resetForNextShipment();
         }
+        pollQueue();
+        return;
       }
-      loadConsole(null);
+      if (data.status === 'invalid-form') {
+        renderInvalidFormCard(data);
+        setStatus('run-status', 'El envío no se creó.', 'bad');
+        return;
+      }
     }).catch(function (error) {
       renderRunFailure(error);
-      setStatus('run-status', 'La corrida no se completó.', 'bad');
-      loadConsole(null);
     }).then(function () {
       state.busy = false;
       syncButtons();
-      // The in-flight worker card goes away the moment the response arrives.
-      // A console read in flight renders the fresh list itself; when there is
-      // none, this re-render is what removes the card honestly.
-      if (!state.consoleBusy) renderWorkersFromState();
     });
   }
 
@@ -720,117 +709,16 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
   }
 
   /**
-   * The run's final state, snapped over whatever estimate the progress card
-   * was showing: whatever the response says is what the screen now says.
+   * The enqueue refusal that can still reach the page: the posted values do not
+   * build a payload, so nothing was stacked at all.
    */
-  function renderResult(data) {
-    stopProgress();
-
-    if (data.status === 'invalid-form') {
-      var box = byId('result');
-      clear(box);
-      var formCard = make('div', 'result-card is-bad');
-      formCard.appendChild(make('p', 'error-heading bad', 'No se ejecutó nada: revisá estos campos.'));
-      formCard.appendChild(issueList(data.errors.map(function (item) { return item.message; })));
-      box.appendChild(formCard);
-      setStatus('run-status', 'El envío no se creó.', 'bad');
-      return;
-    }
-
-    if (data.status === 'refused') {
-      var copy = refusalCopy(data.reason);
-      renderErrorCard({
-        heading: copy.heading,
-        sub: 'La corrida se detuvo antes del primer paso: el panel no se abrió y no se creó nada.',
-        action: copy.action,
-        lines: technicalLines(data.details).concat([data.reason]),
-        note: null,
-      });
-      setStatus('run-status', 'El envío no se creó.', 'bad');
-      return;
-    }
-
-    if (data.status === 'created') {
-      var box = byId('result');
-      clear(box);
-      var card = make('div', 'result-card');
-      card.appendChild(make('p', 'result-id ok', 'Envío creado: ' + data.shipmentId));
-      card.appendChild(make('p', null, 'Estado en el panel: ' + (data.statusBadges.join(', ') || '(no leído)')));
-      card.appendChild(make('p', null, 'Costo (resumen): ' + (data.cost.summary || '(no leído)')));
-      card.appendChild(make('p', null, 'Costo (detalle): ' + (data.cost.detail || '(no leído)')));
-      if (data.labelUnpaid.proven) {
-        card.appendChild(make('p', 'ok',
-          'Etiqueta impaga confirmada: el identificador, el estado del panel y el control de etiqueta siguen presentes; no se accionó nada sobre la etiqueta.'));
-      } else {
-        card.appendChild(make('p', 'bad', 'INCOMPLETO: no se puede probar que la etiqueta siga impaga.'));
-        if (data.labelUnpaid.problem) card.appendChild(make('p', 'bad', data.labelUnpaid.problem));
-        if (data.labelUnpaid.details.length > 0) card.appendChild(issueList(data.labelUnpaid.details));
-      }
-      // The true duration, measured by the run itself: the final line the
-      // estimate card was always going to be replaced by.
-      var duration = durationText(data.durationMs);
-      if (duration !== null) card.appendChild(make('p', 'result-duration', duration));
-      card.appendChild(errorDetails(technicalLines([
-        data.recordPath ? 'registro previo al click: ' + data.recordPath : '',
-        data.outcomePath ? 'desenlace: ' + data.outcomePath : '',
-        data.reportPath ? 'informe del ejecutor: ' + data.reportPath : '',
-        data.detailScreenshot ? 'captura del detalle: ' + data.detailScreenshot : '',
-      ])));
-      box.appendChild(card);
-      setStatus('run-status', 'Listo: la etiqueta queda impaga.', 'ok');
-      return;
-    }
-
-    if (data.status === 'unknown') {
-      renderErrorCard({
-        heading: 'No sabemos si el envío se creó.',
-        sub: 'El click se hizo una sola vez y la página de detalle nunca llegó: la corrida queda abierta a propósito.',
-        action: 'Revisá la lista de envíos del panel antes de repetir este mensaje.',
-        lines: technicalLines(data.details.concat(data.matches)).concat([
-          data.reason,
-          'Conciliación: ' + data.interpretation,
-          data.recordPath ? 'registro a inspeccionar: ' + data.recordPath : '',
-          data.outcomePath ? 'desenlace: ' + data.outcomePath : '',
-        ]),
-        note: data.note,
-        durationMs: data.durationMs,
-      });
-      setStatus('run-status', 'Hay que conciliar a mano antes de repetir este mensaje.', 'warn');
-      return;
-    }
-
-    if (data.status === 'not-created') {
-      renderErrorCard({
-        heading: 'El envío no se creó.',
-        sub: 'La corrida se detuvo antes del click: nada se creó y la corrida quedó resuelta sola.',
-        action: 'Podés repetir este mensaje cuando quieras: no hay nada que conciliar.',
-        lines: technicalLines(data.details).concat([
-          data.reason,
-          'Etapa alcanzada: ' + data.stage,
-          data.recordPath ? 'registro previo al click: ' + data.recordPath : '',
-          data.outcomePath ? 'desenlace escrito: ' + data.outcomePath : '',
-        ]),
-        note: data.note,
-        durationMs: data.durationMs,
-      });
-      setStatus('run-status', 'El envío no se creó. La corrida quedó resuelta: podés reintentar.', 'warn');
-      return;
-    }
-
-    renderErrorCard({
-      heading: 'No se pudo crear el envío.',
-      sub: 'La corrida se detuvo: no se puede saber hasta qué paso llegó.',
-      action: data.recordPath
-        ? 'Antes de reintentar, resolvé la corrida que quedó abierta (el archivo está en los detalles).'
-        : 'Podés volver a intentar cuando quieras: no quedó ninguna corrida abierta.',
-      lines: technicalLines(data.details).concat([
-        data.reason,
-        data.recordPath ? 'registro a inspeccionar: ' + data.recordPath : '',
-      ]),
-      note: data.note,
-      durationMs: data.durationMs,
-    });
-    setStatus('run-status', 'La corrida no se completó.', 'bad');
+  function renderInvalidFormCard(data) {
+    var box = byId('result');
+    clear(box);
+    var formCard = make('div', 'result-card is-bad');
+    formCard.appendChild(make('p', 'error-heading bad', 'No se encoló nada: revisá estos campos.'));
+    formCard.appendChild(issueList(data.errors.map(function (item) { return item.message; })));
+    box.appendChild(formCard);
   }
 
   // ---------------------------------------------------------------- the rail
@@ -890,29 +778,96 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
     return 'sin desenlace';
   }
 
+  /**
+   * One queue entry as its worker card. 'en proceso' carries the journey's step
+   * checklist and its approximate percentage (computed from the entry's own
+   * start instant, labelled 'aproximado'); 'en espera' is a plain waiting card;
+   * finished entries are the classic row with the outcome word and duration.
+   */
+  function entryWord(state) {
+    if (state === 'creada') return 'creada';
+    if (state === 'sin-crear') return 'sin crear';
+    if (state === 'desconocida') return 'desconocida';
+    if (state === 'rechazada') return 'rechazada';
+    if (state === 'fallida') return 'fallida';
+    return 'sin desenlace';
+  }
+
+  function renderQueueEntry(entry) {
+    var item = document.createElement('li');
+
+    if (entry.state === 'en-proceso') {
+      item.className = 'worker in-flight';
+      item.appendChild(make('span', 'worker-line', '— · en proceso · ' + timeOf(entry.startedAt)));
+      var steps = stepsFor(entry.modality);
+      var completed = Math.min(completedStepsOf(entry), steps.length - 1);
+      var list = document.createElement('ul');
+      list.className = 'progress-steps';
+      steps.forEach(function (label, index) {
+        if (index < completed) list.appendChild(make('li', 'done', '✓ ' + label));
+        else if (index === completed) list.appendChild(make('li', 'current', '⏳ ' + label));
+        else list.appendChild(make('li', 'pending', '· ' + label));
+      });
+      item.appendChild(list);
+      // Approximate by nature: the steps last about the same, the clock is a
+      // guess, and the wording on screen says so. It never reaches 100: only
+      // the poll's real outcome can close the entry.
+      item.appendChild(make('span', 'worker-progress',
+        'Progreso estimado: ' + approximatePercent(completed, steps.length) + ' % (aproximado)'));
+      return item;
+    }
+
+    if (entry.state === 'en-espera') {
+      item.className = 'worker waiting';
+      item.appendChild(make('span', 'worker-line', '— · en espera · desde ' + timeOf(entry.enqueuedAt)));
+      return item;
+    }
+
+    var when = entry.finishedAt === null || entry.finishedAt === undefined || entry.finishedAt === ''
+      ? entry.enqueuedAt
+      : entry.finishedAt;
+    var line = textOr(entry.shipmentId, '—') + ' · ' + entryWord(entry.state) + ' · ' + timeOf(when);
+    var duration = durationShort(entry.durationMs);
+    if (duration !== null) line += ' · ' + duration;
+    if (
+      entry.reason !== null && entry.reason !== undefined && entry.reason !== '' &&
+      (entry.state === 'rechazada' || entry.state === 'fallida' || entry.state === 'desconocida' || entry.state === 'sin-crear')
+    ) {
+      // The operator asked for 'rechazada · motivo': its reason rides on its own
+      // line, so the row keeps wrapping inside the column.
+      item.className = 'worker ' + entry.state;
+      item.appendChild(make('span', 'worker-line', line));
+      item.appendChild(make('span', 'meta', entry.reason));
+    } else {
+      item.textContent = line;
+    }
+    return item;
+  }
+
   function renderWorkers(data) {
     var list = byId('workers-list');
     if (!list) return;
     clear(list);
 
-    // The in-flight run is always the first worker card, with its live estimate
-    // straight from the same progress machinery the result card uses.
-    if (state.busy) {
-      var inFlight = document.createElement('li');
-      inFlight.className = 'worker in-flight';
-      inFlight.appendChild(make('span', 'worker-line', '— · en curso · ' + timeOf(state.runStartedAt)));
-      inFlight.appendChild(make('span', 'worker-progress',
-        'Progreso estimado: ' + approximatePercent(progress.completed, progress.steps.length) + ' % (aproximado)'));
-      list.appendChild(inFlight);
+    // v0.4.0: the queue is the panel's source of truth. The server returns the
+    // entries in panel order — 'en proceso' first, then 'en espera' oldest
+    // first, then the finished ones newest first.
+    if (state.queue.length > 0) {
+      state.queue.forEach(function (entry) {
+        list.appendChild(renderQueueEntry(entry));
+      });
+      scheduleQueueTimers();
+      return;
     }
 
+    // Nothing was ever stacked in this deployment yet: the panel keeps showing
+    // the run records' own rows, exactly as before the queue existed.
     var rows = (data && data.runs && data.runs.rows ? data.runs.rows : []).slice(0, 5);
     if (rows.length === 0) {
-      if (!state.busy) {
-        var empty = document.createElement('li');
-        empty.appendChild(make('span', 'meta', 'no hay ningún run registrado todavía'));
-        list.appendChild(empty);
-      }
+      var empty = document.createElement('li');
+      empty.appendChild(make('span', 'meta', 'no hay ningún run registrado todavía'));
+      list.appendChild(empty);
+      scheduleQueueTimers();
       return;
     }
 
@@ -924,9 +879,139 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
       item.textContent = line;
       list.appendChild(item);
     });
+    scheduleQueueTimers();
   }
 
-  /** Re-renders the workers panel over the last console snapshot, in-flight card included. */
+  /**
+   * One queue poll: refresh the snapshot, announce the last stacked entry's
+   * outcome in the page itself, re-render the panel and re-arm the timers.
+   * While nothing is waiting or running, the poll simply stops being scheduled.
+   */
+  function pollQueue() {
+    if (state.queueFetchBusy) return;
+    state.queueFetchBusy = true;
+    fetch('/api/queue', { method: 'GET' }).then(function (response) {
+      if (response.status === 401) {
+        document.location.assign('/login');
+        throw new Error('/api/queue respondió 401');
+      }
+      if (!response.ok) throw new Error('/api/queue respondió ' + response.status);
+      return response.json();
+    }).then(function (data) {
+      state.queue = (data && data.entries) || [];
+      announceLastEntry();
+      if (!state.consoleBusy) renderWorkers(state.lastConsole);
+    }).catch(function () {
+      // The panel keeps the last snapshot: the next poll retries, and the
+      // timers stay armed until a poll sees the queue empty.
+    }).then(function () {
+      state.queueFetchBusy = false;
+      scheduleQueueTimers();
+    });
+  }
+
+  /** The last entry the operator stacked, announced on screen when it finishes. */
+  function announceLastEntry() {
+    if (state.lastQueuedId === null || state.announcedLast) return;
+    var entry = null;
+    for (var index = 0; index < state.queue.length; index += 1) {
+      if (state.queue[index].id === state.lastQueuedId) {
+        entry = state.queue[index];
+        break;
+      }
+    }
+    if (entry === null || !terminalState(entry.state)) return;
+    state.announcedLast = true;
+    renderEntryOutcome(entry);
+    // The rail's own rows change when an entry finishes: one honest read now.
+    loadConsole(null);
+  }
+
+  /** The paths the drained run wrote, for the card's collapsed technical block. */
+  function entryPaths(entry) {
+    return [
+      entry.recordPath ? 'registro previo al click: ' + entry.recordPath : '',
+      entry.outcomePath ? 'desenlace: ' + entry.outcomePath : '',
+      entry.reportPath ? 'informe del ejecutor: ' + entry.reportPath : ''
+    ];
+  }
+
+  /**
+   * The outcome of the operator's own last stacked entry, said out loud in the
+   * result area: what the poll reports is what the screen says, nothing more.
+   */
+  function renderEntryOutcome(entry) {
+    var duration = durationText(entry.durationMs);
+
+    if (entry.state === 'creada') {
+      var box = byId('result');
+      clear(box);
+      var card = make('div', 'result-card');
+      card.appendChild(make('p', 'result-id ok', 'Envío creado: ' + textOr(entry.shipmentId, '(sin identificador)')));
+      card.appendChild(make('p', 'ok',
+        'El agente dejó la etiqueta como está: no accionó nada sobre ella. Revisala en el panel cuando quieras imprimirla.'));
+      if (duration !== null) card.appendChild(make('p', 'result-duration', duration));
+      card.appendChild(errorDetails(technicalLines(entryPaths(entry))));
+      box.appendChild(card);
+      setStatus('run-status', 'Listo: la etiqueta sigue impaga.', 'ok');
+      return;
+    }
+
+    if (entry.state === 'sin-crear') {
+      renderErrorCard({
+        heading: 'El envío no se creó.',
+        sub: 'La corrida se detuvo antes del click: nada se creó y la corrida quedó resuelta sola.',
+        action: 'Podés repetir este mensaje cuando quieras: no hay nada que conciliar.',
+        lines: technicalLines((entry.reason ? [entry.reason] : [])
+          .concat(entry.stage ? ['Etapa alcanzada: ' + entry.stage] : [])
+          .concat(entryPaths(entry))),
+        note: null,
+        durationMs: entry.durationMs,
+      });
+      setStatus('run-status', 'El envío no se creó. La corrida quedó resuelta: podés reintentar.', 'warn');
+      return;
+    }
+
+    if (entry.state === 'desconocida') {
+      renderErrorCard({
+        heading: 'No sabemos si el envío se creó.',
+        sub: 'El click se hizo una sola vez y la página de detalle nunca llegó: la corrida queda abierta a propósito.',
+        action: 'Revisá la lista de envíos del panel antes de repetir este mensaje.',
+        lines: technicalLines((entry.reason ? [entry.reason] : []).concat(entryPaths(entry))),
+        note: null,
+        durationMs: entry.durationMs,
+      });
+      setStatus('run-status', 'Hay que conciliar a mano antes de repetir este mensaje.', 'warn');
+      return;
+    }
+
+    if (entry.state === 'rechazada') {
+      var copy = refusalCopy(entry.reason || '');
+      renderErrorCard({
+        heading: copy.heading,
+        sub: 'La corrida se detuvo antes del primer paso: el panel no se abrió y no se creó nada.',
+        action: copy.action,
+        lines: technicalLines([entry.reason || ''].concat(entryPaths(entry))),
+        note: null,
+      });
+      setStatus('run-status', 'El envío no se creó.', 'bad');
+      return;
+    }
+
+    renderErrorCard({
+      heading: 'No se pudo crear el envío.',
+      sub: 'La corrida se detuvo: no se puede saber hasta qué paso llegó.',
+      action: entry.recordPath
+        ? 'Antes de reintentar, resolvé la corrida que quedó abierta (el archivo está en los detalles).'
+        : 'Podés volver a intentar cuando quieras: no quedó ninguna corrida abierta.',
+      lines: technicalLines([entry.reason || ''].concat(entryPaths(entry))),
+      note: null,
+      durationMs: entry.durationMs,
+    });
+    setStatus('run-status', 'La corrida no se completó.', 'bad');
+  }
+
+  /** Re-renders the workers panel over the last console snapshot, queue included. */
   function renderWorkersFromState() {
     renderWorkers(state.lastConsole);
   }
@@ -1109,5 +1194,8 @@ export const CLIENT_JS = `(function (document, fetch, localStorage, matchMedia, 
   updateMessageBadge();
   syncButtons();
   loadConsole(null);
+  // The queue may already hold entries stacked before this page load (or before
+  // a restart): one poll at boot shows them and arms the timers.
+  pollQueue();
 })(document, fetch, localStorage, matchMedia, setInterval, clearInterval);
 `;

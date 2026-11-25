@@ -1,16 +1,17 @@
 /**
- * The two things the operator asked for after the failed run, as rendered tests.
+ * Two things the operator asked for, as rendered tests.
  *
  * 1. **Feedback during the run.** "me gustaria que al crear el envio se mas
- *    feedback, que me va ya diciendo por que paso va" — the page now shows a
- *    progress card with the journey's step checklist per modality and an
- *    approximate percentage. The POST answers only at the end, so the card runs
- *    on a timer over the known step count and is labelled `estimado` /
- *    `aproximado`; when the response arrives the card snaps to the real outcome.
- *    These tests run the real `CLIENT_JS` against a fake DOM with an injected
- *    clock, so what is asserted is what the operator sees.
+ *    feedback, que me va ya diciendo por que paso va" — while a queue entry is
+ *    `en proceso` its worker card carries the journey's step checklist and an
+ *    approximate percentage (the known `JOURNEY_STEPS` estimate, computed from
+ *    the entry's own start instant and labelled `estimado`/`aproximado`). When a
+ *    poll reports the real outcome, the page says so and the estimate stops:
+ *    nothing says "creado" before the poll reports it. These tests run the real
+ *    `CLIENT_JS` against a fake DOM with an injected clock, so what is asserted
+ *    is what the operator sees.
  * 2. **Readable, contained errors.** "es muy feo ese error encima todo salido
- *    del encuadre" — errors now render in tiers: one human heading, one
+ *    del encuadre" — errors still render in tiers: one human heading, one
  *    actionable sentence, and the raw internals collapsed inside a `<details>`
  *    whose body wraps and scrolls inside its card. The hand-edit JSON recipe for
  *    resolving an unresolved record never reaches the screen; the record's file
@@ -22,7 +23,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { humanResolutionHint } from '../../src/cli/gates';
 import { analyzeMessage } from '../../src/ui/actions';
 import { CLIENT_JS, PAGE_HTML } from '../../src/ui/server';
 import { JOURNEY_STEPS, approximatePercent } from '../../src/ui/progress';
@@ -125,23 +125,26 @@ interface RunGate {
   /** Answers the pending `/api/run` POST with a 200 and this body. */
   settle(body: unknown): void;
   /** Answers the pending `/api/run` POST with an HTTP error. */
-  reject(status: number, body: { reason: string }): void;
+  reject(status: number, body: { status?: string; reason: string }): void;
 }
 
 interface Harness {
   node(id: string): FakeNode;
   fire(id: string, event: string): void;
   text(id: string): string;
+  navigate(id: string): void;
   navigated: string[];
   runGate: RunGate;
+  /** Replaces the snapshot the next `/api/queue` GET returns. */
+  setQueue(snapshot: unknown): void;
   /** Every URL the client fetched, in order (the rail re-fetch assertions read this). */
   fetches: string[];
-  /** Fires the progress card's interval callback once (the injected clock). */
-  tick(): void;
-  /** How many times the client cleared its interval. */
+  /** Fires every live interval callback whose period is `ms` (all when absent). */
+  tick(ms?: number): void;
+  /** How many times the client cleared an interval. */
   clearCalls(): number;
-  /** Whether the progress interval is still scheduled. */
-  timerLive(): boolean;
+  /** How many intervals are still scheduled. */
+  timersLive(): number;
 }
 
 const CONSOLE_SNAPSHOT = {
@@ -150,6 +153,15 @@ const CONSOLE_SNAPSHOT = {
   runs: { rows: [] },
   errors: { latest: null },
   warnings: [],
+};
+
+const EMPTY_QUEUE = {
+  status: 'ok',
+  readAt: '2026-01-01T00:00:00.000Z',
+  entries: [],
+  pending: 0,
+  limit: 10,
+  problems: [],
 };
 
 function okResponse(body: unknown): unknown {
@@ -187,26 +199,32 @@ async function boot(modality: 'domicilio' | 'sucursal'): Promise<Harness> {
     reject: (status, body) => settleRun!(failResponse(status, body)),
   };
 
+  let queueSnapshot: unknown = EMPTY_QUEUE;
   const fetchLog: string[] = [];
   const fetchStub = async (url: string) => {
     fetchLog.push(url);
     if (url === '/api/console') return okResponse(CONSOLE_SNAPSHOT);
     if (url === '/api/analyze') return okResponse(analysis);
+    if (url === '/api/queue') return okResponse(queueSnapshot);
     if (url === '/api/run') return await runPromise;
     throw new Error(`unexpected fetch: ${url}`);
   };
 
-  let intervalCallback: (() => void) | null = null;
-  let intervalMs: number | null = null;
+  // The client keeps up to two timers (the ~3 s queue poll and the ~2 s
+  // re-render of an in-flight card), so the fake clock is a map of live
+  // intervals keyed by id, exactly like the real one.
+  const timers = new Map<number, { fn: () => void; ms: number }>();
+  let nextId = 1;
   let clears = 0;
   const fakeSetInterval = (fn: () => void, ms: number) => {
-    intervalCallback = fn;
-    intervalMs = ms;
-    return 77;
+    const id = nextId;
+    nextId += 1;
+    timers.set(id, { fn, ms });
+    return id;
   };
-  const fakeClearInterval = () => {
+  const fakeClearInterval = (id: number) => {
     clears += 1;
-    intervalCallback = null;
+    timers.delete(id);
   };
 
   const fakeDocument = {
@@ -257,14 +275,17 @@ async function boot(modality: 'domicilio' | 'sucursal'): Promise<Harness> {
     text: (id) => node(id).textContent,
     navigated,
     runGate,
+    setQueue: (snapshot: unknown) => {
+      queueSnapshot = snapshot;
+    },
     fetches: fetchLog,
-    tick: () => {
-      assert.ok(intervalCallback, 'the progress timer should still be scheduled');
-      assert.equal(intervalMs, 2000, 'the progress timer ticks every two seconds');
-      intervalCallback!();
+    tick: (ms?: number) => {
+      for (const timer of [...timers.values()]) {
+        if (ms === undefined || timer.ms === ms) timer.fn();
+      }
     },
     clearCalls: () => clears,
-    timerLive: () => intervalCallback !== null,
+    timersLive: () => timers.size,
   };
 }
 
@@ -273,7 +294,7 @@ async function boot(modality: 'domicilio' | 'sucursal'): Promise<Harness> {
 function resultCard(page: Harness): FakeNode {
   const result = page.node('result');
   const card = result.children[0];
-  assert.ok(card, 'the run rendered one card into #result');
+  assert.ok(card, 'the page rendered one card into #result');
   assert.equal(card.className.split(' ')[0], 'result-card', 'every outcome is one contained card');
   return card;
 }
@@ -282,61 +303,63 @@ function cardChild(card: FakeNode, className: string): FakeNode | null {
   return card.descendants().find((node) => (node.className ?? '').split(' ').includes(className)) ?? null;
 }
 
-const CREATED_BODY = {
-  status: 'created',
-  shipmentId: '#EM1055',
-  statusBadges: ['Por enviar', 'Envío manual'],
-  cost: { summary: 'Andreani · Costo $ 1.234,00', detail: 'Costo $ 1.234,00' },
-  labelUnpaid: { proven: true, problem: null, details: [] },
-  reportPath: 'executor-fixture/create-run.json',
-  detailScreenshot: null,
-  recordPath: 'run-records/2026-01-01T00-00-00-000Z-abcdefabcdef.json',
-  outcomePath: 'run-records/2026-01-01T00-00-00-000Z-abcdefabcdef.outcome.json',
-};
+function workersCard(page: Harness): FakeNode {
+  const list = page.node('workers-list');
+  const first = list.children[0];
+  assert.ok(first, 'the queue rendered one worker card first');
+  return first;
+}
+
+const QUEUED_ID = '000001-abc123def456';
+
+/** A queue entry as `/api/queue` projects it, with only the fields the client reads. */
+function entryOf(overrides: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: QUEUED_ID,
+    state: 'en-espera',
+    modality: 'domicilio',
+    enqueuedAt: '2026-01-01T00:00:00.000Z',
+    startedAt: null,
+    finishedAt: null,
+    shipmentId: null,
+    durationMs: null,
+    reason: null,
+    recordPath: null,
+    outcomePath: null,
+    reportPath: null,
+    stage: null,
+    ...overrides,
+  };
+}
+
+function queueOf(...entries: Record<string, unknown>): Record<string, unknown> {
+  return {
+    status: 'ok',
+    readAt: '2026-01-01T00:00:00.000Z',
+    entries,
+    pending: entries.filter((entry) => entry.state === 'en-espera' || entry.state === 'en-proceso').length,
+    limit: 10,
+    problems: [],
+  };
+}
 
 const UNRESOLVED_RUN_ID = '2026-01-01T00-00-00-000Z-abcdefabcdef';
-
-/** The refusal exactly as the prior-attempt gate raises it, JSON recipe included. */
-const UNRESOLVED_REFUSAL = {
-  status: 'refused',
-  stage: 'prior-attempt',
-  reason: 'refused: a previous run for this message is attempted-unresolved',
-  details: [
-    `run record ${UNRESOLVED_RUN_ID} (recorded 2026-01-01T00:00:00.000Z) was written before the create click and never recorded an outcome`,
-    'the shipment may or may not exist, so this run is not retried automatically',
-    'check the Envío Nube shipment list for this recipient by hand, then resolve the record as a human action',
-    humanResolutionHint(UNRESOLVED_RUN_ID),
-  ],
-};
-
-const FAILED_BODY = {
-  status: 'failed',
-  reason: 'ExecutorError: screen 3 (Completar datos del destinatario): the form no longer holds the values just written',
-  details: ['screenshot captured: executor-fixture/failure.png', 'trace: executor-fixture/trace.zip'],
-  recordPath: `run-records/${UNRESOLVED_RUN_ID}.json`,
-  note: 'el registro queda attempted-unresolved a propósito: revisá la lista de envíos antes de repetir este mensaje',
-};
-
-/** A pre-click abort exactly as the run handler answers it (R10 as amended). */
-const NOT_CREATED_BODY = {
-  status: 'not-created',
-  stage: 'journey to the summary (screens 1-4)',
-  reason: 'PreClickAbortError: refusing to create the shipment: the panel does not hold the approved payload',
-  details: ['zipCode: expected "1901", the panel holds "1902"'],
-  recordPath: `run-records/${UNRESOLVED_RUN_ID}.json`,
-  outcomePath: `run-records/${UNRESOLVED_RUN_ID}.outcome.json`,
-  note: 'no se hizo ningún click: nada se creó. La corrida quedó resuelta como «sin crear» y este mensaje se puede repetir.',
-};
 
 // --------------------------------------------------- 1. the progress estimate
 
 test('the domicilio progress card shows the seven journey steps and an approximate percentage', async () => {
   const page = await boot('domicilio');
 
-  const card = resultCard(page);
-  assert.match(card.textContent, /Creando el envío — progreso estimado/);
+  // The entry is on the server: `en proceso`, started just now. The POST
+  // answered `enqueued` the moment it was stacked; the card lives on the panel.
+  page.setQueue(queueOf(entryOf({ state: 'en-proceso', startedAt: new Date(Date.now() - 200).toISOString() })));
+  page.runGate.settle({ status: 'enqueued', queueId: QUEUED_ID, position: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const card = workersCard(page);
+  assert.match(card.className, /in-flight/, 'the entry being created is the first worker card');
+  assert.match(card.textContent, /Creando el envío/, 'the journey step labels are on screen');
   assert.match(card.textContent, /aproximado/, 'the estimate is labelled as such');
-  assert.match(card.textContent, /estimado/, 'and the wording says estimated, not measured');
 
   const list = cardChild(card, 'progress-steps');
   assert.ok(list);
@@ -351,70 +374,125 @@ test('the domicilio progress card shows the seven journey steps and an approxima
   assert.equal(list!.children[1].className, 'pending');
   assert.equal(list!.children[6].className, 'pending');
 
-  assert.match(page.text('result'), /Progreso estimado: 0 % \(aproximado\)/);
-  assert.equal(page.timerLive(), true, 'the estimate runs while the POST is in flight');
+  assert.match(card.textContent, /Progreso estimado: 0 % \(aproximado\)/);
+  assert.equal(page.timersLive(), 2, 'the poll and the progress re-render are both scheduled');
 
-  // One tick: the second step becomes current and the percentage moves.
-  page.tick();
-  assert.match(page.text('result'), /Progreso estimado: 14 % \(aproximado\)/);
+  // One poll (the snapshot now says two seconds have elapsed): the second step
+  // becomes current and the percentage moves. The poll is what refreshes the
+  // card's data; the ~2s timer only re-renders the same snapshot. Every
+  // re-render rebuilds the list, so the card is read again from the panel.
+  page.setQueue(queueOf(entryOf({ state: 'en-proceso', startedAt: new Date(Date.now() - 2_500).toISOString() })));
+  page.tick(3_000);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const advancedCard = workersCard(page);
+  assert.match(advancedCard.textContent, /Progreso estimado: 14 % \(aproximado\)/);
   assert.equal(approximatePercent(1, 7), 14);
+  assert.equal(cardChild(advancedCard, 'progress-steps')!.children[1].className, 'current', 'the second step is now in flight');
 
   // Ticking to the cap: the last step stays current and the number stays below 100.
-  for (let tick = 0; tick < 10; tick += 1) page.tick();
-  assert.match(page.text('result'), /Progreso estimado: 86 % \(aproximado\)/);
+  page.setQueue(queueOf(entryOf({ state: 'en-proceso', startedAt: new Date(Date.now() - 13_000).toISOString() })));
+  page.tick(3_000);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const cappedCard = workersCard(page);
+  assert.match(cappedCard.textContent, /Progreso estimado: 86 % \(aproximado\)/);
   assert.equal(approximatePercent(6, 7), 86);
-  assert.equal(page.text('result').includes('100 %'), false, 'the timer never claims the run is done');
-  const lastRow = list!.children[6];
+  assert.equal(cappedCard.textContent.includes('100 %'), false, 'the estimator never claims the run is done');
+  const lastRow = cardChild(cappedCard, 'progress-steps')!.children[6];
   assert.equal(lastRow!.className, 'current', 'the last step is in flight, never done');
-  assert.equal(page.clearCalls(), 0, 'the timer is still running: nothing is settled yet');
+  assert.equal(page.clearCalls(), 0, 'the timers are still running: the entry is not settled yet');
 });
 
 test('the sucursal progress card shows the six journey steps with the same rules', async () => {
   const page = await boot('sucursal');
 
-  const list = cardChild(resultCard(page), 'progress-steps');
+  page.setQueue(
+    queueOf(entryOf({ state: 'en-proceso', modality: 'sucursal', startedAt: new Date(Date.now() - 200).toISOString() })),
+  );
+  page.runGate.settle({ status: 'enqueued', queueId: QUEUED_ID, position: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const list = cardChild(workersCard(page), 'progress-steps');
   assert.ok(list);
   assert.equal(list!.children.length, JOURNEY_STEPS.sucursal.length);
   assert.equal(list!.children.length, 6, 'sucursal walks six steps');
-  assert.match(page.text('result'), /Seleccionando Andreani a sucursal/);
-  assert.match(page.text('result'), /Seleccionando la sucursal/);
+  assert.match(page.text('workers-list'), /Seleccionando Andreani a sucursal/);
+  assert.match(page.text('workers-list'), /Seleccionando la sucursal/);
 
-  page.tick();
-  assert.match(page.text('result'), /Progreso estimado: 17 % \(aproximado\)/);
+  page.setQueue(
+    queueOf(entryOf({ state: 'en-proceso', modality: 'sucursal', startedAt: new Date(Date.now() - 2_500).toISOString() })),
+  );
+  page.tick(3_000);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.match(page.text('workers-list'), /Progreso estimado: 17 % \(aproximado\)/);
   assert.equal(approximatePercent(1, 6), 17);
-
-  for (let tick = 0; tick < 10; tick += 1) page.tick();
-  assert.match(page.text('result'), /Progreso estimado: 83 % \(aproximado\)/);
-  assert.equal(page.text('result').includes('100 %'), false);
+  page.setQueue(
+    queueOf(entryOf({ state: 'en-proceso', modality: 'sucursal', startedAt: new Date(Date.now() - 11_000).toISOString() })),
+  );
+  page.tick(3_000);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.match(page.text('workers-list'), /Progreso estimado: 83 % \(aproximado\)/);
+  assert.equal(page.text('workers-list').includes('100 %'), false);
 });
 
 // --------------------------------------------- 2. the snap to the real answer
 
-test('when the response arrives the card snaps to the created state and stops the estimate', async () => {
+test('when the poll reports the outcome the card snaps to the created state and stops the estimate', async () => {
   const page = await boot('domicilio');
-  page.tick();
-  page.tick();
 
-  page.runGate.settle(CREATED_BODY);
+  page.setQueue(queueOf(entryOf({ state: 'en-proceso', startedAt: new Date(Date.now() - 2_500).toISOString() })));
+  page.runGate.settle({ status: 'enqueued', queueId: QUEUED_ID, position: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  page.tick(2_000);
+  assert.equal(page.timersLive(), 2, 'the estimate is running while the entry is in flight');
+
+  // The poll now reports the real outcome of the very same entry.
+  page.setQueue(
+    queueOf(
+      entryOf({
+        state: 'creada',
+        startedAt: '2026-01-01T00:00:00.000Z',
+        finishedAt: '2026-01-01T00:00:19.400Z',
+        shipmentId: '#EM1055',
+        durationMs: 19_400,
+        recordPath: `run-records/${UNRESOLVED_RUN_ID}.json`,
+        outcomePath: `run-records/${UNRESOLVED_RUN_ID}.outcome.json`,
+        reportPath: 'executor-fixture/create-run.json',
+      }),
+    ),
+  );
+  page.tick(3_000);
   await new Promise((resolve) => setTimeout(resolve, 20));
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   const text = page.text('result');
-  assert.match(text, /Envío creado: #EM1055/, 'the big line, from the response');
-  assert.match(text, /Costo \(resumen\): Andreani · Costo \$ 1\.234,00/, 'the cost the response carries');
-  assert.match(text, /impaga/, 'the label-unpaid line');
+  assert.match(text, /Envío creado: #EM1055/, 'the big line, from the poll');
+  assert.match(text, /Duración: 19,4 s/, 'the duration the entry carried');
   assert.equal(text.includes('aproximado'), false, 'no estimate survives the real answer');
   assert.equal(cardChild(resultCard(page), 'progress-steps'), null, 'the checklist is gone');
-  assert.equal(page.timerLive(), false, 'the timer was stopped');
-  assert.ok(page.clearCalls() >= 1, 'the interval was cleared, not left running');
-  assert.deepEqual(page.navigated, [], 'a created run does not navigate anywhere');
+  assert.equal(page.timersLive(), 0, 'both timers were stopped');
+  assert.ok(page.clearCalls() >= 2, 'the intervals were cleared, not left running');
+  assert.deepEqual(page.navigated, [], 'a created entry does not navigate anywhere');
+
+  // The worker list snapped to the finished row, with its short duration.
+  assert.match(page.text('workers-list'), /^#EM1055 · creada · \d{2}:\d{2} · 19s/);
 });
 
 // --------------------------------------------------- 3. the error tiers
 
 test('the unresolved refusal renders heading, action and collapsed details without the JSON recipe', async () => {
   const page = await boot('domicilio');
-  page.runGate.settle(UNRESOLVED_REFUSAL);
+  page.setQueue(
+    queueOf(
+      entryOf({
+        state: 'rechazada',
+        finishedAt: '2026-01-01T00:00:02.000Z',
+        reason: 'refused: a previous run for this message is attempted-unresolved (etapa: prior-attempt)',
+        recordPath: `run-records/${UNRESOLVED_RUN_ID}.json`,
+        outcomePath: `run-records/${UNRESOLVED_RUN_ID}.outcome.json`,
+      }),
+    ),
+  );
+  page.runGate.settle({ status: 'enqueued', queueId: QUEUED_ID, position: 1 });
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   const card = resultCard(page);
@@ -444,18 +522,23 @@ test('the unresolved refusal renders heading, action and collapsed details witho
   assert.equal(whole.includes('"status":"not-created"'), false);
   assert.equal(whole.includes('human resolution:'), false);
 
-  assert.equal(page.timerLive(), false, 'the estimate stopped when the refusal arrived');
+  assert.equal(page.timersLive(), 0, 'the estimators stopped: nothing is in flight');
   assert.match(page.text('run-status'), /no se creó/);
 });
 
 test('a duplicate-shipment refusal gets its own heading and action', async () => {
   const page = await boot('domicilio');
-  page.runGate.settle({
-    status: 'refused',
-    stage: 'prior-attempt',
-    reason: 'refused: this message already created a shipment (#EM1053)',
-    details: [`run record ${UNRESOLVED_RUN_ID} recorded the shipment #EM1053 as created`],
-  });
+  page.setQueue(
+    queueOf(
+      entryOf({
+        state: 'rechazada',
+        finishedAt: '2026-01-01T00:00:02.000Z',
+        reason: 'refused: this message already created a shipment (#EM1053) (etapa: prior-attempt)',
+        recordPath: `run-records/${UNRESOLVED_RUN_ID}.json`,
+      }),
+    ),
+  );
+  page.runGate.settle({ status: 'enqueued', queueId: QUEUED_ID, position: 1 });
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   const card = resultCard(page);
@@ -466,7 +549,18 @@ test('a duplicate-shipment refusal gets its own heading and action', async () =>
 
 test('a failed run names the problem, the open record and keeps the raw reason collapsed', async () => {
   const page = await boot('domicilio');
-  page.runGate.settle(FAILED_BODY);
+  page.setQueue(
+    queueOf(
+      entryOf({
+        state: 'fallida',
+        finishedAt: '2026-01-01T00:00:02.000Z',
+        reason: 'ExecutorError: screen 3 (Completar datos del destinatario): the form no longer holds the values just written',
+        recordPath: `run-records/${UNRESOLVED_RUN_ID}.json`,
+        outcomePath: null,
+      }),
+    ),
+  );
+  page.runGate.settle({ status: 'enqueued', queueId: QUEUED_ID, position: 1 });
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   const card = resultCard(page);
@@ -478,14 +572,26 @@ test('a failed run names the problem, the open record and keeps the raw reason c
   );
 
   const body = cardChild(card, 'error-detail-body')!;
-  assert.match(body.textContent, new RegExp(FAILED_BODY.recordPath.replaceAll('.', '\\.')), 'the record path is in the details');
+  assert.match(body.textContent, new RegExp(`run-records/${UNRESOLVED_RUN_ID}\\.json`), 'the record path is in the details');
   assert.match(body.textContent, /the form no longer holds the values/, 'the raw reason is demoted, not removed');
   assert.equal(page.text('result').includes('"runId"'), false);
 });
 
 test('a pre-click abort renders its own tier: nothing was created and the retry is free', async () => {
   const page = await boot('domicilio');
-  page.runGate.settle(NOT_CREATED_BODY);
+  page.setQueue(
+    queueOf(
+      entryOf({
+        state: 'sin-crear',
+        finishedAt: '2026-01-01T00:00:02.000Z',
+        stage: 'journey to the summary (screens 1-4)',
+        reason: 'PreClickAbortError: refusing to create the shipment: the panel does not hold the approved payload',
+        recordPath: `run-records/${UNRESOLVED_RUN_ID}.json`,
+        outcomePath: `run-records/${UNRESOLVED_RUN_ID}.outcome.json`,
+      }),
+    ),
+  );
+  page.runGate.settle({ status: 'enqueued', queueId: QUEUED_ID, position: 1 });
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   const card = resultCard(page);
@@ -498,7 +604,7 @@ test('a pre-click abort renders its own tier: nothing was created and the retry 
 
   const body = cardChild(card, 'error-detail-body')!;
   assert.match(body.textContent, /Etapa alcanzada: journey to the summary/, 'the stage reached is named');
-  assert.match(body.textContent, new RegExp(NOT_CREATED_BODY.recordPath.replaceAll('.', '\\.')), 'the record path is in the details');
+  assert.match(body.textContent, new RegExp(`run-records/${UNRESOLVED_RUN_ID}\\.json`), 'the record path is in the details');
 
   // R10 as amended: no resolve-the-record instruction where none applies.
   const whole = page.text('result');
@@ -508,19 +614,25 @@ test('a pre-click abort renders its own tier: nothing was created and the retry 
 
 test('an HTTP failure of the run POST itself gets the same tiers', async () => {
   const page = await boot('domicilio');
-  page.runGate.reject(409, { status: 'busy', reason: 'ya hay una corrida en curso en este proceso' });
+  // The queue full: the one 409 the POST can still answer with.
+  page.runGate.reject(409, {
+    status: 'queue-full',
+    reason:
+      'la cola de envíos está llena (10 esperando o en proceso): esperá un rato — los que ya cargaste se crean solos, de a uno — y volvé a cargar este mensaje',
+  });
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   const card = resultCard(page);
-  assert.equal(cardChild(card, 'error-heading')!.textContent, 'Hay otra corrida en curso.');
-  assert.match(cardChild(card, 'error-action')!.textContent, /Esperá a que termine y volvé a intentar/);
-  assert.match(cardChild(card, 'error-detail-body')!.textContent, /ya hay una corrida en curso/);
+  assert.equal(cardChild(card, 'error-heading')!.textContent, 'La cola de envíos está llena.');
+  assert.match(cardChild(card, 'error-action')!.textContent, /los que cargaste se crean solos/);
+  assert.match(cardChild(card, 'error-detail-body')!.textContent, /la cola de envíos está llena/);
+  assert.match(page.text('run-status'), /No se encoló: la cola está llena\./);
 
   const second = await boot('domicilio');
   second.runGate.reject(500, { status: 'error', reason: 'boom' });
   await new Promise((resolve) => setTimeout(resolve, 20));
   const secondCard = resultCard(second);
-  assert.equal(cardChild(secondCard, 'error-heading')!.textContent, 'No se pudo completar la corrida.');
+  assert.equal(cardChild(secondCard, 'error-heading')!.textContent, 'No se pudo encolar el envío.');
   assert.match(cardChild(secondCard, 'error-detail-body')!.textContent, /código HTTP: 500/);
 });
 
@@ -580,32 +692,30 @@ test('the client script still opens no native dialog and injects no markup', () 
   assert.match(CLIENT_JS, /textContent/, 'every value is written as text');
 });
 
-// --------------------------------------------------------- 6. the queue loop
+// --------------------------------------------------------- 6. the queue flow
 
 /**
  * The operator's request verbatim: "debería haber un sistema de encolación …
  * pongo uno analizo lo mando, ahí se me debería limpiar, mando otro y así y
- * abajo que se vayan encolando". After a confirmed `created` only the inputs
- * reset — the result card keeps the `#EM` — and after any response the rail is
- * re-fetched so the new run shows up below without a reload.
+ * abajo que se vayan encolando". Stacking clears the inputs right away — the
+ * values live on the server now — and when a poll reports the entry's outcome
+ * the confirmation is said out loud in the result area. The result card is not
+ * touched by later polls; the next analyze is what clears it.
  */
 
 function consoleReads(page: Harness): number {
   return page.fetches.filter((url) => url === '/api/console').length;
 }
 
-test('after a created run the inputs reset and the confirmation stays on screen', async () => {
+test('after the POST is accepted the inputs reset at once and the entry shows as en espera', async () => {
   const page = await boot('domicilio');
   const readsBeforeRun = consoleReads(page);
 
-  page.runGate.settle(CREATED_BODY);
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  page.setQueue(queueOf(entryOf({ state: 'en-espera' })));
+  page.runGate.settle({ status: 'enqueued', queueId: QUEUED_ID, position: 1 });
   await new Promise((resolve) => setTimeout(resolve, 20));
 
-  // The confirmation is not wiped: the result keeps the created #EM.
-  assert.match(page.text('result'), /Envío creado: #EM1055/);
-
-  // The inputs are empty again: the next message can be pasted right away.
+  // The inputs are empty again immediately: the values live on the server now.
   assert.equal(page.node('message').value, '', 'the message textarea is cleared');
   assert.equal(page.text('message-badge'), 'sin datos', 'the badge follows the emptied message');
   assert.equal(
@@ -619,19 +729,49 @@ test('after a created run the inputs reset and the confirmation stays on screen'
   assert.equal(page.node('create').disabled, true, 'create waits for the next analyze');
   assert.match(page.text('analyze-status'), /pegá el siguiente mensaje/, 'the queue state is named on screen');
 
-  // The rail was re-fetched after the response: the new run shows below.
-  assert.ok(consoleReads(page) > readsBeforeRun, 'the rail data was re-fetched after the created response');
-});
+  // The workers panel carries the stacked entry as waiting.
+  const card = workersCard(page);
+  assert.match(card.textContent, /en espera/, 'the stacked entry is the queue, on the panel');
+  assert.equal(page.timersLive(), 1, 'the poll keeps running while something waits');
 
-test('after a refused run the form stays as-is so the operator can fix and retry', async () => {
-  const page = await boot('domicilio');
-  const readsBeforeRun = consoleReads(page);
-
-  page.runGate.settle(UNRESOLVED_REFUSAL);
+  // The entry is announced when a poll reports its outcome; the rail is
+  // re-fetched so the new run shows below without a reload.
+  page.setQueue(
+    queueOf(
+      entryOf({
+        state: 'creada',
+        startedAt: '2026-01-01T00:00:01.000Z',
+        finishedAt: '2026-01-01T00:00:20.000Z',
+        shipmentId: '#EM1055',
+        durationMs: 19_400,
+      }),
+    ),
+  );
+  page.tick(3_000);
+  await new Promise((resolve) => setTimeout(resolve, 20));
   await new Promise((resolve) => setTimeout(resolve, 20));
 
-  // The refusal card is on screen.
-  assert.match(page.text('result'), /Este mensaje ya tiene una corrida sin resolver\./);
+  // The confirmation is on screen and stays: a later poll never wipes it.
+  assert.match(page.text('result'), /Envío creado: #EM1055/);
+  assert.ok(consoleReads(page) > readsBeforeRun, 'the rail data was re-fetched after the outcome');
+});
+
+test('an entry the queue refused leaves the form as-is so the operator can fix and retry', async () => {
+  const page = await boot('domicilio');
+
+  // The one refusal the POST itself can still answer with: the posted values do
+  // not build a payload, so nothing was stacked at all.
+  page.runGate.settle({
+    status: 'invalid-form',
+    errors: [{ field: 'name', message: '«Nombre» es obligatorio' }],
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  // The card is on screen, with the field the operator must fix.
+  const card = resultCard(page);
+  assert.match(card.textContent, /No se encoló nada: revisá estos campos\./);
+  assert.match(card.textContent, /«Nombre» es obligatorio/);
+  assert.match(page.text('run-status'), /El envío no se creó\./);
 
   // Nothing was cleared: the message and the analyzed fields are untouched.
   assert.equal(page.node('message').value, HAPPY_MESSAGE, 'the message is kept for a fix-and-retry');
@@ -640,7 +780,4 @@ test('after a refused run the form stays as-is so the operator can fix and retry
     'the analyzed fields are still on the form',
   );
   assert.equal(page.node('data-empty').hidden, true, 'the analyzed preview stays (the hint stays hidden)');
-
-  // The rail was re-fetched even on a refusal.
-  assert.ok(consoleReads(page) > readsBeforeRun, 'the rail data was re-fetched after the refusal too');
 });

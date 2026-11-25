@@ -130,6 +130,26 @@ async function waitFor(label: string, predicate: () => boolean, timeoutMs = 5_00
   }
 }
 
+/**
+ * Polls `/api/queue` until every stacked entry has an outcome and at least
+ * `want` entries exist; the budget tolerates a busy suite. Returns the entries
+ * in panel order (newest finished first).
+ */
+async function waitQueueEntries(url: string, want = 1): Promise<Array<Record<string, unknown>>> {
+  const startedAt = Date.now();
+  for (;;) {
+    const response = await authFetch(`${url}/api/queue`);
+    assert.equal(response.status, 200);
+    const snapshot = (await response.json()) as {
+      pending: number;
+      entries: Array<Record<string, unknown>>;
+    };
+    if (snapshot.pending === 0 && snapshot.entries.length >= want) return snapshot.entries;
+    if (Date.now() - startedAt > 30_000) throw new Error('the queue never drained');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
   const promise = new Promise<void>((settle) => {
@@ -458,19 +478,24 @@ test('a second browser request while one is running is a 409 that changes nothin
     await waitFor('the session check to start', () => runnerCalls === 1);
     assert.equal(browserLock.holder, 'session-check');
 
-    // The same lock guards the shipment route.
-    const refused = await authFetch(`${started.url}/api/run`, {
+    // The shipment route no longer takes the browser lock (v0.4.0): stacking
+    // opens nothing, so it is answered even while a check runs. This request
+    // carries no message or values, so the answer is the invalid-form verdict —
+    // and nothing was stacked, so no second browser was ever a possibility.
+    const stacked = await authFetch(`${started.url}/api/run`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ mode: 'create' }),
     });
-    assert.equal(refused.status, 409, 'POST /api/run must be refused while a check runs');
-    const body = (await refused.json()) as { status: string; reason: string; heldBy: string };
-    assert.equal(body.status, 'busy');
-    assert.equal(body.reason, LOCK_BUSY_MESSAGE);
-    assert.match(body.reason, /un solo Chromium/, 'the message says why');
-    assert.match(body.reason, /no se cambió nada/, 'the message says nothing changed');
-    assert.equal(body.heldBy, 'session-check');
+    assert.equal(stacked.status, 200);
+    const stackedBody = (await stacked.json()) as { status: string };
+    assert.equal(stackedBody.status, 'invalid-form', "nothing unbuildable enters the queue");
+    assert.equal(
+      ((await (await authFetch(`${started.url}/api/queue`)).json()) as { pending: number }).pending,
+      0,
+      'the refused stack never entered the queue',
+    );
+    assert.equal(runnerCalls, 1, 'the run POST never reached the runner, and no second browser was started');
 
     // A second check is refused too, and it does not start a second browser.
     const secondCheck = await authFetch(`${started.url}/api/session-check`, { method: 'POST' });
@@ -516,9 +541,10 @@ test('a throwing handler releases the lock, and so does an executor that throws 
   assert.equal(again.ok, true);
   assert.equal(browserLock.free, true);
 
-  // The real route: a creation whose executor throws right after the attempt
-  // record was written still returns, still leaves the record unresolved, and
-  // still frees the lock.
+  // The real route, through the queue: a creation whose executor throws right
+  // after the attempt record was written still resolves to a visible outcome,
+  // still leaves the record unresolved, and the lock comes back — the worker
+  // holds and releases it around the drained run, never wedging the process.
   const analyzed = analyzeMessage(HAPPY_MESSAGE);
   assert.equal(analyzed.status, 'parsed');
   if (analyzed.status !== 'parsed') return;
@@ -543,21 +569,34 @@ test('a throwing handler releases the lock, and so does an executor that throws 
       });
 
     const response = await post();
-    assert.equal(response.status, 200, 'the route answers, it does not hang or 409');
-    const body = (await response.json()) as { status: string; recordPath: string | null };
-    assert.equal(body.status, 'failed');
-    assert.ok(body.recordPath, 'the pre-click record was already written when the executor threw');
-    assert.ok(existsSync(body.recordPath), 'and it is on disk, unresolved');
+    assert.equal(response.status, 200, 'the POST answers at once: the run happens in the worker');
+    const body = (await response.json()) as { status: string };
+    assert.equal(body.status, 'enqueued');
 
-    assert.equal(browserLock.free, true, 'the route frees the lock whatever the run did');
+    const entries = await waitQueueEntries(started.url);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0]['state'], 'fallida', "the executor's throw lands as the entry's own failed outcome");
+    const recordPath = entries[0]['recordPath'];
+    assert.ok(typeof recordPath === 'string' && recordPath.length > 0, 'the pre-click record was already written when the executor threw');
+    assert.ok(existsSync(String(recordPath)), 'and it is on disk, unresolved');
 
-    // The next attempt is refused by the prior-attempt gate, not by the lock:
-    // the lock is available again even after the throw.
+    assert.equal(browserLock.free, true, 'the worker freed the lock whatever the run did');
+
+    // The next attempt is not blocked by the lock: it stacks, drains, and the
+    // prior-attempt gate refuses it at execution — the lock was released even
+    // after the throw.
     const second = await post();
-    assert.equal(second.status, 200, 'the lock is free again, so this is a run, not a 409');
-    const secondBody = (await second.json()) as { status: string; stage?: string };
-    assert.equal(secondBody.status, 'refused');
-    assert.equal(secondBody.stage, 'prior-attempt');
+    assert.equal(second.status, 200, 'the lock is free again, so this is a stack, not a 409');
+    const secondBody = (await second.json()) as { status: string };
+    assert.equal(secondBody.status, 'enqueued');
+
+    const secondEntries = await waitQueueEntries(started.url, 2);
+    assert.equal(secondEntries[0]['state'], 'rechazada');
+    assert.match(
+      String(secondEntries[0]['reason']),
+      /attempted-unresolved/,
+      'the unresolved prior record is the stated reason',
+    );
   } finally {
     await started.close();
   }

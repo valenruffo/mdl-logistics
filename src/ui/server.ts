@@ -44,12 +44,14 @@
  * server that can create shipments must not also hand out PII. Nothing in this
  * file reads a file's bytes to answer a request, and no route is a prefix.
  *
- * **Two routes open a browser, and they share one lock.** `/api/run` (both
- * modes) and `/api/session-check` each used to spawn a Chromium on demand. The
- * documented container has memory for one, so they now take `browserLock`
- * (`lock.ts`) for the whole request: a second request gets a `409` carrying
- * `LOCK_BUSY_MESSAGE` and runs nothing at all, and the lock is released in a
- * `finally` whatever the run does.
+ * **One browser at a time, everywhere.** The queue's worker loop and
+ * `/api/session-check` each drive a Chromium, and the documented container has
+ * memory for one, so every browser-driving step takes `browserLock` (`lock.ts`):
+ * a session check that finds the queue running gets a `409` with
+ * `LOCK_BUSY_MESSAGE`, and the queue's worker waits instead of opening a second
+ * browser while a check runs. `/api/run` itself never takes the lock (v0.4.0):
+ * stacking an approved submission into the queue opens nothing, so the operator
+ * can keep loading shipments while one runs.
  *
  * **The login budget is per client, and one password is derived at a time.**
  * `clientAddress` resolves the bucket key — the real client behind the loopback
@@ -62,7 +64,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { isIP } from 'node:net';
 
 import { messageOf } from '../executor/errors';
-import { analyzeMessage, runAttempt, type ActionDeps } from './actions';
+import { analyzeMessage, type ActionDeps } from './actions';
 import {
   LOGIN_API_PATH,
   LOGIN_BUSY_MESSAGE,
@@ -86,6 +88,7 @@ import { CLIENT_JS } from './client';
 import { performSessionCheck, readConsole, resolveConsoleDeps, type ConsoleDeps } from './console';
 import { LOGIN_HTML } from './login';
 import { LOCK_BUSY_MESSAGE, withBrowserLock } from './lock';
+import { queueFor } from './queue';
 import { PAGE_HTML } from './page';
 
 export { CLIENT_JS, LOCK_BUSY_MESSAGE, LOGIN_HTML, PAGE_HTML };
@@ -370,10 +373,10 @@ async function login(body: string, context: RouteContext): Promise<UiResponse> {
 }
 
 /**
- * The whole surface of the page. Nine routes: the login card, the document, its
- * script, the login and logout actions, the two shipment actions, the console
- * snapshot and the one explicit session check. Nothing else exists to navigate to,
- * and nothing below exists to fetch.
+ * The whole surface of the page. Ten routes: the login card, the document, its
+ * script, the login and logout actions, the shipment enqueue action, the queue
+ * read, the console snapshot and the one explicit session check. Nothing else
+ * exists to navigate to, and nothing below exists to fetch.
  */
 export function createRoutes(deps: ActionDeps): Route[] {
   const consoleDeps: ConsoleDeps = resolveConsoleDeps({ recordDir: deps.recordDir, ...(deps.console ?? {}) });
@@ -428,7 +431,7 @@ export function createRoutes(deps: ActionDeps): Route[] {
     {
       method: 'POST',
       path: '/api/run',
-      purpose: 'crea el envio: sin aprobacion ni token, solo el mensaje y los datos',
+      purpose: 'encola el envio aprobado: sin ceremonia, solo el mensaje y los datos; se crean solos de a uno',
       public: false,
       handle: async (body) => {
         const parsed = parseBody(body);
@@ -442,22 +445,25 @@ export function createRoutes(deps: ActionDeps): Route[] {
           });
         }
 
-        // The run drives the panel, so it takes the one browser lock. The
-        // duplicate check is read inside it too: it must not race a run that is
-        // about to write its own record.
-        const guarded = await withBrowserLock('run', async () =>
-          runAttempt(
-            {
-              message: textField(parsed.value, 'message'),
-              form: formField(parsed.value),
-              mode,
-            },
-            deps,
-          ),
-        );
-        if (!guarded.ok) return busy(guarded.holder);
-        return json(200, guarded.value);
+        // v0.4.0: a create attempt never holds the browser lock — it stacks into
+        // the persistent queue and answers at once (`status: 'enqueued'`). The
+        // prior-attempt and duplicate gates are checked at execution time, when
+        // the queue's worker reaches the entry, so the operator can keep loading
+        // shipments while one runs (the operator asked for exactly that).
+        const stacked = await queueFor(deps).enqueue(textField(parsed.value, 'message'), formField(parsed.value));
+        if (!stacked.ok) {
+          if (stacked.kind === 'invalid-form') return json(200, { status: 'invalid-form', errors: stacked.errors });
+          return json(409, { status: 'queue-full', reason: stacked.reason });
+        }
+        return json(200, { status: 'enqueued', queueId: stacked.entryId, position: stacked.position });
       },
+    },
+    {
+      method: 'GET',
+      path: '/api/queue',
+      purpose: 'la cola de envios en el orden del panel: en proceso, en espera y terminadas, con su desenlace',
+      public: false,
+      handle: async () => json(200, await queueFor(deps).snapshot()),
     },
     {
       method: 'GET',
@@ -663,9 +669,13 @@ export async function startUiServer(options: UiServerOptions): Promise<StartedUi
     port,
     url: `http://${HOST}:${port}`,
     auth,
-    close: () =>
-      new Promise<void>((resolve, reject) => {
+    close: async () => {
+      // Stop the queue worker first, so a mid-drain entry finishes being written
+      // (its outcome lands on disk) before the server itself goes down.
+      await queueFor(options.deps).stop();
+      await new Promise<void>((resolve, reject) => {
         server.close((error) => (error === undefined || error === null ? resolve() : reject(error)));
-      }),
+      });
+    },
   };
 }
